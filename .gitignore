@@ -1,0 +1,29 @@
+# Build output
+build/
+out/
+x64/
+ARM64/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.log
+
+# Driver binaries — vendored/signed binaries must be added deliberately
+*.sys
+*.dll
+*.cat
+*.inf_amd64_*
+
+# Visual Studio / MSBuild
+.vs/
+*.user
+*.suo
+*.vcxproj.filters.bak
+
+# WDK / signing
+*.wixobj
+*.wixpdb
+selfsign/
