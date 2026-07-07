@@ -1,0 +1,9 @@
+[package]
+name = "luminal-driver-proto"
+version = "0.1.0"
+description = "Single-source ABI shared by the LuminalVGD driver and the LuminalShine host. No logic — layout and constants only."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
