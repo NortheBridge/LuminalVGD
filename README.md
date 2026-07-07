@@ -36,4 +36,13 @@ repository.
 
 ## License
 
-[GPL-3.0](LICENSE) © NortheBridge Foundation
+LuminalVGD is dual-licensed — see [LICENSING.md](LICENSING.md) for the full policy:
+
+- **[AGPL-3.0](LICENSE)** for open-source use: anything that uses, links, or derives
+  from LuminalVGD must release its complete source code under the same license.
+- **NortheBridge Access License Agreement (NALA)** for commercial use without
+  source-disclosure obligations, offered by the NortheBridge Foundation.
+
+Contributions require a signed CLA so the Foundation can license the work under both.
+
+© NortheBridge Foundation
