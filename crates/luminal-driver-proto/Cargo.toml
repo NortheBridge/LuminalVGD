@@ -7,3 +7,4 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+static_assertions = "1.1"

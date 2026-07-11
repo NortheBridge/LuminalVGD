@@ -27,3 +27,6 @@ Release/
 *.wixobj
 *.wixpdb
 selfsign/
+
+# Rust
+target/

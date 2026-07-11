@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "luminal-vgd-host"
+version = "0.1.0"
+description = "LuminalShine-side integration for LuminalVGD: capture-mode controller (direct-to-encoder primary, seamless WGC fallback, mid-session restore), WGC recovery ladder driver, and Windows control-device I/O."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+luminal-driver-proto = { path = "../luminal-driver-proto" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_Foundation",
+    "Win32_Security",
+] }

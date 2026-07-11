@@ -22,6 +22,7 @@ Disposition of every notable feature from the two source projects.
 | Frame-generation-aware refresh doubling | LuminalVGD planned scope | **New**; host-side policy, driver honors mode |
 | GPU-TDR/reset survival without WUDFHost wedge | LuminalVGD planned scope | **New**; ring-generation counter + bounded waits (DESIGN.md §3.3) |
 | Recovery ladder + status/heartbeat IOCTL | LuminalVGD planned scope | **New**; `GET_STATUS`, reason-coded telemetry |
+| Seamless, OS-silent WGC fallback with mid-session direct-encode restore | Product requirement (2026-07), DESIGN.md §2.1 | **New**; host-side controller: backoff probes, warm-WGC handover, no OS toast |
 
 Explicitly **not** carried over:
 - SudoVDA's `option.txt` static mode file and registry-driven monitor

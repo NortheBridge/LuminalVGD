@@ -37,8 +37,37 @@ line-by-line disposition.
 ```
 
 Selection runs fresh at every session start (never cached across sessions —
-Insider builds change the answer). Mid-session, failure only moves *down*
-the ladder; recovery back to mode 1 happens at the next session.
+Insider builds change the answer). Mid-session, failure moves *down* the
+ladder immediately — and the host then works to move back **up to mode 1 as
+soon as possible**, within the same session (see §2.1).
+
+### 2.1 Seamless fallback & mid-session restore (product requirement, 2026-07)
+
+> This supersedes the original rule that recovery to direct-to-encoder
+> waits for the next session.
+
+When direct-to-encoder fails mid-stream (driver heartbeat stale, ring
+`DEAD`/`REBUILDING`, frame starvation):
+
+- **The transition is seamless.** WGC takes over between frames against
+  the still-attached LuminalVGD virtual display, one keyframe is forced,
+  and the client never sees an interruption.
+- **The transition is silent at the OS level.** No Windows toast or any
+  other OS-surface notification is raised — the host-side notice channel
+  structurally has no OS-toast variant. LuminalShine surfaces the state in
+  its own UI and structured logs only, with copy that tells the user
+  LuminalShine has temporarily fallen back to Windows Graphics Capture and
+  *"will try restoring direct encoding as soon as possible."*
+- **Restore is active, not next-session.** The host probes the driver
+  (handshake + ring health) on an exponential backoff (1 s → 30 s cap).
+  The moment the driver is healthy — e.g. the ring generation bumps after
+  a TDR rebuild, or the driver was reinstalled — the encoder swaps back to
+  the ring, forces a keyframe, and keeps the WGC session warm until direct
+  encoding has proven stable (default 120 frames), so a relapse is another
+  seamless swap rather than a cold start.
+
+Implementation: `luminal-vgd-host::controller` (state machine, fully
+unit-tested) + `notice` (copy and channel).
 
 ## 3. Direct-to-encoder (primary mode)
 

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "luminal-vgd-core"
+version = "0.1.0"
+description = "Platform-independent LuminalVGD driver logic: the SudoVDA session model ported to Rust (monitor table, watchdog, mode validation, adapter selection, EDID generation, ring policy). No OS calls — fully unit-testable anywhere."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+luminal-driver-proto = { path = "../luminal-driver-proto" }
