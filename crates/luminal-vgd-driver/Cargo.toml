@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "luminal-vgd-driver"
+version = "0.1.0"
+description = "LuminalVGD UMDF IddCx driver. The control-plane dispatcher and session logic compile and test everywhere; the IddCx/D3D shell is Windows+eWDK-only (phase 2)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+luminal-driver-proto = { path = "../luminal-driver-proto" }
+luminal-vgd-core = { path = "../luminal-vgd-core" }
