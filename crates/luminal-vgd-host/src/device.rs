@@ -14,9 +14,10 @@ use std::ptr::{null, null_mut, read_volatile};
 
 use luminal_driver_proto::{
     ioctl, names, ring_section_size, CreateMonitorReply, CreateMonitorRequest,
-    DestroyMonitorRequest, GetStatusReply, HandshakeReply, HandshakeRequest, PingRequest,
-    RingHeader, SlotMetadata, LUMINAL_VGD_INTERFACE_GUID, PROTO_VERSION_MAJOR,
-    PROTO_VERSION_MINOR, RING_SLOTS_OFFSET,
+    DestroyMonitorRequest, GetStatusReply, HandshakeReply, HandshakeRequest,
+    PermanentPoolConfig, PingRequest, QueryLeaseReply, QueryLeaseRequest,
+    QueryPermanentPoolReply, RingHeader, SetRenderAdapterRequest, SlotMetadata,
+    LUMINAL_VGD_INTERFACE_GUID, PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR, RING_SLOTS_OFFSET,
 };
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -163,6 +164,25 @@ impl VgdDevice {
     pub fn get_status(&self) -> io::Result<GetStatusReply> {
         // No input payload.
         self.ioctl_inout(ioctl::IOCTL_GET_STATUS, &())
+    }
+
+    /// Lease introspection (proto v0.3).
+    pub fn query_lease(&self, session_id: u64) -> io::Result<QueryLeaseReply> {
+        self.ioctl_inout(ioctl::IOCTL_QUERY_LEASE, &QueryLeaseRequest { session_id })
+    }
+
+    /// Set the device-wide preferred render adapter (0 clears).
+    pub fn set_render_adapter(&self, adapter_luid: u64) -> io::Result<i32> {
+        self.ioctl_inout(ioctl::IOCTL_SET_RENDER_ADAPTER, &SetRenderAdapterRequest { adapter_luid })
+    }
+
+    /// Configure the permanent display pool (count 0 disbands).
+    pub fn set_permanent_pool(&self, config: &PermanentPoolConfig) -> io::Result<i32> {
+        self.ioctl_inout(ioctl::IOCTL_SET_PERMANENT_POOL, config)
+    }
+
+    pub fn query_permanent_pool(&self) -> io::Result<QueryPermanentPoolReply> {
+        self.ioctl_inout(ioctl::IOCTL_QUERY_PERMANENT_POOL, &())
     }
 }
 

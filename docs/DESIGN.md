@@ -98,17 +98,61 @@ Device interface GUID (new, LuminalVGD-owned): `LUMINAL_VGD_INTERFACE_GUID`.
 | IOCTL | Purpose |
 |---|---|
 | `HANDSHAKE` | proto version + caps exchange; major mismatch → host refuses |
-| `CREATE_MONITOR { w, h, hz, hdr, bit_depth, adapter_luid, session_id }` | per-client monitor with exact single-entry mode list |
+| `CREATE_MONITOR { session_id, display_id, modes[≤4], hdr, bit_depth, adapter_luid, lease_timeout_ms, physical_mm, … }` | per-client monitor; `modes[0]` preferred |
 | `DESTROY_MONITOR { session_id }` | explicit teardown at stream end |
-| `PING { session_id }` | feeds the driver watchdog |
+| `PING { session_id }` | feeds the per-lease watchdog |
+| `QUERY_LEASE { session_id }` | identity, connector, remaining lease time |
+| `SET_RENDER_ADAPTER { luid }` | device-wide preference for unset-adapter creates |
+| `SET_PERMANENT_POOL` / `QUERY_PERMANENT_POOL` | always-on display pool (see §3.2.2) |
 | `GET_STATUS` | monitor list, ring health, last error — for diagnostics |
 
-SudoVDA behaviors preserved: max-monitors cap (default 10), watchdog
-(default 3 s, 0 disables) that destroys monitors whose owner stopped
-pinging (host crash → no zombie displays), SDR 8/10-bit and HDR 10/12-bit
-depth options, render adapter selection with "largest VRAM" default when
-unset. Configuration moves from SudoVDA's registry keys to explicit
-`CREATE_MONITOR` parameters (registry fallback retained for global caps).
+SudoVDA behaviors preserved: max-monitors cap (default 10), PING-fed
+watchdog that destroys monitors whose owner stopped pinging (host crash →
+no zombie displays), SDR 8/10-bit and HDR 10/12-bit depth options, render
+adapter selection with "largest VRAM" default when unset. Configuration
+moves from SudoVDA's registry keys to explicit `CREATE_MONITOR` parameters
+(registry fallback retained for global caps).
+
+#### 3.2.1 Display identity vs. lease (libvirtualdisplay fold-in, proto v0.3)
+
+`session_id` is a *lease* — it lives exactly as long as one stream.
+`display_id` is the monitor's *identity*: it determines the EDID product
+code, serial, container GUID, and (via driver-persisted connector
+reservations) the IddCx connector. A client that reconnects with the same
+`display_id` is, to Windows, the same monitor — resolution, HDR state, and
+desktop position are restored by the OS instead of re-learned. Hosts that
+don't want that pass `EPHEMERAL_IDENTITY`. Lease timeouts are per-monitor
+(3 s–300 s, `USE_DEFAULT` defers to the SudoVDA-style registry default,
+`DISABLED` for pool displays). Reserved identity ranges (permanent
+`0x7000…`, ephemeral `0xE000…`) are refused from the wire.
+
+#### 3.2.2 Permanent display pool
+
+Up to 4 identical always-on displays that exist outside any stream,
+configured via `SET_PERMANENT_POOL`, persisted (with connector
+reservations) in a schema-versioned registry blob, and recreated by the
+driver at device start. This replaces the SudoVDA `option.txt` use case
+the matrix dropped, and backs LuminalShine's keep-display-while-paused
+behavior with a first-class mechanism.
+
+#### 3.2.3 Hardware cursor plane (`caps::HW_CURSOR`)
+
+The driver registers for IddCx hardware-cursor callbacks (alpha + masked,
+up to 256×256) and republishes shape/position into a per-monitor shared
+cursor section (`CursorHeader` + pixel buffer; shape changes bump a
+generation counter, position updates are header-only). The host forwards
+cursor state to the client for client-side rendering — no cursor baked
+into encoded frames, no added latency on cursor motion. IddCx wiring lands
+with the phase-2 shell; the ABI ships in proto v0.3.
+
+#### 3.2.4 EDID
+
+Generated per monitor (256 bytes): base block carries identity (product
+code from connector/pool index, serial from `display_id`), the preferred
+detailed timing, and real physical dimensions (mm, from the create request
+— drives correct DPI scaling); the CTA-861 extension carries HDR static
+metadata (PQ EOTF, ST 2086 luminance) and BT.2020 colorimetry, which is
+what makes the Windows HDR toggle dependable on a virtual display.
 
 ### 3.3 Recovery-first driver design (the WUDFHost-hang killer)
 
@@ -127,6 +171,16 @@ release + Insider builds. Design rules:
 4. **Watchdog self-report:** driver exposes `GET_STATUS` heartbeats so the
    host's recovery ladder can distinguish "driver alive, GPU resetting"
    from "driver gone" (different escalations — see WGC-RELIABILITY.md §4).
+5. **Teardown deadline budgeting** (libvirtualdisplay pattern): monitor
+   departure shares one deadline across cursor/swapchain worker stops
+   (≈500 ms each, remaining-budget computed per step), and a failed
+   departure is tracked (`pending`) rather than retried inline — a wedged
+   worker can never extend teardown unboundedly or dangle a callback.
+6. **Postmortem-first tracing:** the phase-2 shell registers an ETW
+   TraceLogging provider and builds WPP with the Inflight Trace Recorder,
+   so a wedged WUDFHost's recent trace ring is recoverable from a debugger
+   (`!wdfkd.wdflogdump`) — evidence for exactly the hang class this driver
+   exists to kill.
 
 ## 4. WGC fallback
 
@@ -165,6 +219,13 @@ follow the recovery ladder instead.
 - Install: OS floor check (Windows 11; 24H2 required for full HDR — mirror
   SudoVDA's documented constraint), create root-enumerated devnode, `pnputil
   /add-driver /install`. Uninstall reverses all three.
+- **Control-surface ACL (release blocker):** the control device interface
+  gets a strict SDDL (SYSTEM + Administrators only; LuminalShine's service
+  runs as SYSTEM) — an unprivileged process must not be able to create,
+  destroy, or lease monitors. A permissive ACL in a shipped package blocks
+  the release (rule adopted from libvirtualdisplay's release-validation
+  gates, along with functional install/upgrade/identity-retention/lease-
+  expiry validation per release).
 - Future: EV cert + Microsoft attestation signing drops the TrustedPublisher
   step; architecture unchanged.
 
