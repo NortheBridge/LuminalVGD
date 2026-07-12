@@ -116,3 +116,29 @@ reasons — the driver ring does not depend on any of the WGC machinery.
 | Force TDR (dxcap -forcetdr) | R3 recovers |
 | Kill/restart LuminalVGD device mid-stream | Host swaps to WGC ≤ 1 s; R4 available next session |
 | Insider build with known WGC starvation | R5 (DDA) keeps session alive; telemetry flags the build |
+
+## 7. The alt-tab transition race (direct-mode failure class)
+
+Documented by the libvirtualdisplay project as a reproducible
+deadlock/BSOD class on virtual displays (their `alttab_stress` harness;
+MIT — adopt or port it): when a fullscreen game on the virtual display
+enters/leaves exclusive fullscreen (exactly what alt-tab does), the OS
+rotates the IddCx swapchain — unassign/assign plus the driver worker's
+`DXGI_ERROR_ACCESS_LOST` teardown path — while the capture client
+recreates *its* D3D device in response to the same transition. **Three
+D3D11 devices then contend on the render adapter at once** (the driver's,
+the game's, and the capture client's), and a wedged wait in any of them
+deadlocks the transition.
+
+LuminalVGD countermeasures (DESIGN.md §3.3 rules 1, 3, 5): bounded worker
+stops with a shared teardown deadline, no D3D work inline in IddCx
+callbacks, and drop-don't-block on every slot acquire. Direct-to-encoder
+also removes the capture client's device-recreate from the race entirely —
+the host reads shared textures and has no capture device to rebuild.
+
+Test additions:
+
+| Scenario | Expected |
+|---|---|
+| alt-tab stress: rapid `SetFullscreenState` toggles on the virtual display while streaming | No WUDFHost hang/BSOD; ring generation may bump; stream resumes ≤ 1 s per transition |
+| Same, in WGC fallback mode (capture device recreate joins the race) | Ladder recovers; no deadlock; reason codes logged |

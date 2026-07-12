@@ -25,6 +25,20 @@ the notices below satisfy the attribution requirements of those licenses.
   enough to constitute a derivative, verify the upstream LICENSE file at
   that time and expand this notice accordingly.
 
+## Nonary / libvirtualdisplay (Sunshine virtual display stack)
+- Source: https://github.com/Nonary/libvirtualdisplay
+- License: MIT (Copyright © 2026 Chase Payne)
+- Use: behavioral and protocol-design basis for LuminalVGD's proto-v0.3
+  feature set — the display-identity/lease split (stable `display_id`,
+  connector reservations, identity retention across restarts), per-lease
+  configurable timeouts, permanent display pool, physical-dimension EDID
+  fields, CTA-861 HDR static-metadata/BT.2020 extension-block structure,
+  hardware-cursor capability shape, and the multi-mode-per-monitor model.
+  Implemented independently in Rust (`luminal-driver-proto`,
+  `luminal-vgd-core`); MIT permits both spec and code inheritance — if
+  future contributions port libvirtualdisplay code directly, retain the
+  upstream LICENSE text alongside it.
+
 ## Microsoft Windows-driver-samples — IndirectDisplay (IddSampleDriver)
 - Source: https://github.com/microsoft/Windows-driver-samples
 - License: MIT

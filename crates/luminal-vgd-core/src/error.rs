@@ -16,6 +16,8 @@ pub enum CoreError {
     NoSuchSession,
     RingAlloc,
     NotHandshaken,
+    IdentityInUse,
+    BadPool,
     Internal,
 }
 
@@ -33,6 +35,8 @@ impl CoreError {
             Self::NoSuchSession => err::NO_SUCH_SESSION,
             Self::RingAlloc => err::RING_ALLOC,
             Self::NotHandshaken => err::NOT_HANDSHAKEN,
+            Self::IdentityInUse => err::IDENTITY_IN_USE,
+            Self::BadPool => err::BAD_POOL,
             Self::Internal => err::INTERNAL,
         }
     }

@@ -1,8 +1,9 @@
-# Feature Matrix — pf-vdisplay × SudoVDA → LuminalVGD
+# Feature Matrix — pf-vdisplay × SudoVDA × libvirtualdisplay → LuminalVGD
 
-Disposition of every notable feature from the two source projects.
+Disposition of every notable feature from the source projects.
 "Port" = re-specify and implement in Rust (behavior, not code).
-"Inherit" = code lineage permitted (pf-vdisplay is MIT/Apache → AGPL-OK).
+"Inherit" = code lineage permitted (pf-vdisplay and libvirtualdisplay are
+MIT-family → AGPL-OK).
 
 | Feature | Source | Disposition in LuminalVGD |
 |---|---|---|
@@ -23,6 +24,18 @@ Disposition of every notable feature from the two source projects.
 | GPU-TDR/reset survival without WUDFHost wedge | LuminalVGD planned scope | **New**; ring-generation counter + bounded waits (DESIGN.md §3.3) |
 | Recovery ladder + status/heartbeat IOCTL | LuminalVGD planned scope | **New**; `GET_STATUS`, reason-coded telemetry |
 | Seamless, OS-silent WGC fallback with mid-session direct-encode restore | Product requirement (2026-07), DESIGN.md §2.1 | **New**; host-side controller: backoff probes, warm-WGC handover, no OS toast |
+| Display-identity/lease split (`display_id` ≠ lease, connector reservations, settings retention across reconnects + restarts) | libvirtualdisplay | **Ported** (proto v0.3, `core::identity`, `core::persist`) |
+| Per-lease configurable watchdog timeout (3 s–300 s, or never) | libvirtualdisplay | **Ported**; SudoVDA's global registry knob remains the default |
+| Permanent display pool (always-on displays outside streams, reboot-persistent) | libvirtualdisplay | **Ported** (`core::permanent`; replaces dropped `option.txt` use case; backs LuminalShine keep-display-while-paused) |
+| Multi-mode monitors (≤4 modes; frame-gen toggle = mode switch, not re-create) | libvirtualdisplay | **Ported** (proto `ModeSpec[4]`) |
+| 256-byte EDID: CTA-861 HDR static metadata + BT.2020, physical size (DPI) | libvirtualdisplay | **Ported** (`core::edid`); HDR toggle depends on it |
+| Hardware cursor plane (alpha/masked, 256², client-side rendering) | SudoVDA lineage + libvirtualdisplay | **Ported** ABI (cursor section, `caps::HW_CURSOR`); IddCx wiring in phase 2 |
+| Gamma-ramp + default-HDR-metadata DDIs (Night Light on virtual display) | libvirtualdisplay | **Planned** phase 2 (`caps::GAMMA_RAMP` reserved) |
+| `SET_RENDER_ADAPTER` device-wide preference | libvirtualdisplay | **Ported** (proto v0.3) |
+| Strict control-surface ACL (SYSTEM+Admins SDDL), release-blocker on permissive ACL | libvirtualdisplay | **Adopted** as packaging/phase-7 requirement (DESIGN.md §6) |
+| ETW TraceLogging + WPP Inflight Trace Recorder (postmortem from wedged WUDFHost) | libvirtualdisplay | **Adopted** as phase-2 shell requirement (DESIGN.md §3.3) |
+| Alt-tab/fullscreen-transition deadlock stress harness | libvirtualdisplay (`alttab_stress`) | **Adopted** into test matrix (WGC-RELIABILITY.md §7) |
+| Vulkan HDR surface-format layer (ICDs hide HDR formats on IddCx displays) | libvirtualdisplay | **Deferred**; MIT allows near-wholesale adoption when Vulkan HDR titles matter |
 
 Explicitly **not** carried over:
 - SudoVDA's `option.txt` static mode file and registry-driven monitor

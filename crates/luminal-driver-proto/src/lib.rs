@@ -28,7 +28,11 @@ use static_assertions::{const_assert, const_assert_eq};
 /// Bump on breaking ABI changes. Host refuses to run on major mismatch.
 pub const PROTO_VERSION_MAJOR: u16 = 0;
 /// Bump on additive, backward-compatible changes.
-pub const PROTO_VERSION_MINOR: u16 = 2;
+/// v0.3: display-identity/lease split, per-lease timeouts, multi-mode
+/// monitors, physical dimensions, cursor section, permanent pool, render-
+/// adapter IOCTL (libvirtualdisplay behavior fold-in; see
+/// THIRD-PARTY-NOTICES.md).
+pub const PROTO_VERSION_MINOR: u16 = 3;
 
 /// Device interface GUID for the LuminalVGD control device.
 /// {B3A7F2D4-6E1C-4A98-9D3B-5C0E8F714A26} — LuminalVGD-owned; do not reuse
@@ -56,6 +60,17 @@ pub mod caps {
     pub const DIRTY_RECTS: u32 = 1 << 3;
     /// Driver honors frame-generation-aware doubled refresh modes.
     pub const REFRESH_DOUBLING: u32 = 1 << 4;
+    /// Hardware cursor plane: driver fills the cursor section
+    /// (`CursorHeader` + shape buffer) instead of compositing the cursor
+    /// into frames, so the client can render it locally.
+    pub const HW_CURSOR: u32 = 1 << 5;
+    /// Gamma-ramp DDI supported (Night Light / calibration on the virtual
+    /// display).
+    pub const GAMMA_RAMP: u32 = 1 << 6;
+    /// `CREATE_MONITOR` accepts up to `MAX_MODES_PER_MONITOR` modes.
+    pub const MULTI_MODE: u32 = 1 << 7;
+    /// Permanent display pool IOCTLs supported.
+    pub const PERMANENT_POOL: u32 = 1 << 8;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +96,10 @@ pub mod ioctl {
     pub const FN_DESTROY_MONITOR: u32 = 0x802;
     pub const FN_PING: u32 = 0x803;
     pub const FN_GET_STATUS: u32 = 0x804;
+    pub const FN_SET_RENDER_ADAPTER: u32 = 0x805;
+    pub const FN_QUERY_LEASE: u32 = 0x806;
+    pub const FN_SET_PERMANENT_POOL: u32 = 0x807;
+    pub const FN_QUERY_PERMANENT_POOL: u32 = 0x808;
 
     /// In: [`HandshakeRequest`](super::HandshakeRequest), out: [`HandshakeReply`](super::HandshakeReply).
     pub const IOCTL_HANDSHAKE: u32 = ctl_code(FN_HANDSHAKE);
@@ -92,6 +111,16 @@ pub mod ioctl {
     pub const IOCTL_PING: u32 = ctl_code(FN_PING);
     /// In: none, out: [`GetStatusReply`](super::GetStatusReply).
     pub const IOCTL_GET_STATUS: u32 = ctl_code(FN_GET_STATUS);
+    /// In: [`SetRenderAdapterRequest`](super::SetRenderAdapterRequest), out: `i32` result.
+    /// Sets the device-wide preferred adapter used when a create request
+    /// passes `adapter_luid == 0` (before falling back to largest-VRAM).
+    pub const IOCTL_SET_RENDER_ADAPTER: u32 = ctl_code(FN_SET_RENDER_ADAPTER);
+    /// In: [`QueryLeaseRequest`](super::QueryLeaseRequest), out: [`QueryLeaseReply`](super::QueryLeaseReply).
+    pub const IOCTL_QUERY_LEASE: u32 = ctl_code(FN_QUERY_LEASE);
+    /// In: [`PermanentPoolConfig`](super::PermanentPoolConfig), out: `i32` result.
+    pub const IOCTL_SET_PERMANENT_POOL: u32 = ctl_code(FN_SET_PERMANENT_POOL);
+    /// In: none, out: [`QueryPermanentPoolReply`](super::QueryPermanentPoolReply).
+    pub const IOCTL_QUERY_PERMANENT_POOL: u32 = ctl_code(FN_QUERY_PERMANENT_POOL);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +151,10 @@ pub mod err {
     pub const RING_ALLOC: i32 = -9;
     /// Handshake not completed on this handle before session IOCTLs.
     pub const NOT_HANDSHAKEN: i32 = -10;
+    /// `display_id` is already bound to a live monitor.
+    pub const IDENTITY_IN_USE: i32 = -11;
+    /// Permanent-pool config invalid (count above cap, bad mode…).
+    pub const BAD_POOL: i32 = -12;
     /// Unspecified driver-internal failure; details in `GET_STATUS`.
     pub const INTERNAL: i32 = -100;
 }
@@ -143,6 +176,23 @@ pub const DEFAULT_WATCHDOG_SECS: u32 = 3;
 pub const DEFAULT_RING_SLOTS: u32 = 3;
 /// Hard ABI ceiling on ring slots.
 pub const ABI_MAX_RING_SLOTS: u32 = 8;
+
+/// Maximum modes one monitor may advertise (libvirtualdisplay parity —
+/// e.g. base + frame-gen-doubled refresh without a destroy/create cycle).
+pub const MAX_MODES_PER_MONITOR: u32 = 4;
+/// Maximum permanent (outside-any-stream) displays in the pool.
+pub const MAX_PERMANENT_DISPLAYS: u32 = 4;
+
+/// Lease (watchdog) timeout bounds, milliseconds. A request of
+/// [`LEASE_TIMEOUT_USE_DEFAULT`] takes the driver's configured default;
+/// [`LEASE_TIMEOUT_DISABLED`] disables reaping for that monitor
+/// (permanent displays use this); anything else is clamped to
+/// [`MIN_LEASE_TIMEOUT_MS`]..=[`MAX_LEASE_TIMEOUT_MS`].
+pub const DEFAULT_LEASE_TIMEOUT_MS: u32 = 10_000;
+pub const MIN_LEASE_TIMEOUT_MS: u32 = 3_000;
+pub const MAX_LEASE_TIMEOUT_MS: u32 = 300_000;
+pub const LEASE_TIMEOUT_USE_DEFAULT: u32 = 0;
+pub const LEASE_TIMEOUT_DISABLED: u32 = u32::MAX;
 
 /// Keyed-mutex key the driver holds while writing a slot.
 pub const KMTX_KEY_DRIVER: u64 = 0;
@@ -236,32 +286,57 @@ pub mod create_flags {
     /// frame generation is active (policy is host-side; the driver just
     /// honors the mode — DESIGN.md §5).
     pub const REFRESH_DOUBLED: u32 = 1 << 0;
+    /// Ignore `display_id` and mint a throwaway identity: Windows will not
+    /// associate this monitor with any remembered display settings
+    /// (libvirtualdisplay's ephemeral-identity behavior).
+    pub const EPHEMERAL_IDENTITY: u32 = 1 << 1;
+}
+
+/// One display mode. `modes[0]` is the preferred/native mode.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModeSpec {
+    pub width: u32,
+    pub height: u32,
+    /// 120000 = 120 Hz; millihertz avoids fractional-rate loss (59.94 etc.).
+    pub refresh_millihz: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateMonitorRequest {
-    /// Host-chosen unique id for this streaming session; keys every later
-    /// `PING`/`DESTROY_MONITOR` and the shared-section names.
+    /// Host-chosen unique id for this *lease* (stream lifetime); keys every
+    /// later `PING`/`DESTROY_MONITOR`/`QUERY_LEASE` and the shared-section
+    /// names.
     pub session_id: u64,
-    /// Render adapter LUID; 0 => driver default (largest-VRAM adapter,
-    /// SudoVDA-compatible behavior).
+    /// Stable display *identity*, independent of the lease: reconnecting
+    /// with the same `display_id` reclaims the same connector, EDID product
+    /// code, and serial, so Windows recognizes the monitor and keeps its
+    /// settings (resolution/HDR/position). 0 => derive an ephemeral
+    /// identity from `session_id` (same effect as `EPHEMERAL_IDENTITY`).
+    pub display_id: u64,
+    /// Render adapter LUID; 0 => device preference set via
+    /// `SET_RENDER_ADAPTER`, else largest-VRAM (SudoVDA-compatible).
     pub adapter_luid: u64,
-    pub width: u32,
-    pub height: u32,
-    /// 120000 = 120 Hz; millihertz avoids fractional-rate loss (59.94 etc.).
-    pub refresh_millihz: u32,
+    /// See the `LEASE_TIMEOUT_*` constants.
+    pub lease_timeout_ms: u32,
     /// Raw [`BitDepth`] wire value — validate with `BitDepth::from_raw`.
+    /// Applies to all modes.
     pub bit_depth: u32,
     /// 0/1; requires `caps::HDR10` and an HDR-capable `bit_depth`.
     pub hdr: u32,
-    /// Serial number stamped into the generated EDID (SudoVDA exposed a
-    /// per-client serial so Windows treats each client as a distinct,
-    /// settings-remembered display).
+    /// EDID serial override; 0 => derived from the display identity
+    /// (recommended — keeps identity retention coherent).
     pub edid_serial: u32,
     /// Bitmask of `create_flags::*`.
     pub flags: u32,
-    pub reserved: u32,
+    /// Number of valid entries in `modes` (1..=`MAX_MODES_PER_MONITOR`).
+    pub mode_count: u32,
+    pub modes: [ModeSpec; MAX_MODES_PER_MONITOR as usize],
+    /// Physical panel size advertised in the EDID, millimeters — drives
+    /// Windows DPI scaling. 0 => defaults (600×340, ≈27" 16:9).
+    pub physical_width_mm: u32,
+    pub physical_height_mm: u32,
     /// Monitor friendly name for the EDID descriptor, NUL-padded UTF-16LE
     /// (truncated to 13 chars by EDID rules; longer is fine here).
     pub friendly_name: [u16; 32],
@@ -271,11 +346,16 @@ pub struct CreateMonitorRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateMonitorReply {
     pub session_id: u64,
+    /// The effective identity (echoed, or the derived ephemeral one).
+    pub display_id: u64,
     /// `err::OK` or a negative `err::*` code. On error every other field
     /// except `session_id` is zero.
     pub result: i32,
     /// Number of slots in the ring (≤ `ABI_MAX_RING_SLOTS`).
     pub ring_slots: u32,
+    /// IddCx connector this identity is (re-)attached to.
+    pub connector_index: u32,
+    pub reserved: u32,
     /// Name of the shared-memory section containing [`RingHeader`] +
     /// [`SlotMetadata`] array, NUL-padded UTF-16LE. Composed with
     /// [`names::ring_section_name`].
@@ -292,6 +372,62 @@ pub struct DestroyMonitorRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PingRequest {
     pub session_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetRenderAdapterRequest {
+    /// Device-wide preferred adapter for `adapter_luid == 0` creates;
+    /// 0 clears the preference (back to largest-VRAM default).
+    pub adapter_luid: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryLeaseRequest {
+    pub session_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryLeaseReply {
+    pub session_id: u64,
+    pub display_id: u64,
+    /// Milliseconds until the watchdog reaps this monitor if no PING
+    /// arrives; `u32::MAX` when the lease never expires.
+    pub remaining_ms: u32,
+    pub connector_index: u32,
+    pub result: i32,
+    pub reserved: u32,
+}
+
+/// Permanent-display pool configuration: `count` identical always-on
+/// displays that exist outside any streaming session and survive driver
+/// restarts (libvirtualdisplay's permanent pool; the modern replacement
+/// for SudoVDA's `option.txt`). Serves LuminalShine's
+/// keep-display-while-paused behavior.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PermanentPoolConfig {
+    /// 0..=`MAX_PERMANENT_DISPLAYS`; 0 disbands the pool.
+    pub count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+    pub bit_depth: u32,
+    pub hdr: u32,
+    pub physical_width_mm: u32,
+    pub physical_height_mm: u32,
+    /// NUL-padded UTF-16LE.
+    pub name: [u16; 32],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryPermanentPoolReply {
+    pub config: PermanentPoolConfig,
+    pub result: i32,
+    pub reserved: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +568,59 @@ pub const fn ring_section_size(slots: u32) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor section (caps::HW_CURSOR)
+// ---------------------------------------------------------------------------
+
+/// `CursorHeader.kind` values (mirrors IddCx cursor shape types).
+pub mod cursor_kind {
+    /// 32bpp premultiplied-alpha ARGB.
+    pub const ALPHA: u32 = 1;
+    /// 32bpp color, no alpha.
+    pub const COLOR: u32 = 2;
+    /// Monochrome AND/XOR masked.
+    pub const MASKED: u32 = 3;
+}
+
+/// Maximum cursor shape dimension (matches the IddCx hardware-cursor cap
+/// libvirtualdisplay ships).
+pub const CURSOR_MAX_DIM: u32 = 256;
+pub const CURSOR_MAGIC: u32 = 0x4C56_4743; // "CGVL" LE => "LVGC"
+pub const CURSOR_HEADER_VERSION: u32 = 1;
+/// Shape pixel buffer starts at this offset in the cursor section.
+pub const CURSOR_SHAPE_OFFSET: usize = 64;
+
+/// Header at offset 0 of the per-monitor cursor section. One writer
+/// (driver, fed by IddCx cursor callbacks), one reader (host). Position
+/// updates only touch `x`/`y`/`visible`/`position_qpc`; shape updates
+/// rewrite the buffer then bump `shape_generation` (host re-reads the
+/// shape when the generation changes — read generation, copy, re-check).
+#[repr(C)]
+pub struct CursorHeader {
+    pub magic: u32,
+    pub version: u32,
+    /// Incremented after each complete shape-buffer rewrite.
+    pub shape_generation: u32,
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: u32,
+    pub hotspot_y: u32,
+    /// One of `cursor_kind::*`.
+    pub kind: u32,
+    /// Desktop coordinates on the virtual display.
+    pub x: i32,
+    pub y: i32,
+    pub visible: u32,
+    pub reserved0: u32,
+    pub position_qpc: u64,
+    pub reserved1: u64,
+}
+
+/// Total cursor section size: header + worst-case 32bpp shape.
+pub const fn cursor_section_size() -> usize {
+    CURSOR_SHAPE_OFFSET + (CURSOR_MAX_DIM as usize) * (CURSOR_MAX_DIM as usize) * 4
+}
+
+// ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
 
@@ -439,6 +628,7 @@ pub const fn ring_section_size(slots: u32) -> usize {
 #[derive(Clone, Copy, Debug)]
 pub struct MonitorStatus {
     pub session_id: u64,
+    pub display_id: u64,
     pub adapter_luid: u64,
     pub latest_sequence: u64,
     pub frames_published: u64,
@@ -446,6 +636,7 @@ pub struct MonitorStatus {
     /// Driver-clock milliseconds of the last `PING` for this session
     /// (watchdog input; same clock as `GetStatusReply.uptime_ms`).
     pub last_ping_ms: u64,
+    /// Preferred (first) mode; the full list is create-time state.
     pub width: u32,
     pub height: u32,
     pub refresh_millihz: u32,
@@ -456,6 +647,9 @@ pub struct MonitorStatus {
     pub ring_state: u32,
     /// Last `err::*` recorded for this monitor (sticky until destroy).
     pub last_error: i32,
+    pub connector_index: u32,
+    /// Effective lease timeout (`u32::MAX` = never expires).
+    pub lease_timeout_ms: u32,
 }
 
 #[repr(C)]
@@ -509,6 +703,13 @@ pub mod names {
         put_hex(out, i, session_id, 16)
     }
 
+    /// Cursor section: `Global\LuminalVGD-cur-<session_id:016x>`.
+    pub fn cursor_section_name(session_id: u64, out: &mut [u16; 64]) -> usize {
+        out.fill(0);
+        let i = put(out, 0, "Global\\LuminalVGD-cur-");
+        put_hex(out, i, session_id, 16)
+    }
+
     /// Slot texture shared handle:
     /// `Global\LuminalVGD-tex-<session_id:016x>-g<generation:08x>-s<slot:02x>`.
     /// Generation is baked into the name so a rebuilt ring can never alias
@@ -545,14 +746,27 @@ mod layout_tests {
     const_assert_eq!(size_of::<HandshakeReply>(), 20);
     const_assert_eq!(align_of::<HandshakeReply>(), 4);
 
-    const_assert_eq!(size_of::<CreateMonitorRequest>(), 112);
+    const_assert_eq!(size_of::<ModeSpec>(), 12);
+
+    const_assert_eq!(size_of::<CreateMonitorRequest>(), 168);
     const_assert_eq!(align_of::<CreateMonitorRequest>(), 8);
 
-    const_assert_eq!(size_of::<CreateMonitorReply>(), 144);
+    const_assert_eq!(size_of::<CreateMonitorReply>(), 160);
     const_assert_eq!(align_of::<CreateMonitorReply>(), 8);
 
     const_assert_eq!(size_of::<DestroyMonitorRequest>(), 8);
     const_assert_eq!(size_of::<PingRequest>(), 8);
+    const_assert_eq!(size_of::<SetRenderAdapterRequest>(), 8);
+    const_assert_eq!(size_of::<QueryLeaseRequest>(), 8);
+    const_assert_eq!(size_of::<QueryLeaseReply>(), 32);
+    const_assert_eq!(align_of::<QueryLeaseReply>(), 8);
+
+    const_assert_eq!(size_of::<PermanentPoolConfig>(), 96);
+    const_assert_eq!(size_of::<QueryPermanentPoolReply>(), 104);
+
+    const_assert_eq!(size_of::<CursorHeader>(), 64);
+    const_assert_eq!(align_of::<CursorHeader>(), 8);
+    const_assert_eq!(cursor_section_size(), 64 + 256 * 256 * 4);
 
     const_assert_eq!(size_of::<Hdr10StaticMetadata>(), 28);
     const_assert_eq!(align_of::<Hdr10StaticMetadata>(), 4);
@@ -567,12 +781,12 @@ mod layout_tests {
     // Header must fit below the slot array.
     const_assert!(size_of::<RingHeader>() <= RING_SLOTS_OFFSET);
 
-    const_assert_eq!(size_of::<MonitorStatus>(), 80);
+    const_assert_eq!(size_of::<MonitorStatus>(), 96);
     const_assert_eq!(align_of::<MonitorStatus>(), 8);
 
     const_assert_eq!(
         size_of::<GetStatusReply>(),
-        32 + 80 * ABI_MAX_MONITORS as usize
+        32 + 96 * ABI_MAX_MONITORS as usize
     );
     const_assert_eq!(align_of::<GetStatusReply>(), 8);
 
@@ -583,6 +797,10 @@ mod layout_tests {
     const_assert_eq!(ioctl::IOCTL_DESTROY_MONITOR, 0x0022_2008);
     const_assert_eq!(ioctl::IOCTL_PING, 0x0022_200C);
     const_assert_eq!(ioctl::IOCTL_GET_STATUS, 0x0022_2010);
+    const_assert_eq!(ioctl::IOCTL_SET_RENDER_ADAPTER, 0x0022_2014);
+    const_assert_eq!(ioctl::IOCTL_QUERY_LEASE, 0x0022_2018);
+    const_assert_eq!(ioctl::IOCTL_SET_PERMANENT_POOL, 0x0022_201C);
+    const_assert_eq!(ioctl::IOCTL_QUERY_PERMANENT_POOL, 0x0022_2020);
 }
 
 #[cfg(test)]
@@ -661,6 +879,16 @@ mod tests {
         let mut n2 = [0u16; 96];
         names::slot_texture_name(0x0000_0000_0000_00AB, 8, 2, &mut n2);
         assert_ne!(n, n2);
+    }
+
+    #[test]
+    fn cursor_section_name_is_distinct_from_ring() {
+        let mut ring = [0u16; 64];
+        let mut cur = [0u16; 64];
+        names::ring_section_name(0xAB, &mut ring);
+        names::cursor_section_name(0xAB, &mut cur);
+        assert_ne!(ring, cur);
+        assert_eq!(utf16_str(&cur), "Global\\LuminalVGD-cur-00000000000000ab");
     }
 
     #[test]

@@ -24,7 +24,10 @@
 pub mod adapter;
 pub mod edid;
 pub mod error;
+pub mod identity;
 pub mod modes;
+pub mod permanent;
+pub mod persist;
 pub mod ring;
 pub mod session;
 

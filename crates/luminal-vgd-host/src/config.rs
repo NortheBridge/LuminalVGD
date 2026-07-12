@@ -6,7 +6,7 @@
 //! and fills this struct, so the option surface is defined exactly once on
 //! the host side.
 
-use luminal_driver_proto::{DEFAULT_RING_SLOTS, DEFAULT_WATCHDOG_SECS};
+use luminal_driver_proto::{DEFAULT_LEASE_TIMEOUT_MS, DEFAULT_RING_SLOTS, DEFAULT_WATCHDOG_SECS};
 
 #[derive(Clone, Debug)]
 pub struct VgdConfig {
@@ -23,8 +23,22 @@ pub struct VgdConfig {
     /// rung (R5) of the recovery ladder.
     pub dda_enabled: bool,
     /// Request 2× client refresh at CREATE_MONITOR when frame generation
-    /// is active (DESIGN.md §5).
+    /// is active (DESIGN.md §5). With proto v0.3 multi-mode, the doubled
+    /// rate rides the same monitor as `modes[1]` — toggling frame-gen is a
+    /// mode switch, not a monitor re-create.
     pub refresh_doubling: bool,
+    /// Per-lease watchdog timeout requested at CREATE_MONITOR
+    /// (`LEASE_TIMEOUT_USE_DEFAULT` defers to the driver's registry knob).
+    pub lease_timeout_ms: u32,
+    /// Keep each client's display identity stable across reconnects
+    /// (`display_id` derived from the client's persistent id). `false`
+    /// sends `EPHEMERAL_IDENTITY` — no Windows-remembered settings.
+    pub stable_display_identity: bool,
+    /// EDID physical dimensions for created monitors (0 = driver default,
+    /// 600×340 mm). LuminalShine may derive these from client EDID data to
+    /// match the remote panel's DPI.
+    pub physical_width_mm: u32,
+    pub physical_height_mm: u32,
     /// First restore probe fires this long after a fallback.
     pub restore_initial_backoff_ms: u64,
     /// Probe interval backs off exponentially (×2) up to this cap.
@@ -42,6 +56,10 @@ impl Default for VgdConfig {
             watchdog_secs: DEFAULT_WATCHDOG_SECS,
             dda_enabled: true,
             refresh_doubling: true,
+            lease_timeout_ms: DEFAULT_LEASE_TIMEOUT_MS,
+            stable_display_identity: true,
+            physical_width_mm: 0,
+            physical_height_mm: 0,
             restore_initial_backoff_ms: 1_000,
             restore_max_backoff_ms: 30_000,
             restore_stable_frames: 120,

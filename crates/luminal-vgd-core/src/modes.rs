@@ -6,19 +6,19 @@
 //! client asked for — so Windows can never "helpfully" pick something else.
 //! This module owns the envelope checks for that one mode.
 
-use luminal_driver_proto::{caps, BitDepth};
+use luminal_driver_proto::{caps, BitDepth, ModeSpec, MAX_MODES_PER_MONITOR};
 
 use crate::error::CoreError;
 
-/// Supported envelope (SudoVDA lineage: up to 8K / high refresh).
-pub const MIN_WIDTH: u32 = 640;
+/// Supported envelope (libvirtualdisplay-parity: 320×200 floor for retro/
+/// embedded clients, 8K ceiling; no policy refresh ceiling — any positive
+/// millihertz the client asks for, the driver honors).
+pub const MIN_WIDTH: u32 = 320;
 pub const MAX_WIDTH: u32 = 7680;
-pub const MIN_HEIGHT: u32 = 480;
+pub const MIN_HEIGHT: u32 = 200;
 pub const MAX_HEIGHT: u32 = 4320;
-/// 23.000 Hz floor covers 23.976 film rates; 480 Hz ceiling leaves room
-/// for frame-generation doubling of 240 Hz panels.
-pub const MIN_REFRESH_MILLIHZ: u32 = 23_000;
-pub const MAX_REFRESH_MILLIHZ: u32 = 480_000;
+pub const MIN_REFRESH_MILLIHZ: u32 = 1;
+pub const MAX_REFRESH_MILLIHZ: u32 = u32::MAX;
 
 /// A fully validated monitor mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +95,39 @@ impl Mode {
             .contains(&doubled)
             .then_some(doubled)
     }
+
+    /// Validate a `CREATE_MONITOR` mode list: 1..=`MAX_MODES_PER_MONITOR`
+    /// entries, every entry in-envelope, no duplicates. Bit depth / HDR /
+    /// caps apply monitor-wide. `modes[0]` is preferred. Returns the
+    /// validated list in request order.
+    pub fn validate_list(
+        specs: &[ModeSpec],
+        mode_count: u32,
+        bit_depth_raw: u32,
+        hdr_raw: u32,
+        drv_caps: u32,
+    ) -> Result<Vec<Mode>, CoreError> {
+        let count = mode_count as usize;
+        if count == 0 || count > MAX_MODES_PER_MONITOR as usize || count > specs.len() {
+            return Err(CoreError::BadMode);
+        }
+        let mut out = Vec::with_capacity(count);
+        for spec in &specs[..count] {
+            let mode = Mode::validate(
+                spec.width,
+                spec.height,
+                spec.refresh_millihz,
+                bit_depth_raw,
+                hdr_raw,
+                drv_caps,
+            )?;
+            if out.contains(&mode) {
+                return Err(CoreError::BadMode);
+            }
+            out.push(mode);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -120,15 +153,18 @@ mod tests {
 
     #[test]
     fn rejects_out_of_envelope() {
-        assert_eq!(Mode::validate(320, 240, 60_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
+        assert_eq!(Mode::validate(318, 240, 60_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
+        assert_eq!(Mode::validate(640, 198, 60_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
         assert_eq!(Mode::validate(7682, 4320, 60_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
-        assert_eq!(Mode::validate(1920, 1080, 10_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
-        assert_eq!(Mode::validate(1920, 1080, 500_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
+        assert_eq!(Mode::validate(1920, 1080, 0, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
         // Odd dimensions.
         assert_eq!(Mode::validate(1921, 1080, 60_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
         assert_eq!(Mode::validate(1920, 1081, 60_000, 8, 0, ALL_CAPS), Err(CoreError::BadMode));
         // Junk hdr flag.
         assert_eq!(Mode::validate(1920, 1080, 60_000, 8, 7, ALL_CAPS), Err(CoreError::BadMode));
+        // No policy refresh ceiling anymore (libvirtualdisplay parity).
+        assert!(Mode::validate(320, 200, 60_000, 8, 0, ALL_CAPS).is_ok());
+        assert!(Mode::validate(1920, 1080, 1_000_000, 8, 0, ALL_CAPS).is_ok());
     }
 
     #[test]
@@ -172,6 +208,28 @@ mod tests {
     fn refresh_doubling_respects_envelope() {
         assert_eq!(Mode::doubled_refresh(60_000), Some(120_000));
         assert_eq!(Mode::doubled_refresh(240_000), Some(480_000));
-        assert_eq!(Mode::doubled_refresh(241_000), None); // would exceed 480 Hz
+        assert_eq!(Mode::doubled_refresh(u32::MAX), None); // overflow
+    }
+
+    #[test]
+    fn mode_lists_validate_as_a_set() {
+        let specs = [
+            ModeSpec { width: 2560, height: 1440, refresh_millihz: 120_000 },
+            ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 }, // fg-doubled
+            ModeSpec::default(),
+            ModeSpec::default(),
+        ];
+        let modes = Mode::validate_list(&specs, 2, 8, 0, ALL_CAPS).unwrap();
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].refresh_millihz, 120_000, "preferred first");
+
+        // Zero or too many entries.
+        assert_eq!(Mode::validate_list(&specs, 0, 8, 0, ALL_CAPS).err(), Some(CoreError::BadMode));
+        assert_eq!(Mode::validate_list(&specs, 5, 8, 0, ALL_CAPS).err(), Some(CoreError::BadMode));
+        // A bad entry anywhere fails the list (entry 2 is 0×0).
+        assert_eq!(Mode::validate_list(&specs, 3, 8, 0, ALL_CAPS).err(), Some(CoreError::BadMode));
+        // Duplicates rejected.
+        let dup = [specs[0], specs[0]];
+        assert_eq!(Mode::validate_list(&dup, 2, 8, 0, ALL_CAPS).err(), Some(CoreError::BadMode));
     }
 }
