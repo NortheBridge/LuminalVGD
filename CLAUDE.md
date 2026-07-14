@@ -47,3 +47,56 @@ They are the specification; do not contradict them without flagging it.
   versions in `docs/BUILDING.md` when established.
 - Test hardware includes an RTX 5080 host on Insider builds — treat Insider
   regressions as first-class test input, not noise.
+
+## Status & Windows handoff (updated 2026-07-13, main @ b20a492)
+
+Everything portable is built and tested on macOS — 88 unit tests, the
+workspace `cargo check`s for `x86_64-pc-windows-msvc`, zero clippy
+warnings. Phase 1 is complete; phases 3 and 6 exist as tested logic;
+phases 2, 4, 5, and 7 need this Windows box. History: PR #2 = SudoVDA
+port + capture controller (seamless, OS-silent WGC fallback with
+mid-session restore, DESIGN.md §2.1); PR #3 = libvirtualdisplay fold-in
+(proto v0.3: identity/lease split, multi-mode, permanent pool, 256-byte
+HDR EDID, cursor ABI, persistence — THIRD-PARTY-NOTICES.md has the MIT
+entry).
+
+What exists per crate:
+- `luminal-driver-proto` — complete v0.3 ABI, layout-locked. Done.
+- `luminal-vgd-core` — every driver decision (sessions, leases,
+  identity/connectors, EDID, ring policy, pool, persistence). Done.
+- `luminal-vgd-host` — capture controller fully tested; `device.rs` /
+  `RingView` compile for Windows but have never executed.
+- `luminal-vgd-driver` — `dispatch.rs` (the control plane) is tested;
+  **the IddCx shell does not exist yet**.
+
+Ordered plan for this machine (milestones in bold):
+1. Build env: eWDK + windows-drivers-rs, UMDF DLL target,
+   `bcdedit /set testsigning on`; record versions in docs/BUILDING.md.
+2. Phase 2 — IddCx shell in `luminal-vgd-driver`: DriverEntry/WDF device
+   add, `IddCxDeviceInitConfig`, control queue → `dispatch::dispatch()`,
+   1 s WDF timer → `watchdog_tick()`, DXGI adapters →
+   `set_adapters()`, `DeviceState::new(cfg, persisted)` + `startup()`,
+   apply `Effect`s. Add a `vgd-probe` CLI (open → handshake → create →
+   status → destroy). **Milestone: CREATE_MONITOR shows a monitor in
+   Display Settings.**
+3. Phase 4 — transport: `EvtIddCxMonitorAssignSwapChain` → worker
+   thread (`IddCxSwapChainSetDevice` on the monitor's adapter LUID,
+   ReleaseAndAcquireBuffer loop, copy into named keyed-mutex shared
+   textures per `proto::names`, publish `SlotMetadata`, heartbeat
+   ≤500 ms). `core::ring::RingPolicy` makes all slot decisions; every
+   wait bounded; teardown deadline budgeting per DESIGN.md §3.3.
+   Shell must register ETW TraceLogging + WPP IFR (§3.3.6).
+   **Milestone: ring sequences advance while the desktop animates.**
+4. Phase 5 — LuminalShine: `luminalvgd` backend behind
+   `virtual_display_backend` using `luminal-vgd-host` (`VgdDevice`,
+   `RingView`, `ring_watch::classify`, `CaptureController`).
+   **Milestone: Moonlight client streams off the virtual display.**
+5. Dev packaging: INF, inf2cat, test-cert signing, deploy-dev script.
+   OV signing/TrustedPublisher/FORCE_INTEGRITY stay phase 7; strict
+   control-device SDDL (SYSTEM+Admins) is a release blocker (§6).
+
+MVP cuts: SDR 8-bit first; cursor + gamma ramp after first frames; HDR
+verified later; WGC fallback needs no new work. Port libvirtualdisplay's
+`alttab_stress` for the WGC-RELIABILITY.md §7 race when phase 4 lands.
+Merge policy: merge commits, not squash (a squash once orphaned the
+luminalshine submodule pointer); luminalshine merges require green CI.
