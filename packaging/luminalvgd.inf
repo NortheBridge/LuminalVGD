@@ -1,0 +1,88 @@
+; luminalvgd.inf — LuminalVGD (Luminal Video Graphics Display), UMDF IddCx driver.
+; SPDX-License-Identifier: AGPL-3.0-only
+;
+; Dev packaging per DESIGN.md §6. stampinf rewrites DriverVer at build time;
+; inf2cat generates the catalog. UmdfLibraryVersion tracks the UMDF the DLL
+; is compiled against (2.33 — Win11-current; revisit the floor in phase 7).
+
+[Version]
+Signature="$Windows NT$"
+Class=Display
+ClassGUID={4d36e968-e325-11ce-bfc1-08002be10318}
+ClassVer=2.0
+Provider=%ProviderName%
+CatalogFile=luminalvgd.cat
+DriverVer = 07/14/2026,0.1.0.0
+PnpLockdown=1
+
+[Manufacturer]
+%ProviderName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=LuminalVgd_Install, root\luminal_vgd
+
+[SourceDisksFiles]
+luminal_vgd_driver.dll=1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[LuminalVgd_Install.NT]
+; %12%\UMDF copy, not %13% run-from-DriverStore: the reflector on current
+; Insider builds fails to load a UMDF ServiceBinary from %13% (device
+; problem 31). The copy can queue behind a reboot when the old DLL is
+; loaded — the install script warns when that happens.
+CopyFiles=UMDriverCopy
+
+[LuminalVgd_Install.NT.hw]
+AddReg = LuminalVgd_HardwareSettings
+
+[LuminalVgd_HardwareSettings]
+; NOTE: no device-object Security SDDL here — IddCx exposes the OS-facing
+; display interfaces on this same device object, and the graphics stack
+; does not run elevated. The DESIGN.md §6 control-surface ACL must be
+; enforced on the LuminalVGD control path specifically (phase 7:
+; per-interface security or a dedicated control device object); the
+; dispatch handshake gate covers the interim.
+; IddCx requires the IndirectKmd upper filter on the devnode.
+HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+; Dedicated WUDF host pool: LuminalVGD never shares a WUDFHost process
+; with unrelated drivers (blast-radius control for the hang class this
+; driver exists to kill).
+HKR,"WUDF","DeviceGroupId",%REG_SZ%,"LuminalVgdGroup"
+
+[LuminalVgd_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[LuminalVgd_Install.NT.Wdf]
+UmdfService=LuminalVGD,LuminalVgd_UmdfInstall
+UmdfServiceOrder=LuminalVGD
+; IndirectKmd (kernel) is a client of this UMDF driver; without this the
+; reflector refuses the connection and device start fails (0xC0000182).
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+
+[LuminalVgd_UmdfInstall]
+UmdfLibraryVersion=2.33.0
+ServiceBinary=%12%\UMDF\luminal_vgd_driver.dll
+UmdfExtensions=IddCx0102
+
+[WUDFRD_ServiceInstall]
+DisplayName = %WudfRdDisplayName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[UMDriverCopy]
+luminal_vgd_driver.dll
+
+[Strings]
+ProviderName="NortheBridge Foundation"
+DeviceName="Luminal Video Graphics Display"
+DiskName="LuminalVGD Installation Disk"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+REG_MULTI_SZ = 0x00010000
+REG_SZ = 0x00000000

@@ -1,0 +1,111 @@
+﻿# SPDX-License-Identifier: AGPL-3.0-only
+# Install the staged LuminalVGD driver package: verify signature, add the
+# driver package, and create the root\luminal_vgd devnode if missing.
+# TrustedPublisher seeding stays a manual maintainer step (BUILDING.md).
+#Requires -RunAsAdministrator
+param(
+    [string]$Package = (Join-Path $PSScriptRoot "..\target\driver-package")
+)
+$ErrorActionPreference = 'Stop'
+
+$inf = Join-Path $Package 'luminalvgd.inf'
+$cat = Join-Path $Package 'luminalvgd.cat'
+$dll = Join-Path $Package 'luminal_vgd_driver.dll'
+foreach ($f in @($inf, $cat, $dll)) {
+    if (-not (Test-Path $f)) { throw "missing $f — run scripts\build-driver.cmd first" }
+}
+
+$sig = Get-AuthenticodeSignature $cat
+if ($sig.Status -ne 'Valid') {
+    throw "catalog signature is '$($sig.Status)' — sign the package first (docs/BUILDING.md, Signing)"
+}
+$inTrusted = Get-ChildItem Cert:\LocalMachine\TrustedPublisher |
+    Where-Object Thumbprint -eq $sig.SignerCertificate.Thumbprint
+if (-not $inTrusted) {
+    Write-Warning "Signer not in LocalMachine\TrustedPublisher — Windows will show an install prompt."
+}
+
+Write-Host "Adding driver package…"
+pnputil /add-driver $inf /install
+# 3010 = ERROR_SUCCESS_REBOOT_REQUIRED: success, reboot pending.
+if ($LASTEXITCODE -notin 0, 3010) { throw "pnputil /add-driver failed ($LASTEXITCODE)" }
+$rebootPending = ($LASTEXITCODE -eq 3010)
+
+# Root devnodes get SetupDi-generated instance ids (ROOT\DISPLAY\000x);
+# identify ours by hardware id.
+function Get-LuminalDevice {
+    Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+        (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds' -ErrorAction SilentlyContinue).Data -contains 'root\luminal_vgd'
+    }
+}
+$existing = Get-LuminalDevice
+if ($existing) {
+    Write-Host "Devnode already present: $($existing.InstanceId) [$($existing.Status)]"
+} else {
+    Write-Host "Creating root\luminal_vgd devnode…"
+    # devcon-install equivalent via SetupDi (devcon no longer ships in the eWDK).
+    Add-Type -Namespace LuminalVgd -Name DevNode -MemberDefinition @'
+[DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern IntPtr SetupDiCreateDeviceInfoList(ref Guid ClassGuid, IntPtr hwndParent);
+[DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool SetupDiCreateDeviceInfoW(IntPtr DeviceInfoSet, string DeviceName, ref Guid ClassGuid, string DeviceDescription, IntPtr hwndParent, int CreationFlags, ref SP_DEVINFO_DATA DeviceInfoData);
+[DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool SetupDiSetDeviceRegistryPropertyW(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, int Property, byte[] PropertyBuffer, int PropertyBufferSize);
+[DllImport("setupapi.dll", SetLastError = true)]
+public static extern bool SetupDiCallClassInstaller(int InstallFunction, IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData);
+[DllImport("setupapi.dll", SetLastError = true)]
+public static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+[StructLayout(LayoutKind.Sequential)]
+public struct SP_DEVINFO_DATA { public int cbSize; public Guid ClassGuid; public int DevInst; public IntPtr Reserved; }
+'@
+    $displayClass = [Guid]'4d36e968-e325-11ce-bfc1-08002be10318'
+    $DICD_GENERATE_ID = 0x1
+    $SPDRP_HARDWAREID = 0x1
+    $DIF_REGISTERDEVICE = 0x19
+
+    $set = [LuminalVgd.DevNode]::SetupDiCreateDeviceInfoList([ref]$displayClass, [IntPtr]::Zero)
+    if ($set -eq [IntPtr]::Zero -or $set -eq [IntPtr]::new(-1)) { throw "SetupDiCreateDeviceInfoList failed" }
+    try {
+        $data = New-Object LuminalVgd.DevNode+SP_DEVINFO_DATA
+        $data.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($data)
+        if (-not [LuminalVgd.DevNode]::SetupDiCreateDeviceInfoW($set, 'Display', [ref]$displayClass, 'Luminal Video Graphics Display', [IntPtr]::Zero, $DICD_GENERATE_ID, [ref]$data)) {
+            throw "SetupDiCreateDeviceInfo failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+        # REG_MULTI_SZ: "root\luminal_vgd" + double NUL terminator.
+        $hwid = [Text.Encoding]::Unicode.GetBytes("root\luminal_vgd`0`0")
+        if (-not [LuminalVgd.DevNode]::SetupDiSetDeviceRegistryPropertyW($set, [ref]$data, $SPDRP_HARDWAREID, $hwid, $hwid.Length)) {
+            throw "SetupDiSetDeviceRegistryProperty failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+        if (-not [LuminalVgd.DevNode]::SetupDiCallClassInstaller($DIF_REGISTERDEVICE, $set, [ref]$data)) {
+            throw "SetupDiCallClassInstaller(DIF_REGISTERDEVICE) failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+    } finally {
+        [void][LuminalVgd.DevNode]::SetupDiDestroyDeviceInfoList($set)
+    }
+    Write-Host "Devnode registered."
+}
+
+# Registering a devnode does not trigger driver matching, and
+# /scan-devices is unreliable for root-enumerated devices — do what
+# devcon does: UpdateDriverForPlugAndPlayDevices on the hardware id.
+Write-Host "Binding driver to root\luminal_vgd…"
+Add-Type -Namespace LuminalVgd -Name NewDev -MemberDefinition @'
+[DllImport("newdev.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool UpdateDriverForPlugAndPlayDevicesW(IntPtr hwndParent, string HardwareId, string FullInfPath, uint InstallFlags, out bool bRebootRequired);
+'@
+$INSTALLFLAG_FORCE = 0x1
+$reboot = $false
+$infFull = (Resolve-Path $inf).Path
+if (-not [LuminalVgd.NewDev]::UpdateDriverForPlugAndPlayDevicesW([IntPtr]::Zero, 'root\luminal_vgd', $infFull, $INSTALLFLAG_FORCE, [ref]$reboot)) {
+    throw "UpdateDriverForPlugAndPlayDevices failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+}
+if ($reboot -or $rebootPending) { Write-Warning "Windows reports a reboot is required to finish the install." }
+
+Start-Sleep -Seconds 3
+$dev = Get-LuminalDevice
+$dev | Format-Table InstanceId, Status, FriendlyName
+if ($dev) {
+    $inf = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_DriverInfPath' -ErrorAction SilentlyContinue).Data
+    if ($inf) { Write-Host "Driver bound: $inf" } else { Write-Warning "devnode present but no driver bound yet — re-run 'pnputil /scan-devices'" }
+}
+Write-Host "Verify with: cargo run -p vgd-probe --release"

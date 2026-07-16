@@ -1,0 +1,132 @@
+# Building LuminalVGD
+
+Toolchain versions established on the Windows build machine, 2026-07-14.
+This is the environment the driver crates are built and tested against;
+update this file when any component changes.
+
+## Host
+
+| Component | Version |
+| --- | --- |
+| OS | Windows 11 Enterprise 10.0.29617 (Insider) |
+| Rust | rustc 1.90.0 / cargo 1.90.0 (rustup 1.28.2) |
+| Target | `x86_64-pc-windows-msvc` |
+
+## Enterprise WDK (eWDK)
+
+The eWDK is copied to the root of `C:\` (its `Program Files` tree merges
+into the real `C:\Program Files`, so kit paths are canonical).
+
+| Component | Version / location |
+| --- | --- |
+| eWDK build | `br_release_svc_prod3.28000.1761` |
+| SDK/WDK | 10.0.28000.0 (`C:\Program Files\Windows Kits\10`) |
+| VS BuildTools | VS 18, MSVC 14.50.35717 (cl 19.50.35724) |
+| IddCx headers | up to 1.11 (`Include\10.0.28000.0\um\iddcx`) |
+| UMDF | up to 2.35 (`Include\wdf\umdf`) |
+
+Enter the build environment from cmd (interactive):
+
+```
+C:\LaunchBuildEnv.cmd
+```
+
+or non-interactive / from scripts:
+
+```
+C:\BuildEnv\SetupBuildEnv.cmd amd64
+```
+
+Note: `Inf2Cat.exe` lives in the **x86** bin folder
+(`bin\10.0.28000.0\x86`), which is not on the amd64 environment PATH —
+invoke it by full path in packaging scripts.
+
+## Portable workspace
+
+`cargo test --workspace` from the repo root needs none of the above and
+must stay green: 88 tests as of main @ 71418b7.
+
+## Driver (shell) builds
+
+One command stages an installable (unsigned) package at
+`target\driver-package`:
+
+```
+scripts\build-driver.cmd
+```
+
+It sets up the eWDK env, builds `luminal-vgd-driver --features shell`,
+clears the FORCE_INTEGRITY PE bit (wdk-build links /INTEGRITYCHECK, which
+only Microsoft-rooted signatures satisfy — DESIGN.md §6), stamps the INF,
+and runs Inf2Cat. Environment knobs: `EWDK_ROOT` (default `C:\`),
+`LIBCLANG_PATH` (default below).
+
+### Shell toolchain specifics
+
+- **LLVM/libclang 21.1.2 (portable)** at
+  `%USERPROFILE%\clang+llvm-21.1.2-x86_64-pc-windows-msvc` — wdk-sys
+  bindgen breaks with LLVM 22.x layout parsing
+  (<https://github.com/microsoft/windows-drivers-rs/discussions/591>),
+  so `LIBCLANG_PATH` must point at 21.x. (LLVM 22.1.8 is also installed
+  machine-wide at `C:\Program Files\LLVM`; do NOT use it for driver
+  builds.)
+- The eWDK env is created with `-winsdk=none`, so rustc host builds need
+  the SDK libs appended to `LIB` (the build script does this):
+  `%WindowsSdkDir%Lib\%Version_Number%\{um,ucrt}\x64`.
+- **IddCx 1.10** headers/stub (Win11 23H2 floor), UMDF **2.33**. The
+  build script's bindgen pass parses IddCx.h as C++ and patches the UMDF
+  headers' enum forward-declaration mismatch into OUT_DIR (see
+  `crates/luminal-vgd-driver/build.rs`).
+- **cargo-wdk 0.1.1** installed for scaffolding reference; the actual
+  build is plain cargo + wdk-build.
+
+## Installing (dev)
+
+After signing (below): `scripts\install-driver.ps1` from an elevated
+PowerShell — verifies the catalog signature, `pnputil /add-driver
+/install`, and creates the `root\luminal_vgd` devnode (SetupDi; devcon no
+longer ships in the eWDK). Then verify with `cargo run -p vgd-probe
+--release`.
+
+## Signing
+
+Dev machine uses the real OV certificate rather than test signing
+(`bcdedit /set testsigning on` is NOT required for a UMDF package whose
+catalog chains to a trusted root).
+
+The OV certificate is `CN=NortheBridge Foundation` (SSL.com, expires
+2027-06-22, thumbprint `BE990312326FE00EB6400312286A7E307C5D65C0`) in
+`CurrentUser\My`. The private key lives in **SSL.com eSigner** (cloud),
+not on this machine. Two ways to sign:
+
+The working flow:
+
+```
+powershell -File scripts\sign-driver.ps1
+```
+
+It prompts for the SSL.com username/password (hidden, never stored),
+discovers the eSigner credential id, pre-scans both package files with
+CodeSignTool (`scan_code`) — the account has eSigner **Malware Blocker**
+enabled, and unscanned hashes are refused with "hash needs to be scanned
+first" — then signs via signtool through **eSigner CKA** (installed at
+`C:\Program Files (x86)\SSL Corp eSigner CKA`, signed in as the
+maintainer; CodeSignTool lives at `%USERPROFILE%\CodeSignTool`, JDK
+bundled). CodeSignTool 1.3.x has no interactive credential prompts of
+its own — options are mandatory — hence the wrapper. The CKA OTP dialog
+appears during the signtool step.
+
+Gotchas learned the hard way:
+- CKA must be **signed in** before signtool can see the key
+  (`HasPrivateKey` on the cert flips to True via the `eSignerKSP`
+  provider). A manually-imported keyless copy of the cert in
+  `CurrentUser\My` **blocks** CKA's key-linked import — delete it and run
+  `eSignerCKATool.exe load`.
+- The eSigner **TOTP must be enrolled** in the SSL.com dashboard
+  ("signing credentials not configured" otherwise).
+- Driver catalogs are signed via signtool/CKA, not CodeSignTool `sign`.
+
+Signing is a manual, human-attended step, never scripted unattended.
+TrustedPublisher placement is likewise done manually by the maintainer.
+Strict control-device SDDL and full OV packaging requirements remain
+phase 7 (DESIGN.md §6).

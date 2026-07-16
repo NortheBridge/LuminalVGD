@@ -42,15 +42,12 @@ impl Mode {
         hdr_raw: u32,
         drv_caps: u32,
     ) -> Result<Self, CoreError> {
-        if width < MIN_WIDTH
-            || width > MAX_WIDTH
-            || height < MIN_HEIGHT
-            || height > MAX_HEIGHT
-            || refresh_millihz < MIN_REFRESH_MILLIHZ
-            || refresh_millihz > MAX_REFRESH_MILLIHZ
+        if !(MIN_WIDTH..=MAX_WIDTH).contains(&width)
+            || !(MIN_HEIGHT..=MAX_HEIGHT).contains(&height)
+            || !(MIN_REFRESH_MILLIHZ..=MAX_REFRESH_MILLIHZ).contains(&refresh_millihz)
             // Encoders consume 4:2:0; odd dimensions break every one of them.
-            || width % 2 != 0
-            || height % 2 != 0
+            || !width.is_multiple_of(2)
+            || !height.is_multiple_of(2)
         {
             return Err(CoreError::BadMode);
         }
