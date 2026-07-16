@@ -76,7 +76,9 @@ pub enum Effect {
         modes: Vec<Mode>,
         adapter_luid: u64,
         ring_slots: u32,
-        edid: [u8; 256],
+        /// Boxed: keeps Effect variants near-uniform in size (effects
+        /// travel by value through Vec<Effect>).
+        edid: Box<[u8; 256]>,
     },
     /// Unplug the monitor and free its ring (explicit destroy, pool
     /// shrink, or watchdog reap).
@@ -168,7 +170,7 @@ fn plug_effect(m: &Monitor, ring_slots: u32) -> Effect {
         modes: m.modes.clone(),
         adapter_luid: m.adapter_luid,
         ring_slots,
-        edid: monitor_edid(m),
+        edid: Box::new(monitor_edid(m)),
     }
 }
 

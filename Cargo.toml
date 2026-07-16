@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/luminal-driver-proto", "crates/luminal-vgd-core", "crates/luminal-vgd-host", "crates/luminal-vgd-driver"]
+members = ["crates/luminal-driver-proto", "crates/luminal-vgd-core", "crates/luminal-vgd-host", "crates/luminal-vgd-driver", "crates/vgd-probe"]
 
 [workspace.package]
 edition = "2021"
