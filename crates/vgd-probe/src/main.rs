@@ -8,7 +8,9 @@
 //!
 //! ```text
 //! vgd-probe [status]              driver status only, no monitor
-//! vgd-probe [WxH@HZ] [--hold N]   full cycle (default 1920x1080@60, 15 s)
+//! vgd-probe [WxH@HZ] [--hold N]   full cycle; default mode list is
+//!                                 4K120 preferred + 4K60/1080p60
+//!                                 fallbacks (15 s hold)
 //! ```
 
 #![cfg(windows)]
@@ -51,18 +53,25 @@ fn print_status(s: &GetStatusReply) {
 
 struct Args {
     status_only: bool,
-    width: u32,
-    height: u32,
-    refresh_millihz: u32,
+    /// Explicit `WxH@HZ` from the command line; None = default mode list.
+    explicit_mode: Option<ModeSpec>,
     hold_secs: u64,
 }
+
+/// Default mode list when none is given: 4K120 preferred (LG-OLED-class
+/// clients are the LuminalShine baseline), with 4K60 and 1080p60
+/// fallbacks. Also exercises the driver's MULTI_MODE path — the probe's
+/// production counterpart passes the client's exact modes instead.
+const DEFAULT_MODES: [ModeSpec; 3] = [
+    ModeSpec { width: 3840, height: 2160, refresh_millihz: 120_000 },
+    ModeSpec { width: 3840, height: 2160, refresh_millihz: 60_000 },
+    ModeSpec { width: 1920, height: 1080, refresh_millihz: 60_000 },
+];
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         status_only: false,
-        width: 1920,
-        height: 1080,
-        refresh_millihz: 60_000,
+        explicit_mode: None,
         hold_secs: 15,
     };
     let mut it = std::env::args().skip(1);
@@ -77,10 +86,12 @@ fn parse_args() -> Result<Args, String> {
                 // WxH or WxH@HZ (HZ may be fractional, e.g. 59.94)
                 let (dims, hz) = mode.split_once('@').unwrap_or((mode, "60"));
                 let (w, h) = dims.split_once('x').ok_or_else(|| format!("bad mode: {mode}"))?;
-                args.width = w.parse().map_err(|_| format!("bad width: {w}"))?;
-                args.height = h.parse().map_err(|_| format!("bad height: {h}"))?;
                 let hz: f64 = hz.parse().map_err(|_| format!("bad refresh: {hz}"))?;
-                args.refresh_millihz = (hz * 1000.0).round() as u32;
+                args.explicit_mode = Some(ModeSpec {
+                    width: w.parse().map_err(|_| format!("bad width: {w}"))?,
+                    height: h.parse().map_err(|_| format!("bad height: {h}"))?,
+                    refresh_millihz: (hz * 1000.0).round() as u32,
+                });
             }
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -138,16 +149,22 @@ fn main() -> ExitCode {
         .unwrap_or(1)
         | (std::process::id() as u64) << 48;
 
+    let mode_list: Vec<ModeSpec> = match args.explicit_mode {
+        Some(m) => vec![m],
+        None => DEFAULT_MODES.to_vec(),
+    };
+    let described: Vec<String> = mode_list
+        .iter()
+        .map(|m| format!("{}x{}@{}mHz", m.width, m.height, m.refresh_millihz))
+        .collect();
     println!(
-        "[3/6] CREATE_MONITOR {}x{}@{} mHz (session {:#x}, display {:#x})…",
-        args.width, args.height, args.refresh_millihz, session_id, PROBE_DISPLAY_ID
+        "[3/6] CREATE_MONITOR [{}] (session {:#x}, display {:#x})…",
+        described.join(", "),
+        session_id,
+        PROBE_DISPLAY_ID
     );
     let mut modes = [ModeSpec::default(); MAX_MODES_PER_MONITOR as usize];
-    modes[0] = ModeSpec {
-        width: args.width,
-        height: args.height,
-        refresh_millihz: args.refresh_millihz,
-    };
+    modes[..mode_list.len()].copy_from_slice(&mode_list);
     let mut friendly_name = [0u16; 32];
     for (i, c) in "LuminalVGD Probe".encode_utf16().enumerate() {
         friendly_name[i] = c;
@@ -161,7 +178,7 @@ fn main() -> ExitCode {
         hdr: 0,
         edid_serial: 0,
         flags: 0,
-        mode_count: 1,
+        mode_count: mode_list.len() as u32,
         modes,
         physical_width_mm: 0,
         physical_height_mm: 0,
