@@ -60,6 +60,10 @@ struct Args {
     /// (no remembered topology/disconnect state) — useful when the stable
     /// probe identity has accumulated unwanted display-settings memory.
     ephemeral: bool,
+    /// Act as a ring consumer during the hold: claim/release published
+    /// slots continuously (~5 ms cadence). Exercises the reader protocol
+    /// end to end; with a consumer draining, driver drops should stay ≈0.
+    consume: bool,
 }
 
 /// Default mode list when none is given: 4K120 preferred (LG-OLED-class
@@ -78,12 +82,14 @@ fn parse_args() -> Result<Args, String> {
         explicit_mode: None,
         hold_secs: 15,
         ephemeral: false,
+        consume: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "status" => args.status_only = true,
             "--ephemeral" => args.ephemeral = true,
+            "--consume" => args.consume = true,
             "--hold" => {
                 let v = it.next().ok_or("--hold needs a value")?;
                 args.hold_secs = v.parse().map_err(|_| format!("bad --hold value: {v}"))?;
@@ -247,8 +253,24 @@ fn main() -> ExitCode {
     let mut first_seq = None;
     let mut prev_seq = 0u64;
     let mut prev_heartbeat = 0u64;
+    let mut consumed_total = 0u64;
     for tick in 0..args.hold_secs {
-        std::thread::sleep(Duration::from_secs(1));
+        if args.consume {
+            // Drain published slots at ~5 ms cadence for the whole tick:
+            // claim newest → (a real consumer would encode here) → release.
+            let tick_end = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < tick_end {
+                if let Some(view) = &ring {
+                    while let Some(frame) = view.claim_latest() {
+                        view.release(frame.index);
+                        consumed_total += 1;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs(1));
+        }
         match dev.ping(session_id) {
             Ok(r) if r == err::OK => {}
             Ok(r) => {
@@ -270,8 +292,13 @@ fn main() -> ExitCode {
             };
             let fps = h.latest_sequence.saturating_sub(prev_seq);
             let beating = if h.driver_heartbeat_qpc != prev_heartbeat { "beating" } else { "STALE" };
+            let consumed = if args.consume {
+                format!(" consumed {consumed_total}")
+            } else {
+                String::new()
+            };
             println!(
-                "  [{:>2}s] gen {} {} seq {} (+{}/s) published {} dropped {} heartbeat {}",
+                "  [{:>2}s] gen {} {} seq {} (+{}/s) published {} dropped {}{} heartbeat {}",
                 tick + 1,
                 h.ring_generation,
                 state,
@@ -279,6 +306,7 @@ fn main() -> ExitCode {
                 fps,
                 h.frames_published,
                 h.frames_dropped,
+                consumed,
                 beating
             );
             if first_seq.is_none() {

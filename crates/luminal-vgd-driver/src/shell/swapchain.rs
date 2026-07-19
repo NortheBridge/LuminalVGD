@@ -415,6 +415,15 @@ fn publish_frame(
         );
     }
 
+    // Absorb the host's reader transitions (READING claims, FREE
+    // releases) so writer decisions respect checked-out slots and reuse
+    // consumed ones without counting drops.
+    if let Some(s) = &ring.section {
+        for index in 0..ring.policy.slot_count() {
+            ring.policy.reconcile_shared(index, s.slot_state(index));
+        }
+    }
+
     let Some(writer) = ring.policy.writer_acquire() else {
         // Reader holds everything (pathological): drop, never block.
         if let Some(s) = &ring.section {
