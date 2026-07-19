@@ -91,6 +91,16 @@ impl RingPolicy {
         }
     }
 
+    /// Writer could not complete the copy (bounded mutex acquire timed
+    /// out, device loss mid-write): revert the slot without publishing.
+    /// The frame is dropped and counted; any frame the acquire overwrote
+    /// was already counted by `writer_acquire`.
+    pub fn writer_abort(&mut self, index: usize) {
+        debug_assert_eq!(self.slots[index], Slot::Writing);
+        self.slots[index] = Slot::Free;
+        self.frames_dropped += 1;
+    }
+
     /// Writer finished copying: publish the slot. Returns the frame's
     /// sequence number (monotonic, gap-free on the writer side).
     pub fn publish(&mut self, index: usize) -> u64 {
@@ -221,6 +231,20 @@ mod tests {
         }
         assert_eq!(r.writer_acquire(), None, "no slot: drop, don't block");
         assert_eq!(r.frames_dropped, 1);
+    }
+
+    #[test]
+    fn writer_abort_reverts_and_counts_without_a_sequence() {
+        let mut r = RingPolicy::new(2);
+        let w = r.writer_acquire().unwrap();
+        r.writer_abort(w.index);
+        assert_eq!(r.slot(w.index), Slot::Free);
+        assert_eq!(r.frames_dropped, 1);
+        assert_eq!(r.frames_published, 0);
+        // The next publish still starts the sequence at 1 — aborts never
+        // consume sequence numbers, so readers see no phantom gap.
+        let w = r.writer_acquire().unwrap();
+        assert_eq!(r.publish(w.index), 1);
     }
 
     #[test]

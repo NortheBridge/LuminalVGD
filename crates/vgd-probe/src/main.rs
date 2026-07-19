@@ -19,10 +19,10 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use luminal_driver_proto::{
-    err, CreateMonitorRequest, GetStatusReply, ModeSpec, LEASE_TIMEOUT_USE_DEFAULT,
-    MAX_MODES_PER_MONITOR,
+    create_flags, err, ring_state, CreateMonitorRequest, GetStatusReply, ModeSpec,
+    LEASE_TIMEOUT_USE_DEFAULT, MAX_MODES_PER_MONITOR,
 };
-use luminal_vgd_host::device::VgdDevice;
+use luminal_vgd_host::device::{RingView, VgdDevice};
 
 /// Stable default display identity so repeated probe runs exercise the
 /// identity-retention path (same connector, remembered settings).
@@ -56,6 +56,10 @@ struct Args {
     /// Explicit `WxH@HZ` from the command line; None = default mode list.
     explicit_mode: Option<ModeSpec>,
     hold_secs: u64,
+    /// Mint a throwaway identity: Windows treats the monitor as brand new
+    /// (no remembered topology/disconnect state) — useful when the stable
+    /// probe identity has accumulated unwanted display-settings memory.
+    ephemeral: bool,
 }
 
 /// Default mode list when none is given: 4K120 preferred (LG-OLED-class
@@ -73,11 +77,13 @@ fn parse_args() -> Result<Args, String> {
         status_only: false,
         explicit_mode: None,
         hold_secs: 15,
+        ephemeral: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "status" => args.status_only = true,
+            "--ephemeral" => args.ephemeral = true,
             "--hold" => {
                 let v = it.next().ok_or("--hold needs a value")?;
                 args.hold_secs = v.parse().map_err(|_| format!("bad --hold value: {v}"))?;
@@ -171,13 +177,13 @@ fn main() -> ExitCode {
     }
     let req = CreateMonitorRequest {
         session_id,
-        display_id: PROBE_DISPLAY_ID,
+        display_id: if args.ephemeral { 0 } else { PROBE_DISPLAY_ID },
         adapter_luid: 0,
         lease_timeout_ms: LEASE_TIMEOUT_USE_DEFAULT,
         bit_depth: 8,
         hdr: 0,
         edid_serial: 0,
-        flags: 0,
+        flags: if args.ephemeral { create_flags::EPHEMERAL_IDENTITY } else { 0 },
         mode_count: mode_list.len() as u32,
         modes,
         physical_width_mm: 0,
@@ -216,10 +222,32 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "[5/6] holding for {} s — the monitor should be visible in Display Settings now…",
+        "[5/6] holding for {} s — monitor visible in Display Settings; watching the frame ring…",
         args.hold_secs
     );
-    for _ in 0..args.hold_secs {
+    // The driver creates the ring section at monitor plug; allow a short
+    // grace for the first map.
+    let ring = {
+        let mut view = None;
+        for _ in 0..15 {
+            match RingView::open(session_id, reply.ring_slots) {
+                Ok(v) => {
+                    view = Some(v);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
+        }
+        view
+    };
+    if ring.is_none() {
+        eprintln!("  (ring section not mappable — transport inactive, control plane only)");
+    }
+
+    let mut first_seq = None;
+    let mut prev_seq = 0u64;
+    let mut prev_heartbeat = 0u64;
+    for tick in 0..args.hold_secs {
         std::thread::sleep(Duration::from_secs(1));
         match dev.ping(session_id) {
             Ok(r) if r == err::OK => {}
@@ -231,6 +259,41 @@ fn main() -> ExitCode {
                 eprintln!("  PING failed: {e}");
                 break;
             }
+        }
+        if let Some(view) = &ring {
+            let h = view.header();
+            let state = match h.state {
+                ring_state::ACTIVE => "ACTIVE",
+                ring_state::REBUILDING => "REBUILDING",
+                ring_state::DEAD => "DEAD",
+                _ => "UNINITIALIZED",
+            };
+            let fps = h.latest_sequence.saturating_sub(prev_seq);
+            let beating = if h.driver_heartbeat_qpc != prev_heartbeat { "beating" } else { "STALE" };
+            println!(
+                "  [{:>2}s] gen {} {} seq {} (+{}/s) published {} dropped {} heartbeat {}",
+                tick + 1,
+                h.ring_generation,
+                state,
+                h.latest_sequence,
+                fps,
+                h.frames_published,
+                h.frames_dropped,
+                beating
+            );
+            if first_seq.is_none() {
+                first_seq = Some(h.latest_sequence);
+            }
+            prev_seq = h.latest_sequence;
+            prev_heartbeat = h.driver_heartbeat_qpc;
+        }
+    }
+    if let (Some(view), Some(first)) = (&ring, first_seq) {
+        let advanced = view.header().latest_sequence.saturating_sub(first);
+        if advanced > 0 {
+            println!("  ring milestone: sequences advanced by {advanced} during the hold ✔");
+        } else {
+            println!("  ring milestone NOT met: latest_sequence did not advance ✘");
         }
     }
 

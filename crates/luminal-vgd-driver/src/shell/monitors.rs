@@ -35,6 +35,7 @@ pub fn plug(
     connector_index: u32,
     modes: Vec<Mode>,
     _adapter_luid: u64,
+    ring_slots: u32,
     edid: Box<[u8; 256]>,
 ) {
     let shell = Shell::get();
@@ -70,6 +71,11 @@ pub fn plug(
         }
         let monitor = out_args.MonitorObject;
 
+        // The ring section exists from plug time (state ACTIVE, no frames
+        // yet) so the host can map it as soon as CREATE_MONITOR replies.
+        let ring = std::sync::Arc::new(std::sync::Mutex::new(
+            super::swapchain::FrameRing::new(session_id, ring_slots),
+        ));
         shell.monitors.lock().unwrap().insert(
             session_id,
             MonitorRt {
@@ -77,6 +83,7 @@ pub fn plug(
                 edid,
                 modes,
                 worker: None,
+                ring,
             },
         );
 
@@ -96,7 +103,8 @@ pub fn plug(
     }
 }
 
-/// Unplug: stop the frame worker (bounded), then IddCxMonitorDeparture.
+/// Unplug: stop the frame worker (bounded), mark the ring DEAD so the
+/// host unmaps, then IddCxMonitorDeparture.
 pub fn unplug(session_id: u64) {
     let shell = Shell::get();
     let Some(mut rt) = shell.monitors.lock().unwrap().remove(&session_id) else {
@@ -104,6 +112,11 @@ pub fn unplug(session_id: u64) {
     };
     if let Some(worker) = rt.worker.take() {
         worker.stop();
+    }
+    if let Ok(ring) = rt.ring.lock() {
+        if let Some(section) = &ring.section {
+            section.set_state(luminal_driver_proto::ring_state::DEAD);
+        }
     }
     unsafe {
         let status = bindings::monitor_departure(rt.monitor.0.cast());
@@ -231,8 +244,10 @@ pub unsafe extern "C" fn evt_query_target_modes(
     for (slot, mode) in slots.iter_mut().zip(modes.iter()) {
         slot.Size = size_of::<ffi::IDDCX_TARGET_MODE>() as u32;
         slot.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, 1);
-        slot.RequiredBandwidth =
-            (mode.width as u64) * (mode.height as u64) * (mode.refresh_millihz as u64) / 1000;
+        // Zero, matching MaxDisplayPipelineRate = 0: bandwidth management
+        // unused. A nonzero requirement against a zero adapter budget makes
+        // every mode unactivatable (Extend reverts, Scale/Res grayed).
+        slot.RequiredBandwidth = 0;
     }
     out.TargetModeBufferOutputCount = fill as u32;
     STATUS_SUCCESS
@@ -324,8 +339,10 @@ pub unsafe extern "C" fn evt_query_target_modes2(
     for (slot, mode) in slots.iter_mut().zip(modes.iter()) {
         slot.Size = size_of::<ffi::IDDCX_TARGET_MODE2>() as u32;
         slot.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, 1);
-        slot.RequiredBandwidth =
-            (mode.width as u64) * (mode.height as u64) * (mode.refresh_millihz as u64) / 1000;
+        // Zero, matching MaxDisplayPipelineRate = 0: bandwidth management
+        // unused. A nonzero requirement against a zero adapter budget makes
+        // every mode unactivatable (Extend reverts, Scale/Res grayed).
+        slot.RequiredBandwidth = 0;
         slot.BitsPerComponent = wire_bpc_sdr8();
     }
     out.TargetModeBufferOutputCount = fill as u32;

@@ -15,6 +15,7 @@ mod control;
 mod dxgi;
 mod entry;
 mod monitors;
+mod ring;
 mod swapchain;
 
 // Private to `shell` but visible to all submodules (descendants see
@@ -67,6 +68,10 @@ pub(crate) struct MonitorRt {
     pub edid: Box<[u8; 256]>,
     pub modes: Vec<Mode>,
     pub worker: Option<swapchain::Worker>,
+    /// The transport ring (section + policy + textures). Lives here, not
+    /// in the worker, so sequences and the generation persist across
+    /// swap-chain reassignments; the active worker drives it exclusively.
+    pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
 }
 
 pub(crate) struct Shell {
