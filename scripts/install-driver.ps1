@@ -27,8 +27,10 @@ if (-not $inTrusted) {
 
 Write-Host "Adding driver package…"
 pnputil /add-driver $inf /install
-# 3010 = ERROR_SUCCESS_REBOOT_REQUIRED: success, reboot pending.
-if ($LASTEXITCODE -notin 0, 3010) { throw "pnputil /add-driver failed ($LASTEXITCODE)" }
+# 0 = added; 3010 = success, reboot pending; 259 = ERROR_NO_MORE_ITEMS
+# (package already published, nothing newly added — the force-rebind below
+# still installs the staged binary on the device).
+if ($LASTEXITCODE -notin 0, 3010, 259) { throw "pnputil /add-driver failed ($LASTEXITCODE)" }
 $rebootPending = ($LASTEXITCODE -eq 3010)
 
 # Root devnodes get SetupDi-generated instance ids (ROOT\DISPLAY\000x);

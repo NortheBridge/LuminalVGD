@@ -135,5 +135,42 @@ breadcrumbs localize any bring-up failure. Deviations to revisit: WPP/IFR
 not wired (TraceLogging only); shell state is a process global keyed to
 the single root-enumerated devnode.
 
-Next: phase 4 (transport — swapchain worker → shared keyed-mutex texture
-ring per plan step 3), then phase 5 (LuminalShine backend).
+### Phase 4 (transport) — COMPLETE (2026-07-18, Windows box)
+
+**Milestone verified: ring sequences advance while the desktop animates**
+(2,108 frames published in a 30 s hold at 4K120, ephemeral identity, no
+compositor stalls). The worker GPU-copies each acquired frame into named
+keyed-mutex shared textures and publishes through the shared ring
+section; `core::ring::RingPolicy` makes every slot decision. Ring state
+lives in MonitorRt (sequences/generation survive reassignment); section
+is created at plug (SDDL SYSTEM+Admins), textures lazily per frame-desc
+(size change ⇒ generation bump).
+
+Bring-up lessons (cost three compositor freezes to learn):
+- `IddCxSwapChainReleaseAndAcquireBuffer` returns COM **E_PENDING
+  (0x8000000A)**, not STATUS_PENDING, for "no frame yet" — treating it as
+  fatal abandons the swapchain mid-activation and stalls the compositor
+  until the OS kills WUDFHost.
+- On real acquire/publish failure: mark REBUILDING, retire textures,
+  **exit the worker** — never retry SetDevice on the same swapchain (the
+  OS drives recovery via unassign→assign; holding the dead swapchain
+  blocks modeset teardown).
+- The OS unassigns+reassigns the swapchain ~10 ms after activation
+  (routine); first SetDevice often fails DXGI_ERROR_ACCESS_LOST —
+  harmless when the exit path is clean.
+- Adapter caps: MaxDisplayPipelineRate=0 AND target-mode
+  RequiredBandwidth=0 (nonzero bandwidth vs zero budget makes every mode
+  unactivatable: Extend reverts, Scale/Resolution grayed).
+- Windows remembers per-identity topology ("Disconnect this display"
+  sticks across sessions); vgd-probe --ephemeral mints a fresh identity.
+
+Phase-5 notes: keyed-mutex protocol is key 0 pre-first-publish, key 1
+after; readability travels in SlotMetadata.state (mutex only guards
+pixels). Reader-side slot-state reconciliation (host CAS
+PUBLISHED→READING→FREE, driver honoring shared state) lands with the
+consumer. With no reader, drops ≈ published − slots (drop-oldest working
+as specified). ETW: FrameLoopStart/RingTexturesCreated/
+AcquireBufferFailedExit etc. under the provider GUID above.
+
+Next: phase 5 (LuminalShine `luminalvgd` backend consuming the ring),
+then WGC-RELIABILITY §7 alttab_stress port, cursor/gamma/HDR DDIs.
