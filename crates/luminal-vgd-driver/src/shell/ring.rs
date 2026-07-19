@@ -226,6 +226,13 @@ impl RingSection {
         }
     }
 
+    /// Acquire-load one slot's shared state (the host writes READING/FREE
+    /// transitions here — feed into `RingPolicy::reconcile_shared`).
+    pub fn slot_state(&self, index: usize) -> u32 {
+        let slot = self.slot_ptr(index);
+        unsafe { AtomicU32::from_ptr(&mut (*slot).state).load(Ordering::Acquire) }
+    }
+
     /// Reset one slot to FREE (aborted write).
     pub fn reset_slot_free(&self, index: usize) {
         let slot = self.slot_ptr(index);
