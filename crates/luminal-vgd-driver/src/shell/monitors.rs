@@ -269,10 +269,20 @@ pub unsafe extern "C" fn evt_commit_modes(
 // HDR paths get real implementations alongside caps::HDR10 later.
 // ---------------------------------------------------------------------
 
-/// SDR-only wire format: 8-bit RGB, nothing else.
-fn wire_bpc_sdr8() -> ffi::IDDCX_WIRE_BITS_PER_COMPONENT {
+/// Wire format for one mode: RGB at the session's bit depth (8 for SDR-8,
+/// 10 for SDR-10/HDR10, 12 for HDR12). The OS picks the highest depth the
+/// whole path supports; HDR additionally needs the EDID's CTA-861.3 block
+/// (core::edid) and the adapter's CAN_PROCESS_FP16 flag (shell::entry).
+fn wire_bpc_for(mode: &Mode) -> ffi::IDDCX_WIRE_BITS_PER_COMPONENT {
+    use luminal_driver_proto::BitDepth;
     let mut bpc: ffi::IDDCX_WIRE_BITS_PER_COMPONENT = unsafe { zeroed() };
-    bpc.Rgb = ffi::IDDCX_BITS_PER_COMPONENT_IDDCX_BITS_PER_COMPONENT_8;
+    bpc.Rgb = match mode.bit_depth {
+        BitDepth::Sdr8 => ffi::IDDCX_BITS_PER_COMPONENT_IDDCX_BITS_PER_COMPONENT_8,
+        BitDepth::Sdr10 | BitDepth::Hdr10 => {
+            ffi::IDDCX_BITS_PER_COMPONENT_IDDCX_BITS_PER_COMPONENT_10
+        }
+        BitDepth::Hdr12 => ffi::IDDCX_BITS_PER_COMPONENT_IDDCX_BITS_PER_COMPONENT_12,
+    };
     bpc
 }
 
@@ -282,7 +292,11 @@ pub unsafe extern "C" fn evt_adapter_query_target_info(
     out_args: *mut ffi::IDARG_OUT_QUERYTARGET_INFO,
 ) -> NTSTATUS {
     let out = &mut *out_args;
-    out.TargetCaps = ffi::IDDCX_TARGET_CAPS_IDDCX_TARGET_CAPS_NONE;
+    // HDR10/advanced color needs the target to advertise the wide/high
+    // color-space pipeline; harmless for SDR-only monitors (the OS still
+    // gates on the per-monitor EDID + wire bit depth).
+    out.TargetCaps = ffi::IDDCX_TARGET_CAPS_IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE
+        | ffi::IDDCX_TARGET_CAPS_IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE;
     out.DitheringSupport = zeroed();
     STATUS_SUCCESS
 }
@@ -313,7 +327,7 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         slot.Size = size_of::<ffi::IDDCX_MONITOR_MODE2>() as u32;
         slot.Origin = ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
         slot.MonitorVideoSignalInfo = signal_info(mode, 0);
-        slot.BitsPerComponent = wire_bpc_sdr8();
+        slot.BitsPerComponent = wire_bpc_for(mode);
     }
     out.MonitorModeBufferOutputCount = fill as u32;
     STATUS_SUCCESS
@@ -343,7 +357,7 @@ pub unsafe extern "C" fn evt_query_target_modes2(
         // unused. A nonzero requirement against a zero adapter budget makes
         // every mode unactivatable (Extend reverts, Scale/Res grayed).
         slot.RequiredBandwidth = 0;
-        slot.BitsPerComponent = wire_bpc_sdr8();
+        slot.BitsPerComponent = wire_bpc_for(mode);
     }
     out.TargetModeBufferOutputCount = fill as u32;
     STATUS_SUCCESS
@@ -357,10 +371,23 @@ pub unsafe extern "C" fn evt_commit_modes2(
 }
 
 pub unsafe extern "C" fn evt_set_default_hdr_metadata(
-    _monitor: ffi::IDDCX_MONITOR,
-    _in_args: *const ffi::IDARG_IN_MONITOR_SET_DEFAULT_HDR_METADATA,
+    monitor: ffi::IDDCX_MONITOR,
+    in_args: *const ffi::IDARG_IN_MONITOR_SET_DEFAULT_HDR_METADATA,
 ) -> NTSTATUS {
-    // SDR-only shell: accept and ignore. Stored + used when caps::HDR10
-    // and the phase-4 frame pipeline land.
+    // The OS pushes the desktop's effective HDR10 static metadata here when
+    // advanced color engages. The wire pixels already carry the composed
+    // desktop (FP16 scRGB), so nothing needs reprocessing — trace it for
+    // diagnostics; surfacing it to the host via GET_STATUS can come later
+    // if the encoder wants monitor-derived mastering data.
+    let inp = &*in_args;
+    let meta_type = inp.Type as u32;
+    tracelogging::write_event!(
+        PROVIDER,
+        "SetDefaultHdrMetaData",
+        level(Informational),
+        u64("monitor", &(monitor as u64)),
+        u32("type", &meta_type),
+        u32("size", &inp.Size)
+    );
     STATUS_SUCCESS
 }

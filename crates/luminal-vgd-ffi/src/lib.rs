@@ -31,6 +31,14 @@ use luminal_vgd_host::device::{RingView, VgdDevice};
 /// negative proto `err::*` code from the driver.
 pub const VGD_ERR_IO: i32 = -1000;
 
+/// Capability bits of `VgdCaps.caps` the backend gates on (literal
+/// mirrors of proto `caps::*`; the asserts below keep them honest —
+/// cbindgen cannot evaluate cross-crate constants).
+pub const VGD_CAP_HDR10: u32 = 1;
+pub const VGD_CAP_SDR10_BIT: u32 = 4;
+const _: () = assert!(VGD_CAP_HDR10 == luminal_driver_proto::caps::HDR10);
+const _: () = assert!(VGD_CAP_SDR10_BIT == luminal_driver_proto::caps::SDR10_BIT);
+
 pub struct VgdDeviceHandle(VgdDevice);
 pub struct VgdRingHandle(RingView);
 

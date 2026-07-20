@@ -183,6 +183,11 @@ unsafe extern "C" fn evt_d0_entry(
     let mut caps: ffi::IDDCX_ADAPTER_CAPS = zeroed();
     caps.Size = size_of::<ffi::IDDCX_ADAPTER_CAPS>() as u32;
     caps.MaxMonitorsSupported = luminal_driver_proto::DEFAULT_MAX_MONITORS;
+    // HDR10: the OS only offers advanced color on an indirect display when
+    // the adapter declares it can process FP16 desktop content; the frame
+    // pipeline is format-agnostic (ring textures follow the acquired
+    // frame's desc), so this is safe to declare unconditionally.
+    caps.Flags = ffi::IDDCX_ADAPTER_FLAGS_IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
     // MaxDisplayPipelineRate stays 0 (IddSampleDriver convention);
     // u64::MAX fails IddCxAdapterInitAsync parameter validation.
     caps.EndPointDiagnostics.Size = size_of::<ffi::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32;
