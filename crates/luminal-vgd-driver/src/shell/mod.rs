@@ -40,7 +40,7 @@ pub(crate) const SHELL_CAPS: u32 = luminal_driver_proto::caps::MULTI_MODE
 
 /// Monotonic build stamp reported in HANDSHAKE/GET_STATUS (CI will stamp
 /// this properly in phase 7; hand-bumped during bring-up).
-pub(crate) const DRIVER_BUILD: u32 = 1;
+pub(crate) const DRIVER_BUILD: u32 = 2;
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
 /// terminator survives.
