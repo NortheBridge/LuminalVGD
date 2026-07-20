@@ -20,6 +20,15 @@
  */
 #define VGD_ERR_IO -1000
 
+/**
+ * Capability bits of `VgdCaps.caps` the backend gates on (literal
+ * mirrors of proto `caps::*`; the asserts below keep them honest —
+ * cbindgen cannot evaluate cross-crate constants).
+ */
+#define VGD_CAP_HDR10 1
+
+#define VGD_CAP_SDR10_BIT 4
+
 typedef struct VgdDeviceHandle VgdDeviceHandle;
 
 typedef struct VgdRingHandle VgdRingHandle;

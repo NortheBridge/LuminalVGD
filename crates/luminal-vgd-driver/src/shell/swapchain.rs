@@ -55,6 +55,10 @@ pub(crate) struct FrameRing {
     textures: Vec<SharedTexture>,
     tex_width: u32,
     tex_height: u32,
+    /// DXGI_FORMAT raw value of the current textures; the OS switches the
+    /// swapchain surface format when advanced color toggles (BGRA8 ⇄ FP16),
+    /// which retires textures exactly like a size change.
+    tex_format: u32,
     /// Per-slot: has this slot ever been published this generation? A
     /// never-published slot's keyed mutex is still at its creation key
     /// (0, driver); after the first publish it lives at key 1 (host).
@@ -88,6 +92,7 @@ impl FrameRing {
             textures: Vec::new(),
             tex_width: 0,
             tex_height: 0,
+            tex_format: 0,
             ever_published: vec![false; slots],
             assigned_before: false,
         }
@@ -99,6 +104,7 @@ impl FrameRing {
         self.textures.clear();
         self.tex_width = 0;
         self.tex_height = 0;
+        self.tex_format = 0;
         self.ever_published.iter_mut().for_each(|b| *b = false);
         let generation = self.policy.rebuild();
         if let Some(s) = &self.section {
@@ -299,9 +305,16 @@ fn frame_loop(
             last_heartbeat = Instant::now();
         }
 
-        let mut out: ffi::IDARG_OUT_RELEASEANDACQUIREBUFFER = unsafe { zeroed() };
-        let status =
-            unsafe { bindings::swapchain_release_and_acquire_buffer(swapchain.0.cast(), &mut out) };
+        // Buffer2 is mandatory for CAN_PROCESS_FP16 adapters (IddCx 1.10):
+        // METADATA2 carries per-frame HDR metadata / surface color space /
+        // SDR white level alongside the same surface + QPC fields.
+        let mut in_args: ffi::IDARG_IN_RELEASEANDACQUIREBUFFER2 = unsafe { zeroed() };
+        in_args.Size = size_of::<ffi::IDARG_IN_RELEASEANDACQUIREBUFFER2>() as u32;
+        let mut out: ffi::IDARG_OUT_RELEASEANDACQUIREBUFFER2 = unsafe { zeroed() };
+        out.MetaData.Size = size_of::<ffi::IDDCX_METADATA2>() as u32;
+        let status = unsafe {
+            bindings::swapchain_release_and_acquire_buffer2(swapchain.0.cast(), &mut in_args, &mut out)
+        };
         if status == STATUS_PENDING || status == E_PENDING {
             unsafe {
                 let _ = WaitForSingleObject(HANDLE(frame_event.0), 100);
@@ -370,7 +383,7 @@ fn publish_frame(
     ring: &mut FrameRing,
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
-    meta: &ffi::IDDCX_METADATA,
+    meta: &ffi::IDDCX_METADATA2,
 ) -> windows::core::Result<()> {
     if ring.section.is_none() {
         return Ok(()); // transport disabled; drain-only
@@ -387,9 +400,14 @@ fn publish_frame(
     unsafe { frame_tex.GetDesc(&mut desc) };
 
     // Lazy texture (re)creation: first frame, or the committed mode
-    // changed size. A size change is a full generation bump so the host
-    // re-opens textures by name.
-    if ring.textures.is_empty() || desc.Width != ring.tex_width || desc.Height != ring.tex_height {
+    // changed size, or the surface format changed (advanced-color toggle
+    // switches BGRA8 ⇄ FP16). Any change is a full generation bump so the
+    // host re-opens textures by name and re-latches the format.
+    if ring.textures.is_empty()
+        || desc.Width != ring.tex_width
+        || desc.Height != ring.tex_height
+        || desc.Format.0 as u32 != ring.tex_format
+    {
         if !ring.textures.is_empty() {
             ring.retire_textures();
         }
@@ -401,9 +419,11 @@ fn publish_frame(
             slots,
             desc.Width,
             desc.Height,
+            desc.Format,
         )?;
         ring.tex_width = desc.Width;
         ring.tex_height = desc.Height;
+        ring.tex_format = desc.Format.0 as u32;
         tracelogging::write_event!(
             PROVIDER,
             "RingTexturesCreated",
@@ -411,7 +431,8 @@ fn publish_frame(
             u64("session", &session_id),
             u32("generation", &ring.policy.generation),
             u32("width", &desc.Width),
-            u32("height", &desc.Height)
+            u32("height", &desc.Height),
+            u32("format", &(desc.Format.0 as u32))
         );
     }
 

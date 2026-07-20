@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     IDXGIKeyedMutex, IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
@@ -298,8 +298,10 @@ pub fn acquire_mutex(mutex: &IDXGIKeyedMutex, key: u64, timeout_ms: u32) -> Acqu
 }
 
 /// Create the `count` named shared textures for (`session_id`,
-/// `generation`) at the given dimensions. BGRA8 (the IddCx frame surface
-/// format); keyed mutex starts at key 0 (driver-writable).
+/// `generation`) at the given dimensions and format. The format follows
+/// the acquired swapchain frame's desc — BGRA8 for SDR desktops, FP16
+/// (scRGB) or R10G10B10A2 once the OS composes the display in advanced
+/// color; keyed mutex starts at key 0 (driver-writable).
 pub fn create_shared_textures(
     device: &ID3D11Device,
     session_id: u64,
@@ -307,13 +309,14 @@ pub fn create_shared_textures(
     count: u32,
     width: u32,
     height: u32,
+    format: DXGI_FORMAT,
 ) -> windows::core::Result<Vec<SharedTexture>> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
