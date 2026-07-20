@@ -54,7 +54,7 @@ fn print_status(s: &GetStatusReply) {
 struct Args {
     status_only: bool,
     /// Explicit `WxH@HZ` from the command line; None = default mode list.
-    explicit_mode: Option<ModeSpec>,
+    explicit_modes: Vec<ModeSpec>,
     hold_secs: u64,
     /// Mint a throwaway identity: Windows treats the monitor as brand new
     /// (no remembered topology/disconnect state) — useful when the stable
@@ -79,7 +79,7 @@ const DEFAULT_MODES: [ModeSpec; 3] = [
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         status_only: false,
-        explicit_mode: None,
+        explicit_modes: Vec::new(),
         hold_secs: 15,
         ephemeral: false,
         consume: false,
@@ -99,7 +99,7 @@ fn parse_args() -> Result<Args, String> {
                 let (dims, hz) = mode.split_once('@').unwrap_or((mode, "60"));
                 let (w, h) = dims.split_once('x').ok_or_else(|| format!("bad mode: {mode}"))?;
                 let hz: f64 = hz.parse().map_err(|_| format!("bad refresh: {hz}"))?;
-                args.explicit_mode = Some(ModeSpec {
+                args.explicit_modes.push(ModeSpec {
                     width: w.parse().map_err(|_| format!("bad width: {w}"))?,
                     height: h.parse().map_err(|_| format!("bad height: {h}"))?,
                     refresh_millihz: (hz * 1000.0).round() as u32,
@@ -116,7 +116,7 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!("vgd-probe: {e}");
-            eprintln!("usage: vgd-probe [status] [WxH@HZ] [--hold SECS]");
+            eprintln!("usage: vgd-probe [status] [WxH@HZ ...] [--hold SECS]");
             return ExitCode::FAILURE;
         }
     };
@@ -161,9 +161,10 @@ fn main() -> ExitCode {
         .unwrap_or(1)
         | (std::process::id() as u64) << 48;
 
-    let mode_list: Vec<ModeSpec> = match args.explicit_mode {
-        Some(m) => vec![m],
-        None => DEFAULT_MODES.to_vec(),
+    let mode_list: Vec<ModeSpec> = if args.explicit_modes.is_empty() {
+        DEFAULT_MODES.to_vec()
+    } else {
+        args.explicit_modes.clone()
     };
     let described: Vec<String> = mode_list
         .iter()
