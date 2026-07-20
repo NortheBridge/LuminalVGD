@@ -206,3 +206,36 @@ Integration lessons (all host-side, none required driver changes):
 Next: tranche 3b — ring-consuming capture backend in LuminalShine
 (`display_vgd` platf::display_t), driver HDR10 caps, cursor/gamma DDIs,
 WGC-RELIABILITY §7 alttab_stress port.
+
+### Tranche 3b + HDR10 — COMPLETE (2026-07-20, Windows box)
+
+**Milestones verified the same day:** (1) LuminalShine consumes the
+frame ring directly (`display_vgd_vram_t`: claim → keyed-mutex key 1 →
+GPU copy → release; no WGC helper, latency parity ~5 ms) and (2) **HDR10
+end to end** — driver build 2 (caps 0x185) creates HDR monitors
+(bit_depth=110 wire value), Windows engages advanced color off our
+CTA-861.3 EDID block, the ring carries FP16 scRGB, and LuminalShine
+encodes HEVC Main10 4:4:4 with HDR metadata. AV1 HDR 10-bit also works;
+AV1 4:4:4 is an NVENC hardware gap on RTX 5080 (not a software item).
+
+HDR bring-up lessons (one wasted signing round each — check first):
+- **IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 is a contract, not a flag.**
+  AdapterInitAsync fails STATUS_INVALID_PARAMETER unless the driver also
+  registers EvtIddCxMonitorSetGammaRamp (HDR 3x4 matrix; GammaSupport
+  must not be NONE) and acquires via IddCxSwapChainReleaseAndAcquire-
+  Buffer2 (METADATA2). See "Updates for IddCx 1.10" doc for the full
+  obligation list. ETW breadcrumbs localize this in one traced
+  pnputil /restart-device — no re-sign needed to diagnose.
+- **Proto bit_depth wire values are 8/10/110/112** (HDR carries a
+  leading "1"); hdr=1 with bit_depth=10 is BAD_BIT_DEPTH (-4), and the
+  host log only shows "result=-4" — check dispatch err codes first.
+- Ring textures follow the acquired frame's DXGI format; an
+  advanced-color toggle (BGRA8 ⇄ FP16) is a generation bump like a size
+  change. Host reader re-latches format automatically.
+- Host-side stall detection must key off `latest_sequence` vs the last
+  delivered sequence, never cumulative publish counters — an idle
+  desktop is indistinguishable from a stall by counters alone.
+
+Next: cursor + gamma DDIs (hardware cursor ABI is in proto v0.3),
+WGC-RELIABILITY §7 alttab_stress port, phase 7 packaging (installer,
+strict control-device SDDL — release blocker, uninstaller).
