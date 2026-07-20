@@ -305,9 +305,16 @@ fn frame_loop(
             last_heartbeat = Instant::now();
         }
 
-        let mut out: ffi::IDARG_OUT_RELEASEANDACQUIREBUFFER = unsafe { zeroed() };
-        let status =
-            unsafe { bindings::swapchain_release_and_acquire_buffer(swapchain.0.cast(), &mut out) };
+        // Buffer2 is mandatory for CAN_PROCESS_FP16 adapters (IddCx 1.10):
+        // METADATA2 carries per-frame HDR metadata / surface color space /
+        // SDR white level alongside the same surface + QPC fields.
+        let mut in_args: ffi::IDARG_IN_RELEASEANDACQUIREBUFFER2 = unsafe { zeroed() };
+        in_args.Size = size_of::<ffi::IDARG_IN_RELEASEANDACQUIREBUFFER2>() as u32;
+        let mut out: ffi::IDARG_OUT_RELEASEANDACQUIREBUFFER2 = unsafe { zeroed() };
+        out.MetaData.Size = size_of::<ffi::IDDCX_METADATA2>() as u32;
+        let status = unsafe {
+            bindings::swapchain_release_and_acquire_buffer2(swapchain.0.cast(), &mut in_args, &mut out)
+        };
         if status == STATUS_PENDING || status == E_PENDING {
             unsafe {
                 let _ = WaitForSingleObject(HANDLE(frame_event.0), 100);
@@ -376,7 +383,7 @@ fn publish_frame(
     ring: &mut FrameRing,
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
-    meta: &ffi::IDDCX_METADATA,
+    meta: &ffi::IDDCX_METADATA2,
 ) -> windows::core::Result<()> {
     if ring.section.is_none() {
         return Ok(()); // transport disabled; drain-only

@@ -88,6 +88,9 @@ unsafe extern "C" fn evt_device_add(
     idd.EvtIddCxAdapterCommitModes2 = Some(monitors::evt_commit_modes2);
     idd.EvtIddCxMonitorSetDefaultHdrMetaData = Some(monitors::evt_set_default_hdr_metadata);
     idd.EvtIddCxMonitorQueryTargetModes2 = Some(monitors::evt_query_target_modes2);
+    // CAN_PROCESS_FP16 obligates the gamma-ramp DDI (HDR 3x4 matrix);
+    // an FP16 adapter without it fails AdapterInitAsync validation.
+    idd.EvtIddCxMonitorSetGammaRamp = Some(monitors::evt_monitor_set_gamma_ramp);
 
     let status = bindings::device_init_config(device_init, &idd);
     if status != STATUS_SUCCESS {
@@ -198,7 +201,10 @@ unsafe extern "C" fn evt_d0_entry(
     caps.EndPointDiagnostics.pEndPointManufacturerName = MANUFACTURER.as_ptr();
     caps.EndPointDiagnostics.pHardwareVersion = addr_of_mut!(version);
     caps.EndPointDiagnostics.pFirmwareVersion = addr_of_mut!(version);
-    caps.EndPointDiagnostics.GammaSupport = ffi::IDDCX_FEATURE_IMPLEMENTATION_IDDCX_FEATURE_IMPLEMENTATION_NONE;
+    // SOFTWARE, matching the registered EvtIddCxMonitorSetGammaRamp: the
+    // HDR 3x4 matrix is acknowledged by the driver (conversion happens in
+    // the host encoder). NONE alongside CAN_PROCESS_FP16 is contradictory.
+    caps.EndPointDiagnostics.GammaSupport = ffi::IDDCX_FEATURE_IMPLEMENTATION_IDDCX_FEATURE_IMPLEMENTATION_SOFTWARE;
 
     let mut in_args: ffi::IDARG_IN_ADAPTER_INIT = zeroed();
     in_args.WdfDevice = device;

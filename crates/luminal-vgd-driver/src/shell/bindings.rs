@@ -97,6 +97,23 @@ pub unsafe fn swapchain_release_and_acquire_buffer(
     )
 }
 
+/// v1.10 variant — mandatory for CAN_PROCESS_FP16 adapters (per-frame
+/// IDDCX_METADATA2: HDR metadata, surface color space, SDR white level).
+/// Safe to call unconditionally: IddMinimumVersionRequired = 10 means the
+/// OS only loads us with a ≥1.10 function table.
+pub unsafe fn swapchain_release_and_acquire_buffer2(
+    swapchain: IDDCX_SWAPCHAIN,
+    in_args: *mut IDARG_IN_RELEASEANDACQUIREBUFFER2,
+    out_args: *mut IDARG_OUT_RELEASEANDACQUIREBUFFER2,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxSwapChainReleaseAndAcquireBuffer2TableIndex as PFN_IDDCXSWAPCHAINRELEASEANDACQUIREBUFFER2,
+        swapchain,
+        in_args,
+        out_args
+    )
+}
+
 pub unsafe fn swapchain_finished_processing_frame(swapchain: IDDCX_SWAPCHAIN) -> NTSTATUS {
     iddcx_call!(
         _IDDFUNCENUM_IddCxSwapChainFinishedProcessingFrameTableIndex as PFN_IDDCXSWAPCHAINFINISHEDPROCESSINGFRAME,

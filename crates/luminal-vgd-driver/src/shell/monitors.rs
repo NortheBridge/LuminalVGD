@@ -370,6 +370,29 @@ pub unsafe extern "C" fn evt_commit_modes2(
     STATUS_SUCCESS
 }
 
+/// CAN_PROCESS_FP16 contract (IddCx 1.10): the OS provides the HDR 3x4
+/// color matrix here for adapters that advertise FP16 processing. Our
+/// pipeline is pass-through — ring consumers receive the composed FP16
+/// scRGB desktop verbatim and the host encoder performs the colorspace
+/// conversion — so the matrix is acknowledged and traced, not applied to
+/// pixels. GammaSupport is declared SOFTWARE to match.
+pub unsafe extern "C" fn evt_monitor_set_gamma_ramp(
+    monitor: ffi::IDDCX_MONITOR,
+    in_args: *const ffi::IDARG_IN_SET_GAMMARAMP,
+) -> NTSTATUS {
+    let inp = &*in_args;
+    let ramp_type = inp.Type as u32;
+    tracelogging::write_event!(
+        PROVIDER,
+        "SetGammaRamp",
+        level(Informational),
+        u64("monitor", &(monitor as u64)),
+        u32("type", &ramp_type),
+        u32("size", &inp.GammaRampSizeInBytes)
+    );
+    STATUS_SUCCESS
+}
+
 pub unsafe extern "C" fn evt_set_default_hdr_metadata(
     monitor: ffi::IDDCX_MONITOR,
     in_args: *const ffi::IDARG_IN_MONITOR_SET_DEFAULT_HDR_METADATA,
