@@ -174,3 +174,35 @@ AcquireBufferFailedExit etc. under the provider GUID above.
 
 Next: phase 5 (LuminalShine `luminalvgd` backend consuming the ring),
 then WGC-RELIABILITY §7 alttab_stress port, cursor/gamma/HDR DDIs.
+
+### Phase 5 — lifecycle backend COMPLETE (2026-07-20, Windows box)
+
+**Milestone verified: Moonlight client streams off the virtual
+display** — LuminalShine (branch `feat/luminalvgd-backend`) auto-selects
+the LuminalVGD backend, creates a per-client monitor (multi-mode:
+framegen 240 Hz + base 120 Hz), the display helper applies the
+exclusive topology (physical monitors off) at 240 Hz with APPLY acked
+in ~1 s, WGC captures the virtual display at the client's native
+3456×2160, and both physical monitors restore on session end. Capture
+still goes through the WGC helper — the ring-consuming capture backend
+is tranche 3b.
+
+Integration lessons (all host-side, none required driver changes):
+- LuminalShine's display resolvers/predicates had to learn the NBF
+  vendor prefix and "Luminal Video Graphics Display" adapter name; the
+  driver-side identity scheme needed nothing.
+- Mode-list units: the FFI takes millihertz. LuminalShine normalized to
+  mHz and then rescaled ×1000 — Windows silently discards a 240 kHz
+  mode, leaving only the base rate. The driver's ParseMonitorDescription2
+  / QueryTargetModes2 paths were verified correct via vgd-probe +
+  EnumDisplaySettings (both modes register; preferred applies at 240 Hz).
+- HDR: the host now requests SDR for VGD displays; asking Windows to
+  enable HDR on a monitor without HDR10 caps fails the entire
+  SetDisplayConfig apply. Driver HDR10 (EDID metadata + IddCx caps +
+  10-bit ring formats) is the gating work for HDR streaming.
+- vgd-probe now accepts multiple `WxH@HZ` args (previously the last
+  one silently won), so multi-mode creates are testable standalone.
+
+Next: tranche 3b — ring-consuming capture backend in LuminalShine
+(`display_vgd` platf::display_t), driver HDR10 caps, cursor/gamma DDIs,
+WGC-RELIABILITY §7 alttab_stress port.
