@@ -151,6 +151,10 @@ impl RingPolicy {
             // Host consumed (or abandoned) the slot and released it.
             (Slot::Published(_), s) if s == ss::FREE => Slot::Free,
             (Slot::Reading, s) if s == ss::FREE => Slot::Free,
+            // The writer lost a take-CAS race to a host claim and aborted
+            // (policy briefly said Free while the shared state is READING):
+            // respect the host's hold so the writer stops re-picking it.
+            (Slot::Free, s) if s == ss::READING => Slot::Reading,
             (cur, _) => cur,
         };
     }
@@ -295,6 +299,33 @@ mod tests {
         // Bogus shared value: ignored.
         r.reconcile_shared(w.index, 0xDEAD);
         assert!(matches!(r.slot(w.index), Slot::Published(_)));
+    }
+
+    #[test]
+    fn reconcile_free_reading_respects_host_hold_after_lost_take() {
+        use luminal_driver_proto::slot_state as ss;
+        // Full ring; the writer picks slot 0 (oldest) for overwrite, loses
+        // the shared take-CAS to a host claim, and aborts: policy went
+        // Published → Writing → Free while the shared state says READING.
+        let mut r = RingPolicy::new(2);
+        for _ in 0..2 {
+            let w = r.writer_acquire().unwrap();
+            r.publish(w.index);
+        }
+        let w = r.writer_acquire().unwrap();
+        assert_eq!(w.overwrote, Some(1));
+        r.writer_abort(w.index);
+
+        // Reconcile must absorb the host's hold so the writer stops
+        // re-picking the slot the host owns.
+        r.reconcile_shared(w.index, ss::READING);
+        assert_eq!(r.slot(w.index), Slot::Reading);
+        let w2 = r.writer_acquire().unwrap();
+        assert_ne!(w2.index, w.index, "host-held slot must not be re-picked");
+
+        // Host releases: slot reclaimed as Free.
+        r.reconcile_shared(w.index, ss::FREE);
+        assert_eq!(r.slot(w.index), Slot::Free);
     }
 
     #[test]

@@ -196,6 +196,27 @@ impl RingSection {
         }
     }
 
+    /// Atomically take a slot for writing: CAS `expected → WRITING` on the
+    /// shared state. This is the writer's half of the claim protocol — it
+    /// serializes against the host's `PUBLISHED → READING` claim CAS on
+    /// the same atomic, so a slot can never be overwritten out from under
+    /// a concurrent claim (the ring-stall / mislabeled-frame race). Returns
+    /// false when the host won (claimed the slot between the writer's
+    /// reconcile snapshot and this take).
+    pub fn try_take_slot_writing(&self, index: usize, expected: u32) -> bool {
+        let slot = self.slot_ptr(index);
+        unsafe {
+            AtomicU32::from_ptr(&mut (*slot).state)
+                .compare_exchange(
+                    expected,
+                    luminal_driver_proto::slot_state::WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        }
+    }
+
     /// Publish a completed slot: metadata first, state PUBLISHED last
     /// (release), then the header counters.
     pub fn slot_published(

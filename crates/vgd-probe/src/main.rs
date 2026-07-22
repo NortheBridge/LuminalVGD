@@ -255,16 +255,48 @@ fn main() -> ExitCode {
     let mut prev_seq = 0u64;
     let mut prev_heartbeat = 0u64;
     let mut consumed_total = 0u64;
+    // Soak-mode bookkeeping: a real consumer delivers monotonically (only
+    // frames newer than the last delivered), and a frame newer than the
+    // last delivered sitting unclaimable for 5 s is the ring-stall bug —
+    // dump every slot's state as the autopsy when it happens.
+    let mut last_delivered = 0u64;
+    let mut last_progress = std::time::Instant::now();
+    let mut stalls_detected = 0u32;
     for tick in 0..args.hold_secs {
         if args.consume {
-            // Drain published slots at ~5 ms cadence for the whole tick:
-            // claim newest → (a real consumer would encode here) → release.
+            // Claim/deliver/release at ~5 ms cadence for the whole tick.
             let tick_end = std::time::Instant::now() + Duration::from_secs(1);
             while std::time::Instant::now() < tick_end {
                 if let Some(view) = &ring {
                     while let Some(frame) = view.claim_latest() {
+                        let fresh = frame.sequence > last_delivered;
                         view.release(frame.index);
+                        if !fresh {
+                            // Older leftover; leave the backlog for the
+                            // driver's drop-oldest (monotonic contract).
+                            break;
+                        }
+                        last_delivered = frame.sequence;
                         consumed_total += 1;
+                        last_progress = std::time::Instant::now();
+                    }
+                    let latest = view.header().latest_sequence;
+                    if latest <= last_delivered {
+                        last_progress = std::time::Instant::now();
+                    } else if last_progress.elapsed() > Duration::from_secs(5) {
+                        stalls_detected += 1;
+                        eprintln!(
+                            "  RING STALL: latest {latest} vs delivered {last_delivered} for >5 s — slot autopsy:"
+                        );
+                        for i in 0..3u32 {
+                            if let Some(m) = view.slot(i) {
+                                eprintln!(
+                                    "    slot {i}: state={} seq={}",
+                                    m.state, m.sequence
+                                );
+                            }
+                        }
+                        last_progress = std::time::Instant::now();
                     }
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -323,6 +355,13 @@ fn main() -> ExitCode {
             println!("  ring milestone: sequences advanced by {advanced} during the hold ✔");
         } else {
             println!("  ring milestone NOT met: latest_sequence did not advance ✘");
+        }
+        if args.consume {
+            if stalls_detected == 0 {
+                println!("  soak: {consumed_total} frames delivered monotonically, 0 stalls ✔");
+            } else {
+                println!("  soak FAILED: {stalls_detected} ring stall(s) detected ✘ (autopsies above)");
+            }
         }
     }
 
