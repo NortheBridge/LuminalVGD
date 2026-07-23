@@ -156,8 +156,21 @@ IOCTL requires an authorized handle.
 Release archives carry the signed package + install/uninstall scripts;
 signed artifacts are GitHub release assets ONLY, never committed.
 
+Version identity (one convention, three surfaces):
+- **Release tag / product version**: SemVer with prerelease suffix, e.g.
+  `v0.1.0-alpha.1`.
+- **INF DriverVer / Device Manager**: `<semver>.<build>`, e.g. `0.1.0.8`
+  (INF versions must be four numeric fields — the prerelease suffix
+  lives only in the tag). Set via `LUMINAL_VGD_VERSION` (default 0.1.0)
+  + `LUMINAL_VGD_BUILD`.
+- **HANDSHAKE/GET_STATUS `driver_build`**: the same `<build>`, bumped
+  every signing round — dev or release — so any log line maps to an
+  exact binary.
+Unstamped dev builds keep the date-derived `100.YYMM.DDHH.MMSS`
+DriverVer (each rebuild outranks the last on dev boxes).
+
 ```powershell
-$env:LUMINAL_VGD_BUILD = '<build>'    # stamps HANDSHAKE/GET_STATUS
+$env:LUMINAL_VGD_BUILD = '<build>'    # stamps HANDSHAKE/GET_STATUS + DriverVer
 scripts\build-driver.cmd
 # sign luminal_vgd_driver.dll + luminalvgd.cat (see Signing above)
 scripts\package-release.ps1 -Version v0.1.0-alpha.1

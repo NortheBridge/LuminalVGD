@@ -335,9 +335,23 @@ check (Win11; warn <24H2) and `-SeedTrustedPublisher` (TrustedPublisher
 only, never Root); uninstall-driver.ps1 reverses devnode + DriverStore
 package (+ optional cert); package-release.ps1 stages the release zip
 (gates: valid+timestamped signatures, FORCE_INTEGRITY clear) with
-SHA256SUMS; DRIVER_BUILD is stamped via LUMINAL_VGD_BUILD at release
-build time; docs/INSTALL.md ships in the zip. Signed artifacts are
-release assets only — never committed. SudoVDA decision: stays as
-LuminalShine's legacy fallback through the 26.08 alpha (auto-selection
-already prefers LuminalVGD when installed); removal revisited once the
-driver clears all milestones.
+SHA256SUMS; docs/INSTALL.md ships in the zip. Signed artifacts are
+release assets only — never committed.
+
+Version identity (one convention, three surfaces): release tag =
+SemVer + prerelease (`v0.1.0-alpha.1`); INF DriverVer / Device Manager
+= `<semver>.<build>` (`0.1.0.8` — INF versions are four numeric
+fields, so the prerelease suffix lives only in the tag), stamped via
+LUMINAL_VGD_VERSION + LUMINAL_VGD_BUILD; handshake `driver_build` = the
+same `<build>`, bumped every signing round. Unstamped dev builds keep
+the date-derived `100.YYMM.DDHH.MMSS` DriverVer.
+
+SudoVDA decision (user, 2026-07-23, FINAL): SudoVDA is unmaintained and
+unreliable — no LuminalShine version ships it going forward, and the
+LuminalShine installer actively REMOVES SudoVDA whenever detected (new
+install, update, or reinstall; drivers/luminalvgd/install.ps1 does the
+sweep: devices, DriverStore packages, SudoMaker certs, SudoMaker
+registry keys). The MSI bundles the signed LuminalVGD driver-package
+as a packaging input instead. LuminalShine's SudoVDA *code* excision
+(backend sources, third-party headers, web UI copy) is a tracked
+follow-up.

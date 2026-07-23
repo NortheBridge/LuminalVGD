@@ -36,11 +36,23 @@ rem link line sets /INTEGRITYCHECK, which only Microsoft-rooted signatures
 rem satisfy — our OV signature would fail to load (DESIGN.md §6).
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0clear-force-integrity.ps1" "%PKG%\luminal_vgd_driver.dll" || exit /b 1
 
-rem Monotonic DriverVer (date/time derived) so each rebuild outranks the
-rem installed package — `-v *` can collide, and pnputil then skips the
-rem update ("up-to-date on device", exit 259) and the new binary never
-rem reaches the device. Format a.b.c.d, each part <= 65535.
-for /f %%v in ('powershell -NoProfile -Command "$d=Get-Date; '100.{0:00}{1:00}.{2:00}{3:00}.{4:00}{5:00}' -f ($d.Year%%100),$d.Month,$d.Day,$d.Hour,$d.Minute,$d.Second"') do set "DRIVERVER=%%v"
+rem DriverVer convention (docs/BUILDING.md §Releasing):
+rem   Stamped builds (LUMINAL_VGD_BUILD set, i.e. signing/release rounds):
+rem     <LUMINAL_VGD_VERSION>.<LUMINAL_VGD_BUILD>, default version 0.1.0 —
+rem     Device Manager shows e.g. 0.1.0.8, matching the handshake build
+rem     and the vX.Y.Z release tag. DRIVER_BUILD bumps every signing
+rem     round, so releases always outrank each other.
+rem   Unstamped dev builds: date/time-derived 100.YYMM.DDHH.MMSS so every
+rem     throwaway rebuild outranks the previous one (`-v *` can collide,
+rem     pnputil then skips the update and the new binary never reaches
+rem     the device). The 100. prefix keeps dev builds above any release
+rem     scheme on dev boxes; release validation uninstalls first.
+if not defined LUMINAL_VGD_VERSION set "LUMINAL_VGD_VERSION=0.1.0"
+if defined LUMINAL_VGD_BUILD (
+    set "DRIVERVER=%LUMINAL_VGD_VERSION%.%LUMINAL_VGD_BUILD%"
+) else (
+    for /f %%v in ('powershell -NoProfile -Command "$d=Get-Date; '100.{0:00}{1:00}.{2:00}{3:00}.{4:00}{5:00}' -f ($d.Year%%100),$d.Month,$d.Day,$d.Hour,$d.Minute,$d.Second"') do set "DRIVERVER=%%v"
+)
 stampinf -f "%PKG%\luminalvgd.inf" -d * -v %DRIVERVER% -a amd64 || exit /b 1
 echo Stamped DriverVer %DRIVERVER%
 "!WindowsSdkDir!bin\!Version_Number!\x86\Inf2Cat.exe" /driver:"%PKG%" /os:10_NI_X64 || exit /b 1
