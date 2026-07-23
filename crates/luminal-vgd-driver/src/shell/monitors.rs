@@ -85,7 +85,6 @@ pub fn plug(
                 worker: None,
                 ring,
                 cursor: None,
-                cursor_pending: None,
             },
         );
 
@@ -104,24 +103,13 @@ pub fn plug(
             return;
         }
 
-        // Claim the hardware cursor plane (DESIGN.md §3.2.3): create the
-        // section now, then attempt SetupHardwareCursor. The plug-time
-        // attempt can be refused (no path committed yet) — the pending
-        // state is retried at swapchain assign. No locks held across the
-        // IddCx call.
-        if let Some(pending) = super::cursor::prepare(session_id) {
-            let outcome = super::cursor::try_setup(
-                super::cursor::PHASE_PLUG,
-                session_id,
-                OsHandle(monitor.cast()),
-                pending,
-            );
-            if let Some(rt) = shell.monitors.lock().unwrap().get_mut(&session_id) {
-                match outcome {
-                    Ok(cursor) => rt.cursor = Some(cursor),
-                    Err(pending) => rt.cursor_pending = Some(pending),
-                }
-            }
+        // Claim the hardware cursor plane (DESIGN.md §3.2.3). The worker
+        // thread owns every cursor IddCx call — SetupHardwareCursor is
+        // retried on its clock until the OS commits a path and accepts.
+        // Nothing cursor-related ever runs inside an IddCx callback.
+        let cursor = super::cursor::spawn(session_id, OsHandle(monitor.cast()));
+        if let Some(rt) = shell.monitors.lock().unwrap().get_mut(&session_id) {
+            rt.cursor = cursor;
         }
     }
 }
