@@ -29,6 +29,22 @@
 
 #define VGD_CAP_SDR10_BIT 4
 
+#define VGD_CAP_HW_CURSOR 32
+
+/**
+ * `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).
+ */
+#define VGD_CURSOR_KIND_ALPHA 1
+
+#define VGD_CURSOR_KIND_MASKED 3
+
+/**
+ * Worst-case shape buffer size for `vgd_cursor_shape` (256² 32bpp).
+ */
+#define VGD_CURSOR_SHAPE_BUFFER_SIZE ((256 * 256) * 4)
+
+typedef struct VgdCursorHandle VgdCursorHandle;
+
 typedef struct VgdDeviceHandle VgdDeviceHandle;
 
 typedef struct VgdRingHandle VgdRingHandle;
@@ -118,6 +134,44 @@ typedef struct VgdFrame {
   uint64_t present_qpc;
 } VgdFrame;
 
+/**
+ * Cursor position/visibility snapshot (`vgd_cursor_state`).
+ */
+typedef struct VgdCursorState {
+  /**
+   * Desktop coordinates of the shape's top-left pixel (can be
+   * negative when the hotspot hangs off the display edge).
+   */
+  int32_t x;
+  int32_t y;
+  /**
+   * 0 hidden, 1 visible.
+   */
+  uint32_t visible;
+  /**
+   * Even counter bumped after each complete shape rewrite (0 = no
+   * shape yet). Re-fetch the shape when it changes.
+   */
+  uint32_t shape_generation;
+  uint64_t position_qpc;
+} VgdCursorState;
+
+/**
+ * Cursor shape metadata; pixels land in the caller's buffer at a
+ * `width * 4` pitch (32bpp, `VGD_CURSOR_KIND_*`).
+ */
+typedef struct VgdCursorShape {
+  uint32_t kind;
+  uint32_t width;
+  uint32_t height;
+  uint32_t hotspot_x;
+  uint32_t hotspot_y;
+  /**
+   * The generation this copy is valid for.
+   */
+  uint32_t generation;
+} VgdCursorShape;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -163,6 +217,31 @@ bool vgd_ring_claim(struct VgdRingHandle *ring, struct VgdFrame *out);
  * Release a claimed frame back to the driver. Exactly once per claim.
  */
 void vgd_ring_release(struct VgdRingHandle *ring, uint32_t index);
+
+/**
+ * Map the shared cursor section for a created monitor (requires
+ * `VGD_CAP_HW_CURSOR`). NULL when the driver has no cursor plane for
+ * this monitor — the cursor is then composed into frames as before.
+ */
+struct VgdCursorHandle *vgd_cursor_open(uint64_t session_id);
+
+void vgd_cursor_close(struct VgdCursorHandle *cursor);
+
+/**
+ * Position/visibility snapshot (cheap; poll every frame).
+ */
+int32_t vgd_cursor_state(struct VgdCursorHandle *cursor, struct VgdCursorState *out);
+
+/**
+ * Copy the current shape into `buf` (`buf_len` ≥ width*height*4; size
+ * `VGD_CURSOR_SHAPE_BUFFER_SIZE` always suffices). Returns `true` and
+ * fills `out` on a consistent copy; `false` when no shape is published
+ * yet or the driver was mid-rewrite (retry next frame).
+ */
+bool vgd_cursor_shape(struct VgdCursorHandle *cursor,
+                      uint8_t *buf,
+                      uint32_t buf_len,
+                      struct VgdCursorShape *out);
 
 /**
  * Compose the named shared-texture name for (session, generation, slot)

@@ -84,6 +84,7 @@ pub fn plug(
                 modes,
                 worker: None,
                 ring,
+                cursor: None,
             },
         );
 
@@ -99,12 +100,22 @@ pub fn plug(
         );
         if status != STATUS_SUCCESS {
             shell.monitors.lock().unwrap().remove(&session_id);
+            return;
+        }
+
+        // Claim the hardware cursor plane (DESIGN.md §3.2.3). Must follow
+        // arrival; failure is non-fatal (OS composes the cursor instead).
+        let cursor = super::cursor::setup(session_id, OsHandle(monitor.cast()));
+        if let Some(rt) = shell.monitors.lock().unwrap().get_mut(&session_id) {
+            rt.cursor = cursor;
         }
     }
 }
 
-/// Unplug: stop the frame worker (bounded), mark the ring DEAD so the
-/// host unmaps, then IddCxMonitorDeparture.
+/// Unplug: stop the frame + cursor workers (both bounded), mark the ring
+/// DEAD so the host unmaps, then IddCxMonitorDeparture. `rt` (and with it
+/// the cursor event handle) drops only after departure returns, so the OS
+/// never signals a closed event.
 pub fn unplug(session_id: u64) {
     let shell = Shell::get();
     let Some(mut rt) = shell.monitors.lock().unwrap().remove(&session_id) else {
@@ -112,6 +123,9 @@ pub fn unplug(session_id: u64) {
     };
     if let Some(worker) = rt.worker.take() {
         worker.stop();
+    }
+    if let Some(cursor) = rt.cursor.as_mut() {
+        cursor.stop();
     }
     if let Ok(ring) = rt.ring.lock() {
         if let Some(section) = &ring.section {
@@ -374,8 +388,10 @@ pub unsafe extern "C" fn evt_commit_modes2(
 /// color matrix here for adapters that advertise FP16 processing. Our
 /// pipeline is pass-through — ring consumers receive the composed FP16
 /// scRGB desktop verbatim and the host encoder performs the colorspace
-/// conversion — so the matrix is acknowledged and traced, not applied to
-/// pixels. GammaSupport is declared SOFTWARE to match.
+/// conversion — so the ramp/matrix is acknowledged and traced, not
+/// applied to pixels. That matches physical-display streaming, where
+/// capture happens before the scanout LUT as well (`caps::GAMMA_RAMP`
+/// advertises the DDI, and GammaSupport is declared SOFTWARE).
 pub unsafe extern "C" fn evt_monitor_set_gamma_ramp(
     monitor: ffi::IDDCX_MONITOR,
     in_args: *const ffi::IDARG_IN_SET_GAMMARAMP,

@@ -120,3 +120,27 @@ pub unsafe fn swapchain_finished_processing_frame(swapchain: IDDCX_SWAPCHAIN) ->
         swapchain
     )
 }
+
+pub unsafe fn monitor_setup_hardware_cursor(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_SETUP_HWCURSOR,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorSetupHardwareCursorTableIndex as PFN_IDDCXMONITORSETUPHARDWARECURSOR,
+        monitor,
+        in_args
+    )
+}
+
+pub unsafe fn monitor_query_hardware_cursor(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_QUERY_HWCURSOR,
+    out_args: *mut IDARG_OUT_QUERY_HWCURSOR,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorQueryHardwareCursorTableIndex as PFN_IDDCXMONITORQUERYHARDWARECURSOR,
+        monitor,
+        in_args,
+        out_args
+    )
+}

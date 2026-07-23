@@ -256,7 +256,7 @@ fn frame_loop(
     }
     ring.assigned_before = true;
 
-    let mut d3d = match create_device_on_luid(luid) {
+    let d3d = match create_device_on_luid(luid) {
         Ok(d) => d,
         Err(e) => {
             let code = e.code().0;

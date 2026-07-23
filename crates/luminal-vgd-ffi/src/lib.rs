@@ -25,7 +25,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::null_mut;
 
 use luminal_driver_proto::{names, CreateMonitorRequest, ModeSpec, MAX_MODES_PER_MONITOR};
-use luminal_vgd_host::device::{RingView, VgdDevice};
+use luminal_vgd_host::device::{CursorView, RingView, VgdDevice};
 
 /// OS-level failure (I/O error, device unreachable) as opposed to a
 /// negative proto `err::*` code from the driver.
@@ -36,11 +36,27 @@ pub const VGD_ERR_IO: i32 = -1000;
 /// cbindgen cannot evaluate cross-crate constants).
 pub const VGD_CAP_HDR10: u32 = 1;
 pub const VGD_CAP_SDR10_BIT: u32 = 4;
+pub const VGD_CAP_HW_CURSOR: u32 = 32;
 const _: () = assert!(VGD_CAP_HDR10 == luminal_driver_proto::caps::HDR10);
 const _: () = assert!(VGD_CAP_SDR10_BIT == luminal_driver_proto::caps::SDR10_BIT);
+const _: () = assert!(VGD_CAP_HW_CURSOR == luminal_driver_proto::caps::HW_CURSOR);
+
+/// `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).
+pub const VGD_CURSOR_KIND_ALPHA: u32 = 1;
+pub const VGD_CURSOR_KIND_MASKED: u32 = 3;
+const _: () = assert!(VGD_CURSOR_KIND_ALPHA == luminal_driver_proto::cursor_kind::ALPHA);
+const _: () = assert!(VGD_CURSOR_KIND_MASKED == luminal_driver_proto::cursor_kind::MASKED);
+
+/// Worst-case shape buffer size for `vgd_cursor_shape` (256² 32bpp).
+pub const VGD_CURSOR_SHAPE_BUFFER_SIZE: u32 = 256 * 256 * 4;
+const _: () = assert!(
+    VGD_CURSOR_SHAPE_BUFFER_SIZE as usize
+        == luminal_driver_proto::cursor_section_size() - luminal_driver_proto::CURSOR_SHAPE_OFFSET
+);
 
 pub struct VgdDeviceHandle(VgdDevice);
 pub struct VgdRingHandle(RingView);
+pub struct VgdCursorHandle(CursorView);
 
 /// Handshake results the backend needs for capability gating.
 #[repr(C)]
@@ -296,6 +312,109 @@ pub unsafe extern "C" fn vgd_ring_release(ring: *mut VgdRingHandle, index: u32) 
     if !ring.is_null() {
         guarded((), || (*ring).0.release(index));
     }
+}
+
+/// Cursor position/visibility snapshot (`vgd_cursor_state`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VgdCursorState {
+    /// Desktop coordinates of the shape's top-left pixel (can be
+    /// negative when the hotspot hangs off the display edge).
+    pub x: i32,
+    pub y: i32,
+    /// 0 hidden, 1 visible.
+    pub visible: u32,
+    /// Even counter bumped after each complete shape rewrite (0 = no
+    /// shape yet). Re-fetch the shape when it changes.
+    pub shape_generation: u32,
+    pub position_qpc: u64,
+}
+
+/// Cursor shape metadata; pixels land in the caller's buffer at a
+/// `width * 4` pitch (32bpp, `VGD_CURSOR_KIND_*`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VgdCursorShape {
+    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: u32,
+    pub hotspot_y: u32,
+    /// The generation this copy is valid for.
+    pub generation: u32,
+}
+
+/// Map the shared cursor section for a created monitor (requires
+/// `VGD_CAP_HW_CURSOR`). NULL when the driver has no cursor plane for
+/// this monitor — the cursor is then composed into frames as before.
+#[no_mangle]
+pub extern "C" fn vgd_cursor_open(session_id: u64) -> *mut VgdCursorHandle {
+    guarded(null_mut(), || match CursorView::open(session_id) {
+        Ok(view) => Box::into_raw(Box::new(VgdCursorHandle(view))),
+        Err(_) => null_mut(),
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vgd_cursor_close(cursor: *mut VgdCursorHandle) {
+    if !cursor.is_null() {
+        drop(Box::from_raw(cursor));
+    }
+}
+
+/// Position/visibility snapshot (cheap; poll every frame).
+#[no_mangle]
+pub unsafe extern "C" fn vgd_cursor_state(
+    cursor: *mut VgdCursorHandle,
+    out: *mut VgdCursorState,
+) -> i32 {
+    if cursor.is_null() || out.is_null() {
+        return VGD_ERR_IO;
+    }
+    guarded(VGD_ERR_IO, || {
+        let s = (*cursor).0.state();
+        *out = VgdCursorState {
+            x: s.x,
+            y: s.y,
+            visible: s.visible as u32,
+            shape_generation: s.shape_generation,
+            position_qpc: s.position_qpc,
+        };
+        0
+    })
+}
+
+/// Copy the current shape into `buf` (`buf_len` ≥ width*height*4; size
+/// `VGD_CURSOR_SHAPE_BUFFER_SIZE` always suffices). Returns `true` and
+/// fills `out` on a consistent copy; `false` when no shape is published
+/// yet or the driver was mid-rewrite (retry next frame).
+#[no_mangle]
+pub unsafe extern "C" fn vgd_cursor_shape(
+    cursor: *mut VgdCursorHandle,
+    buf: *mut u8,
+    buf_len: u32,
+    out: *mut VgdCursorShape,
+) -> bool {
+    if cursor.is_null() || buf.is_null() || out.is_null() {
+        return false;
+    }
+    guarded(false, || {
+        let slice = std::slice::from_raw_parts_mut(buf, buf_len as usize);
+        match (*cursor).0.shape(slice) {
+            Some(shape) => {
+                *out = VgdCursorShape {
+                    kind: shape.kind,
+                    width: shape.width,
+                    height: shape.height,
+                    hotspot_x: shape.hotspot_x,
+                    hotspot_y: shape.hotspot_y,
+                    generation: shape.generation,
+                };
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Compose the named shared-texture name for (session, generation, slot)

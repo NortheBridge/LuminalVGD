@@ -58,8 +58,9 @@ pub fn qpc_frequency() -> u64 {
 }
 
 /// Run `f` with a SECURITY_ATTRIBUTES for [`RING_SDDL`]. The descriptor
-/// is LocalFree'd afterwards, so it must not outlive the call.
-fn with_ring_security<T>(
+/// is LocalFree'd afterwards, so it must not outlive the call. Shared with
+/// the cursor section (same data-plane principals).
+pub(crate) fn with_ring_security<T>(
     f: impl FnOnce(*const SECURITY_ATTRIBUTES) -> windows::core::Result<T>,
 ) -> windows::core::Result<T> {
     let sddl: Vec<u16> = RING_SDDL.encode_utf16().chain(Some(0)).collect();
@@ -184,15 +185,6 @@ impl RingSection {
     pub fn heartbeat(&self) {
         unsafe {
             core::ptr::write_volatile(&mut (*self.header_mut()).driver_heartbeat_qpc, qpc_now());
-        }
-    }
-
-    /// Mark a slot as being written (state WRITING, release-ordered).
-    pub fn slot_writing(&self, index: usize) {
-        let slot = self.slot_ptr(index);
-        unsafe {
-            AtomicU32::from_ptr(&mut (*slot).state)
-                .store(luminal_driver_proto::slot_state::WRITING, Ordering::Release);
         }
     }
 

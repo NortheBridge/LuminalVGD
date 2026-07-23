@@ -591,9 +591,11 @@ pub const CURSOR_SHAPE_OFFSET: usize = 64;
 
 /// Header at offset 0 of the per-monitor cursor section. One writer
 /// (driver, fed by IddCx cursor callbacks), one reader (host). Position
-/// updates only touch `x`/`y`/`visible`/`position_qpc`; shape updates
-/// rewrite the buffer then bump `shape_generation` (host re-reads the
-/// shape when the generation changes — read generation, copy, re-check).
+/// updates only touch `x`/`y`/`visible`/`position_qpc`; shape hand-off is
+/// a seqlock on `shape_generation`: the writer stores an odd value
+/// (rewrite in progress), rewrites the metadata + buffer, then stores the
+/// next even value. The reader accepts a copy only when the generation
+/// was even and unchanged across it; 0 means no shape published yet.
 #[repr(C)]
 pub struct CursorHeader {
     pub magic: u32,

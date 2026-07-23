@@ -13,11 +13,12 @@ use std::mem::{size_of, MaybeUninit};
 use std::ptr::{null, null_mut, read_volatile};
 
 use luminal_driver_proto::{
-    ioctl, names, ring_section_size, CreateMonitorReply, CreateMonitorRequest,
-    DestroyMonitorRequest, GetStatusReply, HandshakeReply, HandshakeRequest,
-    PermanentPoolConfig, PingRequest, QueryLeaseReply, QueryLeaseRequest,
+    cursor_section_size, ioctl, names, ring_section_size, CreateMonitorReply,
+    CreateMonitorRequest, CursorHeader, DestroyMonitorRequest, GetStatusReply, HandshakeReply,
+    HandshakeRequest, PermanentPoolConfig, PingRequest, QueryLeaseReply, QueryLeaseRequest,
     QueryPermanentPoolReply, RingHeader, SetRenderAdapterRequest, SlotMetadata,
-    LUMINAL_VGD_INTERFACE_GUID, PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR, RING_SLOTS_OFFSET,
+    CURSOR_HEADER_VERSION, CURSOR_MAGIC, CURSOR_SHAPE_OFFSET, LUMINAL_VGD_INTERFACE_GUID,
+    PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR, RING_SLOTS_OFFSET,
 };
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -345,6 +346,158 @@ impl RingView {
     }
 }
 
+/// Read-only mapping of a monitor's shared cursor section
+/// (`caps::HW_CURSOR`): position/visibility from the header, the shape
+/// buffer behind a seqlock on `shape_generation` (odd = driver rewrite in
+/// progress; a stable even generation across the copy validates it).
+pub struct CursorView {
+    mapping: HANDLE,
+    view: *const u8,
+}
+
+unsafe impl Send for CursorView {}
+
+impl Drop for CursorView {
+    fn drop(&mut self) {
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.view.cast_mut().cast(),
+            });
+            CloseHandle(self.mapping);
+        }
+    }
+}
+
+/// Position/visibility snapshot (header-only read, no shape copy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorState {
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+    /// Bumps (to the next even value) after each complete shape rewrite;
+    /// re-fetch the shape when it changes. 0 = no shape published yet.
+    pub shape_generation: u32,
+    pub position_qpc: u64,
+}
+
+/// Metadata of a successfully copied shape (pixels are in the caller's
+/// buffer, `width * 4` pitch).
+#[derive(Clone, Copy, Debug)]
+pub struct CursorShape {
+    /// One of `luminal_driver_proto::cursor_kind::*`.
+    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: u32,
+    pub hotspot_y: u32,
+    /// The (even) generation this copy is valid for.
+    pub generation: u32,
+}
+
+impl CursorView {
+    /// Test-only: a view over caller-owned memory instead of a mapped
+    /// section (same contract as [`RingView::over_buffer`]).
+    #[cfg(test)]
+    pub(crate) fn over_buffer(view: *const u8) -> Self {
+        Self { mapping: std::ptr::null_mut(), view }
+    }
+
+    /// Map the cursor section for `session_id`. `Err(NotFound)`-ish means
+    /// the driver has no cursor plane for this monitor (pre-cursor driver
+    /// build or setup failure) — the cursor is then composed into frames.
+    pub fn open(session_id: u64) -> io::Result<Self> {
+        let mut name = [0u16; 64];
+        names::cursor_section_name(session_id, &mut name);
+        let mapping = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()) };
+        if mapping.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let view =
+            unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, cursor_section_size()) };
+        if view.Value.is_null() {
+            let e = io::Error::last_os_error();
+            unsafe { CloseHandle(mapping) };
+            return Err(e);
+        }
+        let this = Self { mapping, view: view.Value.cast::<u8>().cast_const() };
+        let header = this.header();
+        if header.magic != CURSOR_MAGIC || header.version != CURSOR_HEADER_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cursor section magic/version mismatch",
+            ));
+        }
+        Ok(this)
+    }
+
+    fn header(&self) -> CursorHeader {
+        unsafe { read_volatile(self.view.cast::<CursorHeader>()) }
+    }
+
+    fn generation_atomic(&self) -> &core::sync::atomic::AtomicU32 {
+        unsafe {
+            core::sync::atomic::AtomicU32::from_ptr(
+                &mut (*self.view.cast_mut().cast::<CursorHeader>()).shape_generation,
+            )
+        }
+    }
+
+    /// Volatile position/visibility snapshot.
+    pub fn state(&self) -> CursorState {
+        let h = self.header();
+        CursorState {
+            x: h.x,
+            y: h.y,
+            visible: h.visible != 0,
+            shape_generation: h.shape_generation & !1,
+            position_qpc: h.position_qpc,
+        }
+    }
+
+    /// Copy the current shape into `buf` (`width * 4` pitch). Returns
+    /// `None` when no shape has been published yet, the buffer is too
+    /// small, or the driver kept rewriting across every retry (transient;
+    /// try again on the next frame).
+    pub fn shape(&self, buf: &mut [u8]) -> Option<CursorShape> {
+        use core::sync::atomic::Ordering;
+        let generation = self.generation_atomic();
+        for _ in 0..8 {
+            let g1 = generation.load(Ordering::Acquire);
+            if g1 == 0 {
+                return None; // nothing published yet
+            }
+            if g1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue; // rewrite in progress
+            }
+            let h = self.header();
+            let bytes = (h.width as usize).checked_mul(h.height as usize)?.checked_mul(4)?;
+            if bytes == 0 || bytes > buf.len() || CURSOR_SHAPE_OFFSET + bytes > cursor_section_size()
+            {
+                return None;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.view.add(CURSOR_SHAPE_OFFSET),
+                    buf.as_mut_ptr(),
+                    bytes,
+                );
+            }
+            if generation.load(Ordering::Acquire) == g1 {
+                return Some(CursorShape {
+                    kind: h.kind,
+                    width: h.width,
+                    height: h.height,
+                    hotspot_x: h.hotspot_x,
+                    hotspot_y: h.hotspot_y,
+                    generation: g1,
+                });
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +639,87 @@ mod tests {
             }
             core::mem::forget(v);
             assert!(delivered > 0, "reader must have consumed frames");
+        });
+    }
+
+    /// The cursor shape seqlock: a reader must never accept a torn copy.
+    /// The writer thread below replicates the driver's exact protocol
+    /// (generation to odd → rewrite metadata + pixels → generation to the
+    /// next even value); every shape `n` is 16×16 filled with byte `n`
+    /// and stamps `hotspot_x = n`, so any accepted copy proves itself:
+    /// generation 2n ⇒ hotspot n ⇒ every pixel byte == n.
+    #[test]
+    fn cursor_shape_copies_are_never_torn() {
+        use luminal_driver_proto::{
+            cursor_kind, cursor_section_size, CURSOR_HEADER_VERSION, CURSOR_MAGIC,
+            CURSOR_SHAPE_OFFSET,
+        };
+
+        const W: u32 = 16;
+        const H: u32 = 16;
+        const SHAPES: u32 = 50_000;
+
+        let bytes = cursor_section_size();
+        let mut buf: Vec<u64> = vec![0; bytes.div_ceil(8)];
+        let base_addr = buf.as_mut_ptr() as usize;
+
+        // Driver-side init: magic/version so open() semantics hold.
+        unsafe {
+            let h = base_addr as *mut CursorHeader;
+            std::ptr::write_volatile(&mut (*h).magic, CURSOR_MAGIC);
+            std::ptr::write_volatile(&mut (*h).version, CURSOR_HEADER_VERSION);
+        }
+
+        std::thread::scope(|s| {
+            let writer = s.spawn(move || {
+                let h = base_addr as *mut CursorHeader;
+                let generation =
+                    unsafe { AtomicU32::from_ptr(&mut (*h).shape_generation) };
+                let shape_base = (base_addr + CURSOR_SHAPE_OFFSET) as *mut u8;
+                for n in 1..=SHAPES {
+                    generation.store(2 * n - 1, Ordering::Release);
+                    unsafe {
+                        std::ptr::write_volatile(&mut (*h).kind, cursor_kind::ALPHA);
+                        std::ptr::write_volatile(&mut (*h).width, W);
+                        std::ptr::write_volatile(&mut (*h).height, H);
+                        std::ptr::write_volatile(&mut (*h).hotspot_x, n);
+                        std::ptr::write_volatile(&mut (*h).hotspot_y, 0);
+                        std::ptr::write_bytes(shape_base, n as u8, (W * H * 4) as usize);
+                    }
+                    generation.store(2 * n, Ordering::Release);
+                }
+            });
+
+            let reader = s.spawn(move || {
+                let view = CursorView::over_buffer(base_addr as *const u8);
+                let mut pixels = vec![0u8; (W * H * 4) as usize];
+                let mut accepted = 0u64;
+                let mut last_generation = 0u32;
+                while last_generation < 2 * SHAPES {
+                    let Some(shape) = view.shape(&mut pixels) else {
+                        std::hint::spin_loop();
+                        // Peek so the loop terminates once the writer is done.
+                        last_generation = last_generation.max(view.state().shape_generation);
+                        continue;
+                    };
+                    assert_eq!(shape.generation % 2, 0, "accepted an odd generation");
+                    let n = shape.generation / 2;
+                    assert_eq!(shape.hotspot_x, n, "metadata torn across generations");
+                    assert!(
+                        pixels.iter().all(|&b| b == n as u8),
+                        "torn pixel copy accepted for generation {}",
+                        shape.generation
+                    );
+                    accepted += 1;
+                    last_generation = shape.generation;
+                }
+                core::mem::forget(view);
+                accepted
+            });
+
+            writer.join().unwrap();
+            let accepted = reader.join().unwrap();
+            assert!(accepted > 0, "reader must have accepted shapes");
         });
     }
 }
