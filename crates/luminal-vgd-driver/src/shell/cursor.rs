@@ -311,6 +311,24 @@ fn cursor_loop(
         vec![0u8; (CURSOR_MAX_DIM as usize) * (CURSOR_MAX_DIM as usize) * 4];
     let mut last_shape_id: u32 = 0;
     let mut last_query_failed = false;
+    // Which QueryHardwareCursor variant this OS accepts: 0 = not yet
+    // discovered; then 3/2/1. The FP16 (HDR) adapter contract rejects v1
+    // with STATUS_NOT_SUPPORTED (ETW-confirmed on build 4), so discovery
+    // walks newest → oldest and latches the first success.
+    let mut query_version: u32 = 0;
+    // v2/v3 report X/Y only while PositionValid; carry the last good pair.
+    let mut last_x: i32 = 0;
+    let mut last_y: i32 = 0;
+
+    /// One query's OS reply, unified across the three variants.
+    struct Update {
+        visible: bool,
+        x: i32,
+        y: i32,
+        position_valid: bool,
+        shape_updated: bool,
+        info: ffi::IDDCX_CURSOR_SHAPE_INFO,
+    }
 
     while !stop.load(Ordering::SeqCst) {
         let wait = unsafe { WaitForSingleObject(HANDLE(event.0), 100) };
@@ -322,13 +340,83 @@ fn cursor_loop(
         in_args.LastShapeId = last_shape_id;
         in_args.ShapeBufferSizeInBytes = shape_buf.len() as u32;
         in_args.pShapeBuffer = shape_buf.as_mut_ptr();
-        let mut out: ffi::IDARG_OUT_QUERY_HWCURSOR = unsafe { zeroed() };
-        out.CursorShapeInfo.Size = size_of::<ffi::IDDCX_CURSOR_SHAPE_INFO>() as u32;
 
-        let status = unsafe {
-            bindings::monitor_query_hardware_cursor(monitor.0.cast(), &in_args, &mut out)
+        let query = |version: u32| -> (i32, Option<Update>) {
+            match version {
+                3 => {
+                    let mut out: ffi::IDARG_OUT_QUERY_HWCURSOR3 = unsafe { zeroed() };
+                    out.CursorShapeInfo.Size = size_of::<ffi::IDDCX_CURSOR_SHAPE_INFO>() as u32;
+                    let status = unsafe {
+                        bindings::monitor_query_hardware_cursor3(monitor.0.cast(), &in_args, &mut out)
+                    };
+                    let update = (status >= 0).then(|| Update {
+                        visible: out.IsCursorVisible != 0,
+                        x: out.X,
+                        y: out.Y,
+                        position_valid: out.PositionValid != 0,
+                        shape_updated: out.IsCursorShapeUpdated != 0,
+                        info: out.CursorShapeInfo,
+                    });
+                    (status, update)
+                }
+                2 => {
+                    let mut out: ffi::IDARG_OUT_QUERY_HWCURSOR2 = unsafe { zeroed() };
+                    out.CursorShapeInfo.Size = size_of::<ffi::IDDCX_CURSOR_SHAPE_INFO>() as u32;
+                    let status = unsafe {
+                        bindings::monitor_query_hardware_cursor2(monitor.0.cast(), &in_args, &mut out)
+                    };
+                    let update = (status >= 0).then(|| Update {
+                        visible: out.IsCursorVisible != 0,
+                        x: out.X,
+                        y: out.Y,
+                        position_valid: out.PositionValid != 0,
+                        shape_updated: out.IsCursorShapeUpdated != 0,
+                        info: out.CursorShapeInfo,
+                    });
+                    (status, update)
+                }
+                _ => {
+                    let mut out: ffi::IDARG_OUT_QUERY_HWCURSOR = unsafe { zeroed() };
+                    out.CursorShapeInfo.Size = size_of::<ffi::IDDCX_CURSOR_SHAPE_INFO>() as u32;
+                    let status = unsafe {
+                        bindings::monitor_query_hardware_cursor(monitor.0.cast(), &in_args, &mut out)
+                    };
+                    let update = (status >= 0).then(|| Update {
+                        visible: out.IsCursorVisible != 0,
+                        x: out.X,
+                        y: out.Y,
+                        position_valid: true, // v1 X/Y are always populated
+                        shape_updated: out.IsCursorShapeUpdated != 0,
+                        info: out.CursorShapeInfo,
+                    });
+                    (status, update)
+                }
+            }
         };
-        if status < 0 {
+
+        let (status, update) = if query_version != 0 {
+            query(query_version)
+        } else {
+            // Discovery: newest → oldest, latch the first accepted variant.
+            let mut result = (-1, None);
+            for version in [3u32, 2, 1] {
+                result = query(version);
+                if result.0 >= 0 {
+                    query_version = version;
+                    tracelogging::write_event!(
+                        PROVIDER,
+                        "CursorQueryMode",
+                        level(Informational),
+                        u64("session", &session_id),
+                        u32("version", &version)
+                    );
+                    break;
+                }
+            }
+            result
+        };
+
+        let Some(update) = update else {
             // Transient (e.g. mid-teardown): drop this update, stay alive.
             // Trace only edges so a wedged query can't flood ETW.
             if !last_query_failed {
@@ -337,16 +425,17 @@ fn cursor_loop(
                     "CursorQueryFailed",
                     level(Warning),
                     u64("session", &session_id),
+                    u32("version", &query_version),
                     i32("status", &status)
                 );
             }
             last_query_failed = true;
             continue;
-        }
+        };
         last_query_failed = false;
 
-        if out.IsCursorShapeUpdated != 0 {
-            let info = &out.CursorShapeInfo;
+        if update.shape_updated {
+            let info = &update.info;
             let width = info.Width.min(CURSOR_MAX_DIM);
             let height = info.Height.min(CURSOR_MAX_DIM);
             let kind = match info.CursorType {
@@ -372,7 +461,11 @@ fn cursor_loop(
             }
         }
 
-        section.write_position(out.X, out.Y, out.IsCursorVisible != 0);
+        if update.position_valid {
+            last_x = update.x;
+            last_y = update.y;
+        }
+        section.write_position(last_x, last_y, update.visible);
     }
     tracelogging::write_event!(
         PROVIDER,
