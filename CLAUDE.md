@@ -306,3 +306,15 @@ Cursor bring-up lessons (each cost one traced signing round — the
   §3.2.3's "forward to the client" is not implementable; the host
   composites server-side at encode time instead (same latency model as
   the DDA path on physical displays).
+- **NEVER call into IddCx from inside an IddCx callback, and never
+  join a thread that makes IddCx calls without a deadline** (build 7,
+  the hard way): IddCx callbacks are win32k callouts, and build 6's
+  SetupHardwareCursor retry inside EvtIddCxMonitorAssignSwapChain plus
+  an unbounded cursor-worker join in unplug produced mid-stream stream
+  drops, persistent RTSP 500s (host TDR gate), unrestorable topology,
+  LiveKernelEvent 0x1b8 (win32k callout watchdog) storms every ~72 s,
+  and finally an unclean system shutdown. The cursor worker now owns
+  every cursor IddCx call (setup retried on its own clock), and
+  CursorRt::stop() detaches after 500 ms per §3.3 rule 5. Diagnostic
+  signature to remember: 0x1b8 storms in WER = one of our callbacks is
+  not returning.
