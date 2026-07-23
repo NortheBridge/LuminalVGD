@@ -177,13 +177,24 @@ impl Drop for CursorRt {
     }
 }
 
-/// Register for hardware-cursor callbacks on `monitor` and spawn the
-/// worker that republishes updates into the shared cursor section.
-/// Failure is non-fatal (traced): the OS falls back to composing the
-/// cursor into the desktop frames, exactly the pre-cursor-DDI behavior.
-pub(crate) fn setup(session_id: u64, monitor: OsHandle) -> Option<CursorRt> {
-    let section = match CursorSection::create(session_id) {
-        Ok(s) => s,
+/// A cursor plane prepared but not yet claimed: the shared section exists
+/// (created at plug so the host can map it early) while
+/// `IddCxMonitorSetupHardwareCursor` still has to succeed.
+pub(crate) struct CursorPending {
+    section: CursorSection,
+}
+
+/// Setup phases, traced with every attempt so ETW shows exactly which
+/// call site the OS accepts.
+pub(crate) const PHASE_PLUG: u32 = 0;
+pub(crate) const PHASE_ASSIGN: u32 = 1;
+
+/// Create the shared cursor section at plug time. Failure is non-fatal
+/// (traced): without a section there is no cursor plane and the OS keeps
+/// composing the cursor into frames.
+pub(crate) fn prepare(session_id: u64) -> Option<CursorPending> {
+    match CursorSection::create(session_id) {
+        Ok(section) => Some(CursorPending { section }),
         Err(e) => {
             let code = e.code().0;
             tracelogging::write_event!(
@@ -193,8 +204,37 @@ pub(crate) fn setup(session_id: u64, monitor: OsHandle) -> Option<CursorRt> {
                 u64("session", &session_id),
                 i32("hresult", &code)
             );
-            return None;
+            None
         }
+    }
+}
+
+/// Try to claim the hardware cursor for `monitor` and spawn the worker.
+/// Bring-up diagnosis mode: SetupHardwareCursor rejected the plug-time
+/// call with STATUS_INVALID_PARAMETER (cursor caps are "for a given
+/// path", and no path exists before the first mode commit), so attempts
+/// run as a ladder — every (phase, variant, status) is traced, and the
+/// assign phase also walks caps variants in case the rejection is about
+/// the caps rather than the timing. `Err` hands the pending state back
+/// for the next phase to retry.
+pub(crate) fn try_setup(
+    phase: u32,
+    session_id: u64,
+    monitor: OsHandle,
+    pending: CursorPending,
+) -> Result<CursorRt, CursorPending> {
+    // Variant 0: alpha + XOR via OS emulation (out-of-band transport per
+    // the header's own guidance). Variant 1: alpha + full XOR (the host
+    // blend path handles masked shapes too). Variant 2: alpha only.
+    const VARIANTS: [ffi::IDDCX_XOR_CURSOR_SUPPORT; 3] = [
+        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_EMULATION,
+        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_FULL,
+        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_NONE,
+    ];
+    let variants: &[ffi::IDDCX_XOR_CURSOR_SUPPORT] = if phase == PHASE_PLUG {
+        &VARIANTS[..1]
+    } else {
+        &VARIANTS[..]
     };
 
     let event = match unsafe { CreateEventW(None, false, false, None) } {
@@ -208,48 +248,49 @@ pub(crate) fn setup(session_id: u64, monitor: OsHandle) -> Option<CursorRt> {
                 u64("session", &session_id),
                 i32("hresult", &code)
             );
-            return None;
+            return Err(pending);
         }
     };
 
-    // Alpha cursors natively; XOR cursors via OS emulation (the OS
-    // converts them to bordered alpha shapes). The IddCx header's own
-    // guidance for drivers that transmit the cursor out-of-band — and it
-    // means every shape written to the section is plain 32bpp.
-    let mut caps: ffi::IDDCX_CURSOR_CAPS = unsafe { zeroed() };
-    caps.Size = size_of::<ffi::IDDCX_CURSOR_CAPS>() as u32;
-    caps.ColorXorCursorSupport =
-        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_EMULATION;
-    caps.AlphaCursorSupport = 1;
-    caps.MaxX = CURSOR_MAX_DIM;
-    caps.MaxY = CURSOR_MAX_DIM;
+    for (variant, &xor_support) in variants.iter().enumerate() {
+        let mut caps: ffi::IDDCX_CURSOR_CAPS = unsafe { zeroed() };
+        caps.Size = size_of::<ffi::IDDCX_CURSOR_CAPS>() as u32;
+        caps.ColorXorCursorSupport = xor_support;
+        caps.AlphaCursorSupport = 1;
+        caps.MaxX = CURSOR_MAX_DIM;
+        caps.MaxY = CURSOR_MAX_DIM;
 
-    let mut in_args: ffi::IDARG_IN_SETUP_HWCURSOR = unsafe { zeroed() };
-    in_args.CursorInfo = caps;
-    in_args.hNewCursorDataAvailable = event.0.cast();
+        let mut in_args: ffi::IDARG_IN_SETUP_HWCURSOR = unsafe { zeroed() };
+        in_args.CursorInfo = caps;
+        in_args.hNewCursorDataAvailable = event.0.cast();
 
-    let status = unsafe { bindings::monitor_setup_hardware_cursor(monitor.0.cast(), &in_args) };
-    tracelogging::write_event!(
-        PROVIDER,
-        "CursorSetup",
-        level(Informational),
-        u64("session", &session_id),
-        i32("status", &status)
-    );
-    if status < 0 {
-        unsafe {
-            let _ = CloseHandle(event);
+        let status =
+            unsafe { bindings::monitor_setup_hardware_cursor(monitor.0.cast(), &in_args) };
+        tracelogging::write_event!(
+            PROVIDER,
+            "CursorSetup",
+            level(Informational),
+            u64("session", &session_id),
+            u32("phase", &phase),
+            u32("variant", &(variant as u32)),
+            i32("status", &status)
+        );
+        if status >= 0 {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = stop.clone();
+            let event_os = OsHandle(event.0);
+            let section = pending.section;
+            let join = std::thread::spawn(move || {
+                cursor_loop(session_id, monitor, event_os, section, stop_thread)
+            });
+            return Ok(CursorRt { stop, join: Some(join), event: OsHandle(event.0) });
         }
-        return None;
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    let event_os = OsHandle(event.0);
-    let join = std::thread::spawn(move || {
-        cursor_loop(session_id, monitor, event_os, section, stop_thread)
-    });
-    Some(CursorRt { stop, join: Some(join), event: OsHandle(event.0) })
+    unsafe {
+        let _ = CloseHandle(event);
+    }
+    Err(pending)
 }
 
 fn cursor_loop(
