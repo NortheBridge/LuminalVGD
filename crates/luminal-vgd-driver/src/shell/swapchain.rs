@@ -452,6 +452,26 @@ fn publish_frame(
         }
         return Ok(());
     };
+
+    // Take the slot ATOMICALLY in shared memory before touching it. The
+    // policy's choice above is based on the reconcile snapshot; the host's
+    // claim CAS (PUBLISHED → READING) can land in between. CASing
+    // `expected → WRITING` on the same atomic serializes the two takers —
+    // without this, an overwrite could relabel/clobber a slot mid-claim
+    // (the ring-stall / mislabeled-frame race). On loss: drop this frame
+    // and let the next reconcile absorb the host's READING.
+    if let Some(s) = &ring.section {
+        let expected = if writer.overwrote.is_some() {
+            luminal_driver_proto::slot_state::PUBLISHED
+        } else {
+            luminal_driver_proto::slot_state::FREE
+        };
+        if !s.try_take_slot_writing(writer.index, expected) {
+            ring.policy.writer_abort(writer.index);
+            s.heartbeat();
+            return Ok(());
+        }
+    }
     let slot: &SharedTexture = &ring.textures[writer.index];
 
     // Key 0 until the slot's first publish this generation; key 1
@@ -476,13 +496,16 @@ fn publish_frame(
         }
         AcquireOutcome::DeviceLost(hr) => {
             ring.policy.writer_abort(writer.index);
+            if let Some(s) = &ring.section {
+                // The take-CAS put the shared state at WRITING; release it
+                // so the slot isn't leaked unwritable if the ring survives.
+                s.reset_slot_free(writer.index);
+            }
             return Err(windows::core::Error::from_hresult(hr));
         }
     }
 
-    if let Some(s) = &ring.section {
-        s.slot_writing(writer.index);
-    }
+    // Shared state is already WRITING via the take-CAS above.
     unsafe { context.CopyResource(&slot.texture, &frame_tex) };
     let release = unsafe { slot.mutex.ReleaseSync(luminal_driver_proto::KMTX_KEY_HOST) };
 

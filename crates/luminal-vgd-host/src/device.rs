@@ -225,6 +225,14 @@ pub struct ClaimedFrame {
 }
 
 impl RingView {
+    /// Test-only: a view over caller-owned memory instead of a mapped
+    /// section. The caller must keep the buffer alive and `mem::forget`
+    /// the view (Drop would try to unmap it).
+    #[cfg(test)]
+    pub(crate) fn over_buffer(view: *mut u8, slot_count: u32) -> Self {
+        Self { mapping: core::ptr::null_mut(), view, slot_count }
+    }
+
     /// Map the ring section for `session_id` (name derived through the
     /// shared proto helper — never hand-composed).
     pub fn open(session_id: u64, slot_count: u32) -> io::Result<Self> {
@@ -302,7 +310,22 @@ impl RingView {
                 .compare_exchange(ss::PUBLISHED, ss::READING, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(candidate);
+                // Re-read the metadata now that READING protects the slot.
+                // The scan above races the driver's drop-oldest republish:
+                // the state can be PUBLISHED again (ABA) with a NEWER
+                // sequence by CAS time, and returning the stale pre-CAS
+                // sequence mislabels the claim — a consumer deduping by
+                // sequence then discards a frame that (if the desktop goes
+                // idle) can never be re-claimed. The CAS's acquire ordering
+                // pairs with the driver's release publish, so these reads
+                // see the full metadata of whatever frame the slot holds.
+                let meta = self.slot(candidate.index)?;
+                return Some(ClaimedFrame {
+                    index: candidate.index,
+                    sequence: meta.sequence,
+                    present_qpc: meta.present_qpc,
+                    generation: self.header().ring_generation,
+                });
             }
         }
         None
@@ -319,5 +342,150 @@ impl RingView {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use luminal_driver_proto::slot_state as ss;
+    use luminal_vgd_core::ring::RingPolicy;
+
+    /// Regression for the ring-stall bug (2026-07-22): `claim_latest`'s
+    /// pre-CAS metadata scan races the driver's drop-oldest republish. The
+    /// CAS can succeed against a slot that was republished with a NEWER
+    /// sequence in between (ABA on the state value), and returning the
+    /// stale scanned sequence mislabels the claim. A consumer deduping by
+    /// sequence then discards the ring's freshest frame; if the desktop
+    /// idles, that frame is never re-claimable — the observed live stall
+    /// (latest_sequence frozen above the last delivered sequence).
+    ///
+    /// The writer thread below mimics the driver's exact shared-memory
+    /// protocol (RingPolicy decisions + metadata-then-state-Release
+    /// publishes); the reader claims/releases with the capture backend's
+    /// dedupe. The invariant that catches the bug: a claim's reported
+    /// sequence must always equal the sequence the slot holds while it is
+    /// READING-protected.
+    #[test]
+    fn claim_sequence_is_coherent_under_republish_races() {
+        const SLOTS: u32 = 3;
+        const FRAMES: u64 = 200_000;
+
+        let bytes = ring_section_size(SLOTS);
+        let mut buf: Vec<u64> = vec![0; bytes.div_ceil(8)];
+        let base_addr = buf.as_mut_ptr() as usize;
+
+        let stop = AtomicBool::new(false);
+        let published_latest = AtomicU64::new(0);
+
+        std::thread::scope(|s| {
+            // Driver-side writer: reconcile → writer_acquire → metadata
+            // writes → state PUBLISHED (Release) → header latest_sequence.
+            let stop_ref = &stop;
+            let published_ref = &published_latest;
+            let w = s.spawn(move || {
+                let v = RingView::over_buffer(base_addr as *mut u8, SLOTS);
+                let mut policy = RingPolicy::new(SLOTS);
+                let mut published = 0u64;
+                while published < FRAMES && !stop_ref.load(Ordering::Acquire) {
+                    for i in 0..SLOTS {
+                        let state = unsafe {
+                            AtomicU32::from_ptr(&mut (*v.slot_ptr(i)).state)
+                                .load(Ordering::Acquire)
+                        };
+                        policy.reconcile_shared(i as usize, state);
+                    }
+                    let Some(wslot) = policy.writer_acquire() else {
+                        std::hint::spin_loop();
+                        continue;
+                    };
+                    // The driver's take-CAS: serialize against the host's
+                    // claim CAS on the same atomic; on loss, drop the frame
+                    // (next reconcile absorbs the host's READING).
+                    let expected = if wslot.overwrote.is_some() {
+                        ss::PUBLISHED
+                    } else {
+                        ss::FREE
+                    };
+                    let taken = unsafe {
+                        AtomicU32::from_ptr(&mut (*v.slot_ptr(wslot.index as u32)).state)
+                            .compare_exchange(
+                                expected,
+                                ss::WRITING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    };
+                    if !taken {
+                        policy.writer_abort(wslot.index);
+                        continue;
+                    }
+                    let seq = policy.publish(wslot.index);
+                    unsafe {
+                        let slot = v.slot_ptr(wslot.index as u32);
+                        core::ptr::write_volatile(&mut (*slot).sequence, seq);
+                        core::ptr::write_volatile(&mut (*slot).present_qpc, seq);
+                        AtomicU32::from_ptr(&mut (*slot).state)
+                            .store(ss::PUBLISHED, Ordering::Release);
+                    }
+                    published_ref.store(seq, Ordering::Release);
+                    published = seq;
+                }
+                core::mem::forget(v);
+            });
+
+            // Host-side reader: claim → verify coherence → dedupe → release.
+            let r = s.spawn(move || {
+                let v = RingView::over_buffer(base_addr as *mut u8, SLOTS);
+                let mut last_delivered = 0u64;
+                let mut delivered = 0u64;
+                while published_ref.load(Ordering::Acquire) < FRAMES {
+                    let Some(claim) = v.claim_latest() else {
+                        std::hint::spin_loop();
+                        continue;
+                    };
+                    // THE regression assertion: while READING-protected,
+                    // the slot's actual sequence must match the claim.
+                    let held = v.slot(claim.index).unwrap();
+                    assert_eq!(
+                        held.sequence, claim.sequence,
+                        "claim mislabeled: slot holds {} but claim says {}",
+                        held.sequence, claim.sequence
+                    );
+                    // Consumer contract: deliver only frames NEWER than the
+                    // last delivered one. Older still-PUBLISHED leftovers
+                    // are legitimately claimable after the newest slot is
+                    // released — a `!=` dedupe would deliver them out of
+                    // order (the second defect this test exposed).
+                    if claim.sequence > last_delivered {
+                        last_delivered = claim.sequence;
+                        delivered += 1;
+                    }
+                    v.release(claim.index);
+                }
+                core::mem::forget(v);
+                (last_delivered, delivered)
+            });
+
+            w.join().unwrap();
+            let (last_delivered, delivered) = r.join().unwrap();
+            stop.store(true, Ordering::Release);
+
+            // End-state invariant (the live failure mode): once the writer
+            // idles, the freshest published frame must still be claimable.
+            let v = RingView::over_buffer(base_addr as *mut u8, SLOTS);
+            let final_latest = published_latest.load(Ordering::Acquire);
+            if last_delivered < final_latest {
+                let claim = v
+                    .claim_latest()
+                    .expect("freshest frame must remain claimable after writer idles");
+                assert_eq!(claim.sequence, final_latest);
+                v.release(claim.index);
+            }
+            core::mem::forget(v);
+            assert!(delivered > 0, "reader must have consumed frames");
+        });
     }
 }
