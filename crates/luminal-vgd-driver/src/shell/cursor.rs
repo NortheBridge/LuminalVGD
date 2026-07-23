@@ -20,6 +20,7 @@ use core::mem::{size_of, zeroed};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
@@ -152,49 +153,69 @@ impl CursorSection {
 pub(crate) struct CursorRt {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
-    /// Closed on drop — after departure, so the OS never signals a closed
-    /// handle (drop the whole `MonitorRt` only once departure returned).
+    /// Closed on drop unless the worker had to be detached (see stop()).
     event: OsHandle,
+    detached: bool,
 }
 
+/// How long stop() waits for the worker before detaching it. Part of the
+/// §3.3 teardown budget: a cursor query wedged inside the OS must never
+/// extend monitor departure (and with it the whole control plane)
+/// unboundedly.
+const STOP_DEADLINE: Duration = Duration::from_millis(500);
+
 impl CursorRt {
-    /// Bounded stop (the worker re-checks the flag at least every 100 ms).
-    /// The event handle stays open until drop.
+    /// Deadline-bounded stop. The worker re-checks the flag at least
+    /// every 100 ms; if it fails to exit within [`STOP_DEADLINE`] (an OS
+    /// call wedged), the thread is detached and the event handle is
+    /// deliberately leaked so the stuck call never touches a closed
+    /// handle. Teardown proceeds regardless.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        let Some(join) = self.join.take() else { return };
+        let deadline = std::time::Instant::now() + STOP_DEADLINE;
+        while !join.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "CursorStopTimeout",
+                    level(Warning)
+                );
+                self.detached = true;
+                drop(join); // detach; the worker exits on its own if it ever unblocks
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        let _ = join.join();
     }
 }
 
 impl Drop for CursorRt {
     fn drop(&mut self) {
         self.stop();
-        unsafe {
-            let _ = CloseHandle(HANDLE(self.event.0));
+        if !self.detached {
+            unsafe {
+                let _ = CloseHandle(HANDLE(self.event.0));
+            }
         }
+        // Detached: event handle leaks intentionally (worker may still be
+        // blocked on it inside the OS).
     }
 }
 
-/// A cursor plane prepared but not yet claimed: the shared section exists
-/// (created at plug so the host can map it early) while
-/// `IddCxMonitorSetupHardwareCursor` still has to succeed.
-pub(crate) struct CursorPending {
-    section: CursorSection,
-}
-
-/// Setup phases, traced with every attempt so ETW shows exactly which
-/// call site the OS accepts.
-pub(crate) const PHASE_PLUG: u32 = 0;
-pub(crate) const PHASE_ASSIGN: u32 = 1;
-
-/// Create the shared cursor section at plug time. Failure is non-fatal
-/// (traced): without a section there is no cursor plane and the OS keeps
-/// composing the cursor into frames.
-pub(crate) fn prepare(session_id: u64) -> Option<CursorPending> {
-    match CursorSection::create(session_id) {
-        Ok(section) => Some(CursorPending { section }),
+/// Claim the cursor plane for `monitor`: create the shared section and
+/// spawn the worker. ALL cursor IddCx calls (SetupHardwareCursor and the
+/// queries) happen on the worker thread — never on the plug/ioctl path
+/// and never inside an IddCx callback. IddCx callbacks are win32k
+/// callouts; calling back into IddCx from one can deadlock against the
+/// locks win32k holds while calling us, and the win32k callout watchdog
+/// then fires LiveKernelEvent 0x1b8 storms until the machine wedges
+/// (observed live, 2026-07-23). The worker retries SetupHardwareCursor
+/// on its own clock until a path is committed and the OS accepts.
+pub(crate) fn spawn(session_id: u64, monitor: OsHandle) -> Option<CursorRt> {
+    let section = match CursorSection::create(session_id) {
+        Ok(s) => s,
         Err(e) => {
             let code = e.code().0;
             tracelogging::write_event!(
@@ -204,39 +225,9 @@ pub(crate) fn prepare(session_id: u64) -> Option<CursorPending> {
                 u64("session", &session_id),
                 i32("hresult", &code)
             );
-            None
+            return None;
         }
-    }
-}
-
-/// Try to claim the hardware cursor for `monitor` and spawn the worker.
-/// Bring-up diagnosis mode: SetupHardwareCursor rejected the plug-time
-/// call with STATUS_INVALID_PARAMETER (cursor caps are "for a given
-/// path", and no path exists before the first mode commit), so attempts
-/// run as a ladder — every (phase, variant, status) is traced, and the
-/// assign phase also walks caps variants in case the rejection is about
-/// the caps rather than the timing. `Err` hands the pending state back
-/// for the next phase to retry.
-pub(crate) fn try_setup(
-    phase: u32,
-    session_id: u64,
-    monitor: OsHandle,
-    pending: CursorPending,
-) -> Result<CursorRt, CursorPending> {
-    // Variant 0: alpha + XOR via OS emulation (out-of-band transport per
-    // the header's own guidance). Variant 1: alpha + full XOR (the host
-    // blend path handles masked shapes too). Variant 2: alpha only.
-    const VARIANTS: [ffi::IDDCX_XOR_CURSOR_SUPPORT; 3] = [
-        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_EMULATION,
-        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_FULL,
-        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_NONE,
-    ];
-    let variants: &[ffi::IDDCX_XOR_CURSOR_SUPPORT] = if phase == PHASE_PLUG {
-        &VARIANTS[..1]
-    } else {
-        &VARIANTS[..]
     };
-
     let event = match unsafe { CreateEventW(None, false, false, None) } {
         Ok(h) => h,
         Err(e) => {
@@ -248,11 +239,35 @@ pub(crate) fn try_setup(
                 u64("session", &session_id),
                 i32("hresult", &code)
             );
-            return Err(pending);
+            return None;
         }
     };
 
-    for (variant, &xor_support) in variants.iter().enumerate() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let event_os = OsHandle(event.0);
+    let join = std::thread::spawn(move || {
+        cursor_loop(session_id, monitor, event_os, section, stop_thread)
+    });
+    Some(CursorRt { stop, join: Some(join), event: OsHandle(event.0), detached: false })
+}
+
+/// One SetupHardwareCursor attempt ladder (EMULATION → FULL → NONE XOR
+/// caps). Returns the accepted variant, or the last status. Runs on the
+/// worker thread only.
+fn setup_attempt(
+    session_id: u64,
+    monitor: OsHandle,
+    event: OsHandle,
+    round: u32,
+    last_status: &mut i32,
+) -> bool {
+    const VARIANTS: [ffi::IDDCX_XOR_CURSOR_SUPPORT; 3] = [
+        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_EMULATION,
+        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_FULL,
+        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_NONE,
+    ];
+    for (variant, &xor_support) in VARIANTS.iter().enumerate() {
         let mut caps: ffi::IDDCX_CURSOR_CAPS = unsafe { zeroed() };
         caps.Size = size_of::<ffi::IDDCX_CURSOR_CAPS>() as u32;
         caps.ColorXorCursorSupport = xor_support;
@@ -266,31 +281,25 @@ pub(crate) fn try_setup(
 
         let status =
             unsafe { bindings::monitor_setup_hardware_cursor(monitor.0.cast(), &in_args) };
-        tracelogging::write_event!(
-            PROVIDER,
-            "CursorSetup",
-            level(Informational),
-            u64("session", &session_id),
-            u32("phase", &phase),
-            u32("variant", &(variant as u32)),
-            i32("status", &status)
-        );
+        // Trace edges (status changes) and successes — the retry loop
+        // runs at 1 Hz until a path commits, which would flood ETW.
+        if status >= 0 || status != *last_status {
+            tracelogging::write_event!(
+                PROVIDER,
+                "CursorSetup",
+                level(Informational),
+                u64("session", &session_id),
+                u32("round", &round),
+                u32("variant", &(variant as u32)),
+                i32("status", &status)
+            );
+        }
+        *last_status = status;
         if status >= 0 {
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_thread = stop.clone();
-            let event_os = OsHandle(event.0);
-            let section = pending.section;
-            let join = std::thread::spawn(move || {
-                cursor_loop(session_id, monitor, event_os, section, stop_thread)
-            });
-            return Ok(CursorRt { stop, join: Some(join), event: OsHandle(event.0) });
+            return true;
         }
     }
-
-    unsafe {
-        let _ = CloseHandle(event);
-    }
-    Err(pending)
+    false
 }
 
 fn cursor_loop(
@@ -306,6 +315,29 @@ fn cursor_loop(
         level(Informational),
         u64("session", &session_id)
     );
+
+    // Phase 1: claim the plane. SetupHardwareCursor is rejected with
+    // INVALID_PARAMETER until a path is committed on the monitor (mode
+    // commit happens seconds after plug), so retry at 1 Hz on this
+    // thread's own clock — never from plug or an IddCx callback.
+    let mut setup_round: u32 = 0;
+    let mut last_setup_status: i32 = 0;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            tracelogging::write_event!(
+                PROVIDER,
+                "CursorWorkerExit",
+                level(Informational),
+                u64("session", &session_id)
+            );
+            return;
+        }
+        if setup_attempt(session_id, monitor, event, setup_round, &mut last_setup_status) {
+            break;
+        }
+        setup_round += 1;
+        std::thread::sleep(Duration::from_millis(if setup_round < 3 { 250 } else { 1000 }));
+    }
 
     let mut shape_buf =
         vec![0u8; (CURSOR_MAX_DIM as usize) * (CURSOR_MAX_DIM as usize) * 4];
@@ -334,6 +366,12 @@ fn cursor_loop(
         let wait = unsafe { WaitForSingleObject(HANDLE(event.0), 100) };
         if wait != WAIT_OBJECT_0 {
             continue; // timeout — just the bounded stop check
+        }
+        // Re-check after the wait: stop() gives teardown a 500 ms deadline
+        // before departure, so refusing to issue a query once stopping
+        // guarantees no cursor query ever targets a departed monitor.
+        if stop.load(Ordering::SeqCst) {
+            break;
         }
 
         let mut in_args: ffi::IDARG_IN_QUERY_HWCURSOR = unsafe { zeroed() };

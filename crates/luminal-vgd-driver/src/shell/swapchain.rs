@@ -174,30 +174,11 @@ pub unsafe extern "C" fn evt_assign(
         frame_loop(session_id, swapchain, frame_event, luid, ring, stop_thread)
     });
     rt.worker = Some(Worker { stop, join: Some(join) });
-
-    // Retry a pending cursor-plane claim now that a path is committed and
-    // active (the plug-time SetupHardwareCursor predates the first mode
-    // commit and the OS can refuse it). The IddCx call happens with the
-    // monitors lock released.
-    let cursor_pending = rt.cursor.is_none().then(|| rt.cursor_pending.take()).flatten();
-    drop(monitors);
-    if let Some(pending) = cursor_pending {
-        let outcome = super::cursor::try_setup(
-            super::cursor::PHASE_ASSIGN,
-            session_id,
-            OsHandle(monitor.cast()),
-            pending,
-        );
-        let mut monitors = shell.monitors.lock().unwrap();
-        if let Some(rt) = monitors.get_mut(&session_id) {
-            match outcome {
-                Ok(cursor) => rt.cursor = Some(cursor),
-                Err(pending) => rt.cursor_pending = Some(pending),
-            }
-        }
-        // Monitor gone mid-attempt: outcome drops here (worker stopped,
-        // event closed) — departure has already run.
-    }
+    // NOTE: nothing here may call back into IddCx. This callback is a
+    // win32k callout; an IddCx call from inside it can deadlock against
+    // the locks win32k holds while calling us (callout-watchdog 0x1b8
+    // storms → system hang, observed 2026-07-23). The cursor worker owns
+    // all cursor IddCx calls on its own thread.
     STATUS_SUCCESS
 }
 

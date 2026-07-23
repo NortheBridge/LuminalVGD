@@ -45,7 +45,7 @@ pub(crate) const SHELL_CAPS: u32 = luminal_driver_proto::caps::MULTI_MODE
 
 /// Monotonic build stamp reported in HANDSHAKE/GET_STATUS (CI will stamp
 /// this properly in phase 7; hand-bumped during bring-up).
-pub(crate) const DRIVER_BUILD: u32 = 6;
+pub(crate) const DRIVER_BUILD: u32 = 7;
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
 /// terminator survives.
@@ -80,13 +80,11 @@ pub(crate) struct MonitorRt {
     /// in the worker, so sequences and the generation persist across
     /// swap-chain reassignments; the active worker drives it exclusively.
     pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
-    /// Hardware-cursor worker + section (None when setup failed — the OS
+    /// Hardware-cursor worker + section (None when spawn failed — the OS
     /// then composes the cursor into frames, the pre-cursor behavior).
+    /// The worker owns every cursor IddCx call, including the
+    /// SetupHardwareCursor retry loop.
     pub cursor: Option<cursor::CursorRt>,
-    /// Cursor section awaiting a successful SetupHardwareCursor (retried
-    /// at swapchain assign — the plug-time call predates the first mode
-    /// commit and the OS can reject it).
-    pub cursor_pending: Option<cursor::CursorPending>,
 }
 
 pub(crate) struct Shell {
