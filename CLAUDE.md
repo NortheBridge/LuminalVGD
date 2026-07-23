@@ -268,3 +268,41 @@ test enforces forever:
 Verified: 10-minute vgd-probe --consume soak (0 stalls, autopsy
 tooling now built into the probe) + long multi-leg live sessions incl.
 Initial-Ping-Timeout reconnect storms.
+
+### Cursor + gamma DDIs, alttab_stress — COMPLETE (2026-07-23, build 6)
+
+**Milestones verified:** (1) hardware-cursor plane end to end — the
+driver claims the IddCx cursor (alpha + XOR-emulation, 256²) and
+republishes shape/position into the shared cursor section
+(`Global\LuminalVGD-cur-<sid>`, seqlock on `shape_generation`);
+LuminalShine reads it via `CursorView`/FFI and GPU-blends at encode
+time reusing the DDA cursor machinery. Live-validated on the LG OLED
+(HDR stream): tracking, hotspot alignment, normal HDR brightness, and
+smooth cursor motion over an idle desktop (the driver publishes no
+frames for cursor-only changes — `display_vgd` keeps a cursor-free
+copy of the last frame and redelivers it with a fresh blend). (2)
+`alttab-stress` (WGC-RELIABILITY §7 port): exclusive-fullscreen round
+trips on an ephemeral monitor with a concurrent ring consumer + wedge
+watchdog — passed with 0 stalls. `caps::GAMMA_RAMP` is advertised;
+SetGammaRamp stays acknowledge-and-trace (capture on physical displays
+is pre-LUT too, so stream parity is unchanged).
+
+Cursor bring-up lessons (each cost one traced signing round — the
+(phase, variant, status) ETW ladder made every round conclusive):
+- **IddCxMonitorSetupHardwareCursor fails STATUS_INVALID_PARAMETER
+  before a path is committed** (cursor caps are per-path; right after
+  MonitorArrival there is no path). Call it at swapchain assign; the
+  shell keeps a `cursor_pending` state and retries on every assign.
+- **FP16 (HDR) adapters reject QueryHardwareCursor v1 with
+  STATUS_NOT_SUPPORTED** — the contract wants the newer variants (v3
+  adds the cursor SdrWhiteLevel). The worker discovers the accepted
+  variant at runtime (3 → 2 → 1, latched, traced as CursorQueryMode;
+  this box latches v3). v2/v3 X/Y are only valid with PositionValid —
+  carry the last good pair across visibility-only updates.
+- Windows remembers per-identity topology: a stable-identity probe run
+  with zero frames + stale heartbeat is usually remembered-disconnect
+  state, not a driver bug — re-test with `--ephemeral` before chasing.
+- Moonlight/Sunshine has **no client-side cursor channel** — DESIGN.md
+  §3.2.3's "forward to the client" is not implementable; the host
+  composites server-side at encode time instead (same latency model as
+  the DDA path on physical displays).
