@@ -318,3 +318,26 @@ Cursor bring-up lessons (each cost one traced signing round — the
   CursorRt::stop() detaches after 500 ms per §3.3 rule 5. Diagnostic
   signature to remember: 0x1b8 storms in WER = one of our callbacks is
   not returning.
+
+### Phase 7 — packaging & first release (2026-07-23, build 8)
+
+**Control-surface ACL (the §6 release blocker) shipped**: the control
+interface is registered with reference string `LuminalVGDControl`;
+EvtDeviceFileCreate authorizes control opens under caller impersonation
+(`WdfRequestImpersonate` at SecurityIdentification →
+`CheckTokenMembership` for SYSTEM / BUILTIN\Administrators — filtered
+admin tokens correctly fail), and EvtIddCxDeviceIoControl refuses every
+IOCTL on a handle that did not pass (default deny, including handles
+opened on the bare device object). OS graphics-stack opens carry other
+names and pass unhindered — a device-wide SDDL remains forbidden
+(phase-2 lesson). Packaging: install-driver.ps1 gained the §6 OS floor
+check (Win11; warn <24H2) and `-SeedTrustedPublisher` (TrustedPublisher
+only, never Root); uninstall-driver.ps1 reverses devnode + DriverStore
+package (+ optional cert); package-release.ps1 stages the release zip
+(gates: valid+timestamped signatures, FORCE_INTEGRITY clear) with
+SHA256SUMS; DRIVER_BUILD is stamped via LUMINAL_VGD_BUILD at release
+build time; docs/INSTALL.md ships in the zip. Signed artifacts are
+release assets only — never committed. SudoVDA decision: stays as
+LuminalShine's legacy fallback through the 26.08 alpha (auto-selection
+already prefers LuminalVGD when installed); removal revisited once the
+driver clears all milestones.

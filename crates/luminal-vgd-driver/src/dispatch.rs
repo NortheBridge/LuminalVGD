@@ -58,6 +58,12 @@ pub struct DeviceState {
 #[derive(Default)]
 pub struct HandleCtx {
     pub handshaken: bool,
+    /// DESIGN.md §6 control-surface ACL: set by the shell at file-create
+    /// when the handle was opened through the control reference string by
+    /// SYSTEM or an elevated Administrator. The shell refuses every IOCTL
+    /// (including HANDSHAKE) on unauthorized handles before dispatch runs;
+    /// the default is deny.
+    pub authorized: bool,
 }
 
 /// Side effects the shell must apply after a successful dispatch. The

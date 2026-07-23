@@ -114,14 +114,20 @@ unsafe extern "C" fn evt_device_add(
         return status;
     }
 
-    // The control interface the host enumerates (proto GUID). Device
-    // object security (SYSTEM+Admins SDDL) is enforced from the INF.
+    // The control interface the host enumerates (proto GUID), registered
+    // WITH a reference string: opens through the interface symlink then
+    // carry "\LuminalVGDControl" as the file name, which is what lets
+    // EvtDeviceFileCreate tell control-plane opens apart from the OS
+    // graphics stack's own (unelevated, name-less) opens of the same
+    // device object. The DESIGN.md §6 SYSTEM+Admins ACL is enforced there
+    // — a device-wide SDDL would break IddCx (phase-2 lesson).
     let guid = interface_guid();
+    let ref_string = control::control_ref_unicode();
     let status = call_unsafe_wdf_function_binding!(
         WdfDeviceCreateDeviceInterface,
         device,
         &guid,
-        null_mut()
+        &ref_string
     );
     if status != STATUS_SUCCESS {
         return status;

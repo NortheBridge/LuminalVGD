@@ -40,10 +40,11 @@ AddReg = LuminalVgd_HardwareSettings
 [LuminalVgd_HardwareSettings]
 ; NOTE: no device-object Security SDDL here — IddCx exposes the OS-facing
 ; display interfaces on this same device object, and the graphics stack
-; does not run elevated. The DESIGN.md §6 control-surface ACL must be
-; enforced on the LuminalVGD control path specifically (phase 7:
-; per-interface security or a dedicated control device object); the
-; dispatch handshake gate covers the interim.
+; does not run elevated. The DESIGN.md §6 control-surface ACL is enforced
+; in the driver instead: control opens (interface reference string
+; "LuminalVGDControl") require SYSTEM or an elevated Administrator, and
+; IOCTLs are refused on any handle that did not pass that check
+; (shell/control.rs).
 ; IddCx requires the IndirectKmd upper filter on the devnode.
 HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
 ; Dedicated WUDF host pool: LuminalVGD never shares a WUDFHost process

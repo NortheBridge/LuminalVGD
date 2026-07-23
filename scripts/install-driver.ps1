@@ -1,12 +1,27 @@
 ﻿# SPDX-License-Identifier: AGPL-3.0-only
-# Install the staged LuminalVGD driver package: verify signature, add the
-# driver package, and create the root\luminal_vgd devnode if missing.
-# TrustedPublisher seeding stays a manual maintainer step (BUILDING.md).
+# Install the LuminalVGD driver package (DESIGN.md §6): OS floor check,
+# signature verification, optional TrustedPublisher seeding, driver-package
+# add, and root\luminal_vgd devnode creation. Uninstall with
+# uninstall-driver.ps1.
 #Requires -RunAsAdministrator
 param(
-    [string]$Package = (Join-Path $PSScriptRoot "..\target\driver-package")
+    [string]$Package = (Join-Path $PSScriptRoot "..\target\driver-package"),
+    # Seed the package's signing certificate into
+    # LocalMachine\TrustedPublisher (ONLY TrustedPublisher — the OV cert
+    # already chains to a trusted root; the Root store is never touched).
+    # Without it, Windows shows a publisher-trust prompt during install.
+    [switch]$SeedTrustedPublisher
 )
 $ErrorActionPreference = 'Stop'
+
+# OS floor (DESIGN.md §6): Windows 11 required; 24H2+ for full HDR.
+$build = [Environment]::OSVersion.Version.Build
+if ($build -lt 22000) {
+    throw "LuminalVGD requires Windows 11 (build 22000+); this is build $build."
+}
+if ($build -lt 26100) {
+    Write-Warning "Windows 11 24H2 (build 26100+) is required for full HDR support; this is build $build. SDR streaming works."
+}
 
 $inf = Join-Path $Package 'luminalvgd.inf'
 $cat = Join-Path $Package 'luminalvgd.cat'
@@ -21,8 +36,15 @@ if ($sig.Status -ne 'Valid') {
 }
 $inTrusted = Get-ChildItem Cert:\LocalMachine\TrustedPublisher |
     Where-Object Thumbprint -eq $sig.SignerCertificate.Thumbprint
+if (-not $inTrusted -and $SeedTrustedPublisher) {
+    Write-Host "Seeding signer into LocalMachine\TrustedPublisher: $($sig.SignerCertificate.Subject)"
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
+    $store.Open('ReadWrite')
+    try { $store.Add($sig.SignerCertificate) } finally { $store.Close() }
+    $inTrusted = $true
+}
 if (-not $inTrusted) {
-    Write-Warning "Signer not in LocalMachine\TrustedPublisher — Windows will show an install prompt."
+    Write-Warning "Signer not in LocalMachine\TrustedPublisher — Windows will show an install prompt (re-run with -SeedTrustedPublisher to install silently)."
 }
 
 Write-Host "Adding driver package…"
