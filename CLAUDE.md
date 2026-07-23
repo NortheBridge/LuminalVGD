@@ -239,3 +239,32 @@ HDR bring-up lessons (one wasted signing round each — check first):
 Next: cursor + gamma DDIs (hardware cursor ABI is in proto v0.3),
 WGC-RELIABILITY §7 alttab_stress port, phase 7 packaging (installer,
 strict control-device SDDL — release blocker, uninstaller).
+
+### Ring protocol hardening — take-CAS (2026-07-22, build 3)
+
+Live streams stalled ~1 min in (latest_sequence frozen above the last
+delivered sequence; LuminalShine's breaker fell back to WGC). Root
+cause, found by the threaded protocol regression test in
+luminal-vgd-host in milliseconds: the writer picked overwrite victims
+from the reconcile snapshot and plain-stored WRITING, silently
+clobbering host claims that landed in between — the keyed mutex guards
+pixels, but the slot state machine had no atomic hand-off. Fix: the
+writer takes slots by CAS (`try_take_slot_writing`, PUBLISHED/FREE →
+WRITING) on the same atomic the host claims through; lost takes drop
+the frame and reconcile absorbs (Free, READING). Protocol rules the
+test enforces forever:
+
+- Every writer path into a slot must win a shared-state CAS first —
+  never trust the policy snapshot alone.
+- Claims re-read metadata after their CAS (READING protects the slot).
+- Consumers deliver only sequence > last-delivered: older published
+  leftovers legitimately become "freshest claimable" after the newest
+  slot is released, and != dedupe delivers them out of order.
+- Host-side health checks key off latest_sequence vs delivered, never
+  cumulative counters; a stale heartbeat means "worker stopped"
+  (swapchain unassigned during mode switches), not "worker dead" —
+  LuminalShine waits a 10 s grace before reinitializing.
+
+Verified: 10-minute vgd-probe --consume soak (0 stalls, autopsy
+tooling now built into the probe) + long multi-leg live sessions incl.
+Initial-Ping-Timeout reconnect storms.
