@@ -22,7 +22,7 @@ use luminal_driver_proto::{
     create_flags, err, ring_state, CreateMonitorRequest, GetStatusReply, ModeSpec,
     LEASE_TIMEOUT_USE_DEFAULT, MAX_MODES_PER_MONITOR,
 };
-use luminal_vgd_host::device::{RingView, VgdDevice};
+use luminal_vgd_host::device::{CursorView, RingView, VgdDevice};
 
 /// Stable default display identity so repeated probe runs exercise the
 /// identity-retention path (same connector, remembered settings).
@@ -64,6 +64,9 @@ struct Args {
     /// slots continuously (~5 ms cadence). Exercises the reader protocol
     /// end to end; with a consumer draining, driver drops should stay ≈0.
     consume: bool,
+    /// Watch the shared cursor section during the hold: print position/
+    /// visibility changes and fetch each new shape (caps::HW_CURSOR).
+    cursor: bool,
 }
 
 /// Default mode list when none is given: 4K120 preferred (LG-OLED-class
@@ -83,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
         hold_secs: 15,
         ephemeral: false,
         consume: false,
+        cursor: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -90,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
             "status" => args.status_only = true,
             "--ephemeral" => args.ephemeral = true,
             "--consume" => args.consume = true,
+            "--cursor" => args.cursor = true,
             "--hold" => {
                 let v = it.next().ok_or("--hold needs a value")?;
                 args.hold_secs = v.parse().map_err(|_| format!("bad --hold value: {v}"))?;
@@ -116,7 +121,9 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!("vgd-probe: {e}");
-            eprintln!("usage: vgd-probe [status] [WxH@HZ ...] [--hold SECS]");
+            eprintln!(
+                "usage: vgd-probe [status] [WxH@HZ ...] [--hold SECS] [--ephemeral] [--consume] [--cursor]"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -251,6 +258,72 @@ fn main() -> ExitCode {
         eprintln!("  (ring section not mappable — transport inactive, control plane only)");
     }
 
+    // Cursor plane: the driver creates the section at plug, alongside the
+    // ring; same short grace applies.
+    let cursor_view = if args.cursor {
+        let mut view = None;
+        for _ in 0..15 {
+            match CursorView::open(session_id) {
+                Ok(v) => {
+                    view = Some(v);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
+        }
+        if view.is_none() {
+            eprintln!("  (cursor section not mappable — no hardware cursor plane)");
+        }
+        view
+    } else {
+        None
+    };
+    let mut cursor_last: Option<luminal_vgd_host::device::CursorState> = None;
+    let mut cursor_shape_buf = vec![0u8; 256 * 256 * 4];
+    let mut cursor_moves = 0u64;
+    let mut cursor_shapes = 0u64;
+    // Move the pointer over the virtual display to exercise this: the OS
+    // only routes cursor updates to the monitor the pointer is on.
+    let watch_cursor = |last: &mut Option<luminal_vgd_host::device::CursorState>,
+                            moves: &mut u64,
+                            shapes: &mut u64,
+                            buf: &mut Vec<u8>| {
+        let Some(view) = &cursor_view else { return };
+        let state = view.state();
+        let prev = last.replace(state);
+        if prev == Some(state) {
+            return;
+        }
+        if prev.is_none_or(|p| p.shape_generation != state.shape_generation) {
+            match view.shape(buf) {
+                Some(s) => {
+                    *shapes += 1;
+                    println!(
+                        "  cursor shape: {}x{} kind {} hotspot ({},{}) gen {}",
+                        s.width, s.height, s.kind, s.hotspot_x, s.hotspot_y, s.generation
+                    );
+                }
+                None => println!(
+                    "  cursor shape gen {} not yet readable (mid-rewrite)",
+                    state.shape_generation
+                ),
+            }
+        }
+        if prev.is_none_or(|p| (p.x, p.y, p.visible) != (state.x, state.y, state.visible)) {
+            *moves += 1;
+            // Positions stream at pointer speed; print a sample, not all.
+            if *moves <= 5 || *moves % 100 == 0 {
+                println!(
+                    "  cursor: ({}, {}) {} [{} updates]",
+                    state.x,
+                    state.y,
+                    if state.visible { "visible" } else { "hidden" },
+                    moves
+                );
+            }
+        }
+    };
+
     let mut first_seq = None;
     let mut prev_seq = 0u64;
     let mut prev_heartbeat = 0u64;
@@ -299,7 +372,25 @@ fn main() -> ExitCode {
                         last_progress = std::time::Instant::now();
                     }
                 }
+                watch_cursor(
+                    &mut cursor_last,
+                    &mut cursor_moves,
+                    &mut cursor_shapes,
+                    &mut cursor_shape_buf,
+                );
                 std::thread::sleep(Duration::from_millis(5));
+            }
+        } else if args.cursor {
+            // Poll the cursor plane through the tick (position updates
+            // stream at pointer speed).
+            for _ in 0..20 {
+                watch_cursor(
+                    &mut cursor_last,
+                    &mut cursor_moves,
+                    &mut cursor_shapes,
+                    &mut cursor_shape_buf,
+                );
+                std::thread::sleep(Duration::from_millis(50));
             }
         } else {
             std::thread::sleep(Duration::from_secs(1));
@@ -362,6 +453,17 @@ fn main() -> ExitCode {
             } else {
                 println!("  soak FAILED: {stalls_detected} ring stall(s) detected ✘ (autopsies above)");
             }
+        }
+    }
+    if args.cursor {
+        if cursor_moves > 0 || cursor_shapes > 0 {
+            println!(
+                "  cursor milestone: {cursor_moves} position update(s), {cursor_shapes} shape(s) via the shared section ✔"
+            );
+        } else {
+            println!(
+                "  cursor: no updates observed (move the pointer onto the virtual display during the hold)"
+            );
         }
     }
 

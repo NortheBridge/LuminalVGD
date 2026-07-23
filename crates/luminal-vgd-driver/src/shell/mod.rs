@@ -12,6 +12,7 @@
 
 pub mod bindings;
 mod control;
+mod cursor;
 mod dxgi;
 mod entry;
 mod monitors;
@@ -30,17 +31,21 @@ use crate::dispatch::{DeviceState, HandleCtx};
 use luminal_vgd_core::modes::Mode;
 
 /// Capabilities the shell actually delivers. HDR10/SDR10 landed with the
-/// HDR tranche (FP16-capable adapter, per-mode wire bit depth, format-
-/// aware ring textures); hardware cursor and gamma caps are added when
-/// their DDIs land (docs/FEATURE-MATRIX.md).
+/// HDR tranche; HW_CURSOR = the cursor plane is republished into the
+/// shared cursor section (the OS stops composing it into frames);
+/// GAMMA_RAMP = the SetGammaRamp DDI is registered and acknowledged
+/// (pixels stay pass-through — capture on physical displays is pre-LUT
+/// too, so the stream parity is identical).
 pub(crate) const SHELL_CAPS: u32 = luminal_driver_proto::caps::MULTI_MODE
     | luminal_driver_proto::caps::PERMANENT_POOL
     | luminal_driver_proto::caps::HDR10
-    | luminal_driver_proto::caps::SDR10_BIT;
+    | luminal_driver_proto::caps::SDR10_BIT
+    | luminal_driver_proto::caps::HW_CURSOR
+    | luminal_driver_proto::caps::GAMMA_RAMP;
 
 /// Monotonic build stamp reported in HANDSHAKE/GET_STATUS (CI will stamp
 /// this properly in phase 7; hand-bumped during bring-up).
-pub(crate) const DRIVER_BUILD: u32 = 3;
+pub(crate) const DRIVER_BUILD: u32 = 6;
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
 /// terminator survives.
@@ -75,6 +80,13 @@ pub(crate) struct MonitorRt {
     /// in the worker, so sequences and the generation persist across
     /// swap-chain reassignments; the active worker drives it exclusively.
     pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
+    /// Hardware-cursor worker + section (None when setup failed — the OS
+    /// then composes the cursor into frames, the pre-cursor behavior).
+    pub cursor: Option<cursor::CursorRt>,
+    /// Cursor section awaiting a successful SetupHardwareCursor (retried
+    /// at swapchain assign — the plug-time call predates the first mode
+    /// commit and the OS can reject it).
+    pub cursor_pending: Option<cursor::CursorPending>,
 }
 
 pub(crate) struct Shell {

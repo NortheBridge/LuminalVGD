@@ -120,3 +120,59 @@ pub unsafe fn swapchain_finished_processing_frame(swapchain: IDDCX_SWAPCHAIN) ->
         swapchain
     )
 }
+
+pub unsafe fn monitor_setup_hardware_cursor(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_SETUP_HWCURSOR,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorSetupHardwareCursorTableIndex as PFN_IDDCXMONITORSETUPHARDWARECURSOR,
+        monitor,
+        in_args
+    )
+}
+
+pub unsafe fn monitor_query_hardware_cursor(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_QUERY_HWCURSOR,
+    out_args: *mut IDARG_OUT_QUERY_HWCURSOR,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorQueryHardwareCursorTableIndex as PFN_IDDCXMONITORQUERYHARDWARECURSOR,
+        monitor,
+        in_args,
+        out_args
+    )
+}
+
+/// v1.4 replacement adding PositionValid/PositionId. The FP16 (HDR)
+/// adapter contract can reject older query variants with
+/// STATUS_NOT_SUPPORTED — the cursor worker discovers the accepted
+/// variant at runtime (3 → 2 → 1).
+pub unsafe fn monitor_query_hardware_cursor2(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_QUERY_HWCURSOR,
+    out_args: *mut IDARG_OUT_QUERY_HWCURSOR2,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorQueryHardwareCursor2TableIndex as PFN_IDDCXMONITORQUERYHARDWARECURSOR2,
+        monitor,
+        in_args,
+        out_args
+    )
+}
+
+/// v1.10 variant additionally carrying the cursor SdrWhiteLevel for HDR
+/// compositing.
+pub unsafe fn monitor_query_hardware_cursor3(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_QUERY_HWCURSOR,
+    out_args: *mut IDARG_OUT_QUERY_HWCURSOR3,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorQueryHardwareCursor3TableIndex as PFN_IDDCXMONITORQUERYHARDWARECURSOR3,
+        monitor,
+        in_args,
+        out_args
+    )
+}

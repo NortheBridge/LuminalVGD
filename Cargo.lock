@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alttab-stress"
+version = "0.1.0"
+dependencies = [
+ "luminal-driver-proto",
+ "luminal-vgd-host",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -415,6 +424,7 @@ name = "luminal-vgd-host"
 version = "0.1.0"
 dependencies = [
  "luminal-driver-proto",
+ "luminal-vgd-core",
  "windows-sys 0.60.2",
 ]
 
