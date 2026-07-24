@@ -11,8 +11,11 @@ capture API in the hot path.
 
 - Windows 11 x64 (build 22000+). **24H2 (build 26100+) is required for
   full HDR support**; SDR works on any Windows 11.
-- LuminalShine 26.08.0-beta.1 or newer to actually stream (the driver
-  alone just provides virtual displays).
+- LuminalShine 26.08.0-beta.2 or newer to actually stream (the driver
+  alone just provides virtual displays). Older LuminalShine builds
+  (including 26.08.0-beta.1) cannot complete the control-device
+  handshake with this driver — its host must grant impersonation at
+  open, which shipped in beta.2.
 
 ## Install
 
