@@ -60,7 +60,7 @@ pub(crate) const DRIVER_BUILD: u32 = match option_env!("LUMINAL_VGD_BUILD") {
         }
         n
     }
-    None => 8,
+    None => 11,
 };
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the

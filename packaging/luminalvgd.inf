@@ -61,6 +61,14 @@ UmdfServiceOrder=LuminalVGD
 ; IndirectKmd (kernel) is a client of this UMDF driver; without this the
 ; reflector refuses the connection and device start fails (0xC0000182).
 UmdfKernelModeClientPolicy = AllowKernelModeClients
+; The §6 control-surface ACL evaluates the caller's token under
+; WdfRequestImpersonate (shell/control.rs). Without this directive UMDF
+; disallows impersonation entirely and every WdfRequestImpersonate fails
+; STATUS_ACCESS_DENIED — it MUST live in this .NT.Wdf section (build-10
+; lesson: in the umdf-service-install section it is silently ignored;
+; verify via ImpersonationLevel in the devnode's Device Parameters\WUDF
+; registry key after install).
+UmdfImpersonationLevel = Impersonation
 
 [LuminalVgd_UmdfInstall]
 UmdfLibraryVersion=2.33.0

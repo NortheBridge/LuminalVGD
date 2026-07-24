@@ -177,6 +177,13 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * Win32 error code of the most recent failing FFI call on the calling
+ * thread (0 = none recorded). Read it immediately after a NULL /
+ * [`VGD_ERR_IO`] return; success does not clear it.
+ */
+uint32_t vgd_last_error(void);
+
+/**
  * Open the LuminalVGD control device. NULL when the driver is absent —
  * the caller falls back to another backend.
  */

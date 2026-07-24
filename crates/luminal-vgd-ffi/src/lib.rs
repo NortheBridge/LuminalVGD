@@ -141,13 +141,36 @@ fn guarded<T>(default: T, f: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
 }
 
+std::thread_local! {
+    /// OS error of the most recent failing FFI call on this thread (0 =
+    /// none). The 2026-07 streaming outage was undiagnosable from host
+    /// logs because every failure collapsed to NULL/`VGD_ERR_IO`; this
+    /// carries the underlying Win32 error across the boundary.
+    static LAST_OS_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn record_os_error(e: &std::io::Error) {
+    LAST_OS_ERROR.with(|c| c.set(e.raw_os_error().unwrap_or(0) as u32));
+}
+
+/// Win32 error code of the most recent failing FFI call on the calling
+/// thread (0 = none recorded). Read it immediately after a NULL /
+/// [`VGD_ERR_IO`] return; success does not clear it.
+#[no_mangle]
+pub extern "C" fn vgd_last_error() -> u32 {
+    LAST_OS_ERROR.with(|c| c.get())
+}
+
 /// Open the LuminalVGD control device. NULL when the driver is absent —
 /// the caller falls back to another backend.
 #[no_mangle]
 pub extern "C" fn vgd_device_open() -> *mut VgdDeviceHandle {
     guarded(null_mut(), || match VgdDevice::open_first() {
         Ok(dev) => Box::into_raw(Box::new(VgdDeviceHandle(dev))),
-        Err(_) => null_mut(),
+        Err(e) => {
+            record_os_error(&e);
+            null_mut()
+        }
     })
 }
 
@@ -175,7 +198,10 @@ pub unsafe extern "C" fn vgd_handshake(dev: *mut VgdDeviceHandle, out: *mut VgdC
             };
             0
         }
-        Err(_) => VGD_ERR_IO,
+        Err(e) => {
+            record_os_error(&e);
+            VGD_ERR_IO
+        }
     })
 }
 
@@ -224,7 +250,10 @@ pub unsafe extern "C" fn vgd_create_monitor(
                 };
                 0
             }
-            Err(_) => VGD_ERR_IO,
+            Err(e) => {
+                record_os_error(&e);
+                VGD_ERR_IO
+            }
         }
     })
 }
@@ -254,7 +283,10 @@ pub unsafe extern "C" fn vgd_ping(dev: *mut VgdDeviceHandle, session_id: u64) ->
 pub extern "C" fn vgd_ring_open(session_id: u64, ring_slots: u32) -> *mut VgdRingHandle {
     guarded(null_mut(), || match RingView::open(session_id, ring_slots) {
         Ok(view) => Box::into_raw(Box::new(VgdRingHandle(view))),
-        Err(_) => null_mut(),
+        Err(e) => {
+            record_os_error(&e);
+            null_mut()
+        }
     })
 }
 
