@@ -355,3 +355,54 @@ registry keys). The MSI bundles the signed LuminalVGD driver-package
 as a packaging input instead. LuminalShine's SudoVDA *code* excision
 (backend sources, third-party headers, web UI copy) is a tracked
 follow-up.
+
+### Control-surface ACL outage — root causes & fix (2026-07-24, build 11)
+
+Build 8's ACL broke streaming on installed deployments: EVERY control
+IOCTL (starting with HANDSHAKE) was refused for EVERY caller, so
+virtual display creation failed and sessions fell back to letterboxed
+physical capture with monitors left on. Fixed in build 11 (validated:
+SYSTEM-service handshake `proto 0.3 build 11`, monitor create, ring
+capture, live macOS + LG streams). Three independent defects stacked —
+each is a permanent rule:
+
+- **IddCxDeviceInitConfig replaces any WDF file-object config
+  registered before it.** Our `EvtDeviceFileCreate`/`EvtFileClose` were
+  dead code from day one — user-mode opens were only ever gated by the
+  kernel device-object DACL, and no handle was ever marked authorized.
+  Do not hang ANYTHING off file-create in an IddCx driver; the shell
+  now authorizes lazily at IOCTL time (first IOCTL on a handle runs the
+  token check against its own caller; fail closed).
+- **UMDF impersonation needs BOTH sides to opt in.** Client: CreateFile
+  must pass `SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION`
+  (luminal-vgd-host does). Driver: the INF needs
+  `UmdfImpersonationLevel = Impersonation` **in the [Install.NT.Wdf]
+  section** — in the umdf-service-install section it is SILENTLY
+  ignored. Verify after install: `ImpersonationLevel` (=2) must appear
+  in the devnode's `Device Parameters\WUDF` registry key, exactly like
+  `KernelModeClientPolicy`. Missing either side ⇒ every
+  `WdfRequestImpersonate` fails STATUS_ACCESS_DENIED (ETW
+  `IoctlDenied stage=1 code=0xC0000022`).
+- **Token evaluation is a ladder** (no single point of failure, every
+  rung traced): `OpenThreadToken(AsSelf=FALSE)` →
+  `OpenThreadToken(AsSelf=TRUE)` → `CheckTokenMembership`; policy is
+  TokenUser == SYSTEM or TokenGroups holds BUILTIN\Administrators with
+  `SE_GROUP_ENABLED` (filtered admin tokens correctly refused).
+  `WdfRequestImpersonate` prefers SecurityImpersonation and retries at
+  SecurityIdentification.
+
+Process lessons: a milestone validation counts ONLY against the exact
+shipped binary (the phase-7 "elevated probe works" note was wrong for
+final build 8 — the ACL had refused every IOCTL since it shipped); and
+diagnostics ARE the fix's first half — builds 9-10 existed mainly to
+add the ETW auth breadcrumbs and FFI `vgd_last_error()` that made the
+real defects visible in one trace each.
+
+Insider caveat (OS 29617, 2026-07-24): user-mode opens of the IddCx
+devnode are denied (error 5) below the driver for every non-SYSTEM
+caller — INCLUDING elevated Administrators, all four combinations of
+{ref-string, bare} × {SQOS, none}, zero driver ETW events, no devnode
+security overrides. Elevated vgd-probe / dev-host runs therefore cannot
+open the control device on this build; the SYSTEM service path is
+unaffected (it's how streaming runs). Re-test on future Insider flights
+before chasing "regressions" in our code.

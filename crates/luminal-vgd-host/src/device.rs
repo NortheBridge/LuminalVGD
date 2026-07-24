@@ -29,6 +29,13 @@ use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, H
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+
+/// `SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION` (winbase.h). UMDF only
+/// lets the driver see the caller's identity (`WdfRequestImpersonate`, the
+/// DESIGN.md §6 ACL) when the client explicitly grants it at open — without
+/// these flags every IOCTL is refused STATUS_ACCESS_DENIED by the driver's
+/// authorization gate (the 2026-07 streaming outage).
+const SECURITY_QOS_IMPERSONATION: u32 = 0x0010_0000 | 0x0002_0000;
 use windows_sys::Win32::System::Memory::{
     MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
     MEMORY_MAPPED_VIEW_ADDRESS,
@@ -99,7 +106,7 @@ impl VgdDevice {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
-                0,
+                SECURITY_QOS_IMPERSONATION,
                 std::ptr::null_mut(),
             )
         };
