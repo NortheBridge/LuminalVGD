@@ -318,3 +318,40 @@ Cursor bring-up lessons (each cost one traced signing round — the
   CursorRt::stop() detaches after 500 ms per §3.3 rule 5. Diagnostic
   signature to remember: 0x1b8 storms in WER = one of our callbacks is
   not returning.
+
+### Phase 7 — packaging & first release (2026-07-23, build 8)
+
+**Control-surface ACL (the §6 release blocker) shipped**: the control
+interface is registered with reference string `LuminalVGDControl`;
+EvtDeviceFileCreate authorizes control opens under caller impersonation
+(`WdfRequestImpersonate` at SecurityIdentification →
+`CheckTokenMembership` for SYSTEM / BUILTIN\Administrators — filtered
+admin tokens correctly fail), and EvtIddCxDeviceIoControl refuses every
+IOCTL on a handle that did not pass (default deny, including handles
+opened on the bare device object). OS graphics-stack opens carry other
+names and pass unhindered — a device-wide SDDL remains forbidden
+(phase-2 lesson). Packaging: install-driver.ps1 gained the §6 OS floor
+check (Win11; warn <24H2) and `-SeedTrustedPublisher` (TrustedPublisher
+only, never Root); uninstall-driver.ps1 reverses devnode + DriverStore
+package (+ optional cert); package-release.ps1 stages the release zip
+(gates: valid+timestamped signatures, FORCE_INTEGRITY clear) with
+SHA256SUMS; docs/INSTALL.md ships in the zip. Signed artifacts are
+release assets only — never committed.
+
+Version identity (one convention, three surfaces): release tag =
+SemVer + prerelease (`v0.1.0-alpha.1`); INF DriverVer / Device Manager
+= `<semver>.<build>` (`0.1.0.8` — INF versions are four numeric
+fields, so the prerelease suffix lives only in the tag), stamped via
+LUMINAL_VGD_VERSION + LUMINAL_VGD_BUILD; handshake `driver_build` = the
+same `<build>`, bumped every signing round. Unstamped dev builds keep
+the date-derived `100.YYMM.DDHH.MMSS` DriverVer.
+
+SudoVDA decision (user, 2026-07-23, FINAL): SudoVDA is unmaintained and
+unreliable — no LuminalShine version ships it going forward, and the
+LuminalShine installer actively REMOVES SudoVDA whenever detected (new
+install, update, or reinstall; drivers/luminalvgd/install.ps1 does the
+sweep: devices, DriverStore packages, SudoMaker certs, SudoMaker
+registry keys). The MSI bundles the signed LuminalVGD driver-package
+as a packaging input instead. LuminalShine's SudoVDA *code* excision
+(backend sources, third-party headers, web UI copy) is a tracked
+follow-up.

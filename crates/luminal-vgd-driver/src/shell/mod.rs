@@ -43,9 +43,25 @@ pub(crate) const SHELL_CAPS: u32 = luminal_driver_proto::caps::MULTI_MODE
     | luminal_driver_proto::caps::HW_CURSOR
     | luminal_driver_proto::caps::GAMMA_RAMP;
 
-/// Monotonic build stamp reported in HANDSHAKE/GET_STATUS (CI will stamp
-/// this properly in phase 7; hand-bumped during bring-up).
-pub(crate) const DRIVER_BUILD: u32 = 7;
+/// Monotonic build stamp reported in HANDSHAKE/GET_STATUS. Release
+/// builds stamp it via the LUMINAL_VGD_BUILD environment variable
+/// (scripts/package-release.ps1); the literal below is the dev fallback,
+/// hand-bumped per signing round.
+pub(crate) const DRIVER_BUILD: u32 = match option_env!("LUMINAL_VGD_BUILD") {
+    Some(v) => {
+        // const-context decimal parse (str::parse is not const).
+        let bytes = v.as_bytes();
+        let mut n: u32 = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(bytes[i] >= b'0' && bytes[i] <= b'9', "LUMINAL_VGD_BUILD must be a decimal integer");
+            n = n * 10 + (bytes[i] - b'0') as u32;
+            i += 1;
+        }
+        n
+    }
+    None => 8,
+};
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
 /// terminator survives.

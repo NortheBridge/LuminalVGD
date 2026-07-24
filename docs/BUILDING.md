@@ -144,6 +144,43 @@ Gotchas learned the hard way:
 - Driver catalogs are signed via signtool/CKA, not CodeSignTool `sign`.
 
 Signing is a manual, human-attended step, never scripted unattended.
-TrustedPublisher placement is likewise done manually by the maintainer.
-Strict control-device SDDL and full OV packaging requirements remain
-phase 7 (DESIGN.md §6).
+TrustedPublisher placement is handled by `install-driver.ps1
+-SeedTrustedPublisher` (TrustedPublisher only — never the Root store).
+The DESIGN.md §6 control-surface ACL is enforced in the driver: control
+opens (interface reference string `LuminalVGDControl`) are refused
+unless the caller is SYSTEM or an elevated Administrator, and every
+IOCTL requires an authorized handle.
+
+## Releasing
+
+Release archives carry the signed package + install/uninstall scripts;
+signed artifacts are GitHub release assets ONLY, never committed.
+
+Version identity (one convention, three surfaces):
+- **Release tag / product version**: SemVer with prerelease suffix, e.g.
+  `v0.1.0-alpha.1`.
+- **INF DriverVer / Device Manager**: `<semver>.<build>`, e.g. `0.1.0.8`
+  (INF versions must be four numeric fields — the prerelease suffix
+  lives only in the tag). Set via `LUMINAL_VGD_VERSION` (default 0.1.0)
+  + `LUMINAL_VGD_BUILD`.
+- **HANDSHAKE/GET_STATUS `driver_build`**: the same `<build>`, bumped
+  every signing round — dev or release — so any log line maps to an
+  exact binary.
+Unstamped dev builds keep the date-derived `100.YYMM.DDHH.MMSS`
+DriverVer (each rebuild outranks the last on dev boxes).
+
+```powershell
+$env:LUMINAL_VGD_BUILD = '<build>'    # stamps HANDSHAKE/GET_STATUS + DriverVer
+scripts\build-driver.cmd
+# sign luminal_vgd_driver.dll + luminalvgd.cat (see Signing above)
+scripts\package-release.ps1 -Version v0.1.0-alpha.1
+gh release create v0.1.0-alpha.1 target\release-artifacts\LuminalVGD-*.zip `
+    target\release-artifacts\SHA256SUMS --prerelease `
+    --title "LuminalVGD v0.1.0-alpha.1" --notes-file <notes.md>
+```
+
+`package-release.ps1` gates on: valid + timestamped Authenticode on DLL
+and catalog, and FORCE_INTEGRITY clear in the shipped DLL. Release
+validation per DESIGN.md §6: fresh install, upgrade-over-previous,
+identity retention across reinstall, lease expiry, and an unelevated
+`vgd-probe` run being refused (ACL check).
