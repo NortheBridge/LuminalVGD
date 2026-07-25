@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+﻿# SPDX-License-Identifier: AGPL-3.0-only
 # Uninstall LuminalVGD (DESIGN.md §6): remove the root\luminal_vgd devnode,
 # delete the driver package from the DriverStore, and optionally remove the
 # NortheBridge signing certificate from LocalMachine\TrustedPublisher.
@@ -11,8 +11,11 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# -Class Display keeps the scan to a handful of devices (the per-device
+# property round-trip is ~0.8 s; unfiltered it walked every devnode —
+# minutes per call). Phantom devnodes keep their class and still match.
 function Get-LuminalDevice {
-    Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+    Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object {
         (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds' -ErrorAction SilentlyContinue).Data -contains 'root\luminal_vgd'
     }
 }
