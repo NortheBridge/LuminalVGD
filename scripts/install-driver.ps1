@@ -48,17 +48,25 @@ if (-not $inTrusted) {
 }
 
 Write-Host "Adding driver package…"
-pnputil /add-driver $inf /install
-# 0 = added; 3010 = success, reboot pending; 259 = ERROR_NO_MORE_ITEMS
-# (package already published, nothing newly added — the force-rebind below
-# still installs the staged binary on the device).
+# Stage only — no /install: the UpdateDriverForPlugAndPlayDevices call
+# below performs the one device install/start (with /install an existing
+# devnode went through the device-install transaction twice per run).
+pnputil /add-driver $inf
+# 0 = added; 3010 = success, reboot pending; 259 = ERROR_NO_MORE_ITEMS,
+# kept defensively (observed on already-published/no-op adds, though only
+# documented for the /install path — the force-rebind below installs the
+# staged binary on the device either way).
 if ($LASTEXITCODE -notin 0, 3010, 259) { throw "pnputil /add-driver failed ($LASTEXITCODE)" }
 $rebootPending = ($LASTEXITCODE -eq 3010)
 
 # Root devnodes get SetupDi-generated instance ids (ROOT\DISPLAY\000x);
-# identify ours by hardware id.
+# identify ours by hardware id. -Class Display is what keeps this fast:
+# each Get-PnpDeviceProperty round-trip costs ~0.8 s, so an unfiltered
+# scan of every devnode (~500 on the dev box) ran ~6.5 minutes per call —
+# the "30-minute install". Phantom (not-present) devnodes keep their
+# class, so removed-but-remembered devices still match.
 function Get-LuminalDevice {
-    Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+    Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object {
         (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds' -ErrorAction SilentlyContinue).Data -contains 'root\luminal_vgd'
     }
 }

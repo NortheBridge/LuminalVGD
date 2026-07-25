@@ -406,3 +406,41 @@ security overrides. Elevated vgd-probe / dev-host runs therefore cannot
 open the control device on this build; the SYSTEM service path is
 unaffected (it's how streaming runs). Re-test on future Insider flights
 before chasing "regressions" in our code.
+
+### The ">30-minute install" — script-side scan, not the driver (2026-07-24)
+
+Reported as a suspected driver deadlock after devnode attach; an
+adversarial code hunt (11 driver-side hypotheses, all refuted) proved
+the driver innocent. setupapi.dev.log showed every device install/start
+section completing sub-second — including "Restarting device completed"
+in 85 ms — while the 389–392 s gaps BETWEEN sections matched the
+install scripts' device-discovery scan exactly: Get-LuminalDevice /
+Get-DevicesByHardwareId piped Get-PnpDevice (~500 devnodes on the dev
+box) into a PER-DEVICE Get-PnpDeviceProperty round-trip (~0.8 s each ≈
+6.5 min per scan). Each script run performs 1–2 scans (install checks
+for the devnode then re-verifies; uninstall scans once), so an MSI
+update (uninstall + install ≈ 3 scans) plus an attended reinstall
+accumulates 2–5 scans at ~6.5 min each — the >30-minute report.
+Fix: `-Class Display` pre-narrow (~500 devices → 3, scan → seconds) in
+both repo scripts and LuminalShine's drivers/luminalvgd/install.ps1;
+also dropped the redundant `/install` from `pnputil /add-driver` (the
+UpdateDriverForPlugAndPlayDevices force-bind is the one device
+install). Rules:
+
+- Never pipe Get-PnpDevice into a per-device Get-PnpDeviceProperty
+  filter without narrowing the device set first. The bulk form
+  (`-InstanceId <array>`) silently returns zero rows — it is not an
+  alternative.
+- Win32_PnPEntity CIM enumeration omits phantom (not-present) devnodes
+  (97 on the dev box) — uninstall/sweep paths must stay on
+  Get-PnpDevice. Phantoms keep their Class, so class filtering is safe;
+  hardware-id matching stays mandatory (ROOT\DISPLAY\0000 here is a
+  third-party Root\MetaVirtualScreenDriver).
+- Perceived install hangs: read setupapi.dev.log section timestamps
+  FIRST — sub-second sections separated by long gaps = tooling between
+  the PnP calls, not the driver.
+- Latent shell-rule violations found (and refuted as causes of THIS
+  symptom) are tracked for the next signing round: unbounded
+  Worker::stop join, join-under-monitors-lock in evt_assign,
+  apply_effects IddCx calls from callback frames, uncapped cursor setup
+  retry, no device-stop teardown, process-global ADAPTER_STARTED.
