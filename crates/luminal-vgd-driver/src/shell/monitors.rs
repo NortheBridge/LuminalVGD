@@ -338,12 +338,34 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
     let out = &mut *out_args;
     let desc = &inp.MonitorDescription;
     if desc.pData.is_null() || desc.DataSize < 128 {
+        tracelogging::write_event!(
+            PROVIDER,
+            "ParseDescription2Bad",
+            level(Warning),
+            u32("size", &desc.DataSize)
+        );
         return STATUS_INVALID_PARAMETER;
     }
     let data = core::slice::from_raw_parts(desc.pData.cast::<u8>(), desc.DataSize as usize);
     let Some(modes) = session_modes_for_edid(data) else {
+        // The OS is asking about an EDID no live session owns — activation
+        // cannot proceed for that monitor. Cold-boot instrumentation
+        // (2026-07-25): the build-12 activation failure needed exactly
+        // this visibility.
+        tracelogging::write_event!(
+            PROVIDER,
+            "ParseDescription2NoSession",
+            level(Warning)
+        );
         return STATUS_INVALID_PARAMETER;
     };
+    tracelogging::write_event!(
+        PROVIDER,
+        "ParseDescription2",
+        level(Informational),
+        u32("modes", &(modes.len() as u32)),
+        u32("buffer", &inp.MonitorModeBufferInputCount)
+    );
 
     out.MonitorModeBufferOutputCount = modes.len() as u32;
     out.PreferredMonitorModeIdx = 0;
@@ -370,8 +392,21 @@ pub unsafe extern "C" fn evt_query_target_modes2(
     let inp = &*in_args;
     let out = &mut *out_args;
     let Some(modes) = modes_for_monitor_object(monitor) else {
+        tracelogging::write_event!(
+            PROVIDER,
+            "QueryTargetModes2NoSession",
+            level(Warning),
+            u64("monitor_ptr", &(monitor as u64))
+        );
         return STATUS_INVALID_PARAMETER;
     };
+    tracelogging::write_event!(
+        PROVIDER,
+        "QueryTargetModes2",
+        level(Informational),
+        u32("modes", &(modes.len() as u32)),
+        u32("buffer", &inp.TargetModeBufferInputCount)
+    );
 
     out.TargetModeBufferOutputCount = modes.len() as u32;
     if inp.TargetModeBufferInputCount == 0 || inp.pTargetModes.is_null() {
@@ -394,8 +429,19 @@ pub unsafe extern "C" fn evt_query_target_modes2(
 
 pub unsafe extern "C" fn evt_commit_modes2(
     _adapter: ffi::IDDCX_ADAPTER,
-    _in_args: *const ffi::IDARG_IN_COMMITMODES2,
+    in_args: *const ffi::IDARG_IN_COMMITMODES2,
 ) -> NTSTATUS {
+    // Path-commit visibility (cold-boot instrumentation, 2026-07-25): a
+    // monitor that never activates never gets a commit — this event's
+    // absence after MonitorArrival localizes an activation failure to
+    // the OS side of the mode negotiation in one trace.
+    let count = (*in_args).PathCount;
+    tracelogging::write_event!(
+        PROVIDER,
+        "CommitModes2",
+        level(Informational),
+        u32("paths", &count)
+    );
     STATUS_SUCCESS
 }
 
