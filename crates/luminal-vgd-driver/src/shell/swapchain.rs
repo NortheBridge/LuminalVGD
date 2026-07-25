@@ -120,13 +120,31 @@ pub(crate) struct Worker {
     join: Option<JoinHandle<()>>,
 }
 
+/// How long stop() waits for the worker before detaching it — the same
+/// §3.3 teardown budget as the cursor worker (cursor.rs). The frame
+/// loop's waits are all ≤100 ms bounded, so a healthy worker exits well
+/// inside the deadline; a worker wedged inside an OS call must never
+/// extend unassign/teardown unboundedly.
+const STOP_DEADLINE: Duration = Duration::from_millis(500);
+
 impl Worker {
-    /// Bounded stop: the thread re-checks the flag at least every 100 ms.
+    /// Deadline-bounded stop: the thread re-checks the flag at least
+    /// every 100 ms. On deadline (an OS call wedged) the thread is
+    /// detached — it exits on its own if it ever unblocks (the stop flag
+    /// stays set, and the ring Arc keeps its state alive).
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        let Some(join) = self.join.take() else { return };
+        let deadline = Instant::now() + STOP_DEADLINE;
+        while !join.is_finished() {
+            if Instant::now() >= deadline {
+                tracelogging::write_event!(PROVIDER, "FrameWorkerStopTimeout", level(Warning));
+                drop(join); // detach
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        let _ = join.join();
     }
 }
 
@@ -141,39 +159,78 @@ pub unsafe extern "C" fn evt_assign(
         | inp.RenderAdapterLuid.LowPart as u64;
 
     let shell = Shell::get();
-    let mut monitors = shell.monitors.lock().unwrap();
-    let monitor_count = monitors.len() as u32;
-    let Some((&session_id, rt)) = monitors
-        .iter_mut()
-        .find(|(_, rt)| rt.monitor == OsHandle(monitor.cast()))
-    else {
+    let stop = Arc::new(AtomicBool::new(false));
+    // Take what the spawn needs under the lock — and install the new
+    // worker's PLACEHOLDER (stop flag, no join yet) in the same atomic
+    // step that removes the old worker: an unassign/unplug landing while
+    // the old worker's (possibly 500 ms) stop runs below takes the
+    // placeholder and sets its flag, which the about-to-spawn thread
+    // honors at its first re-check — no window where teardown finds
+    // nothing to stop. The old worker itself stops OUTSIDE the lock:
+    // stop() can wait its full deadline, and no such wait may run under
+    // a lock other IddCx callbacks also take (§3.3).
+    let (session_id, ring, old) = {
+        let mut monitors = shell.monitors.lock().unwrap();
+        let monitor_count = monitors.len() as u32;
+        let Some((&session_id, rt)) = monitors
+            .iter_mut()
+            .find(|(_, rt)| rt.monitor == OsHandle(monitor.cast()))
+        else {
+            tracelogging::write_event!(
+                PROVIDER,
+                "AssignSwapChainUnknownMonitor",
+                level(Error),
+                u64("monitor_ptr", &(monitor as u64)),
+                u32("known_monitors", &monitor_count)
+            );
+            return STATUS_SUCCESS;
+        };
         tracelogging::write_event!(
             PROVIDER,
-            "AssignSwapChainUnknownMonitor",
-            level(Error),
-            u64("monitor_ptr", &(monitor as u64)),
-            u32("known_monitors", &monitor_count)
+            "AssignSwapChain",
+            level(Informational),
+            u64("session", &session_id),
+            u64("luid", &luid)
         );
-        return STATUS_SUCCESS;
+        let old = rt.worker.replace(Worker { stop: stop.clone(), join: None });
+        (session_id, rt.ring.clone(), old)
     };
-    tracelogging::write_event!(
-        PROVIDER,
-        "AssignSwapChain",
-        level(Informational),
-        u64("session", &session_id),
-        u64("luid", &luid)
-    );
-    if let Some(old) = rt.worker.take() {
+    if let Some(old) = old {
         old.stop();
     }
 
-    let ring = rt.ring.clone();
-    let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let join = std::thread::spawn(move || {
         frame_loop(session_id, swapchain, frame_event, luid, ring, stop_thread)
     });
-    rt.worker = Some(Worker { stop, join: Some(join) });
+    // Adopt the join handle into the placeholder — matched by session_id,
+    // monitor identity, AND the same stop flag (a re-plug reusing the
+    // session id or monitor pointer must not adopt a stranger's thread).
+    let mut join = Some(join);
+    {
+        let mut monitors = shell.monitors.lock().unwrap();
+        if let Some(rt) = monitors.get_mut(&session_id) {
+            if rt.monitor == OsHandle(monitor.cast()) {
+                if let Some(worker) = rt.worker.as_mut() {
+                    if Arc::ptr_eq(&worker.stop, &stop) {
+                        worker.join = join.take();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(join) = join {
+        // Teardown (or a replacement assign) consumed the placeholder in
+        // the window: this thread must not run against the swapchain —
+        // stop it (bounded).
+        tracelogging::write_event!(
+            PROVIDER,
+            "AssignRacedUnplug",
+            level(Warning),
+            u64("session", &session_id)
+        );
+        Worker { stop, join: Some(join) }.stop();
+    }
     // NOTE: nothing here may call back into IddCx. This callback is a
     // win32k callout; an IddCx call from inside it can deadlock against
     // the locks win32k holds while calling us (callout-watchdog 0x1b8
@@ -251,7 +308,16 @@ fn frame_loop(
         level(Informational),
         u64("session", &session_id)
     );
-    let mut ring = ring.lock().unwrap();
+    // Poison recovery matches mark_ring_dead: a prior worker's panic must
+    // not cascade a second panic into WUDFHost on the next assign.
+    let mut ring = ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-check after the (possibly long) lock wait: a worker stopped while
+    // queued behind a wedged predecessor may have been deadline-detached —
+    // its swapchain is then already torn down and must not be touched
+    // (mirrors the cursor worker's post-wait re-check).
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
     let ring = &mut *ring;
 
     // A reassignment means a new device: retire the old textures and bump
@@ -275,6 +341,12 @@ fn frame_loop(
             return;
         }
     };
+    // The OS routinely unassigns ~10 ms after assign; if that (or a
+    // detach) already stopped us during device creation, the swapchain
+    // may be gone — never SetDevice a stale handle.
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
 
     unsafe {
         let mut set_dev: ffi::IDARG_IN_SWAPCHAINSETDEVICE = zeroed();
@@ -320,6 +392,13 @@ fn frame_loop(
         let status = unsafe {
             bindings::swapchain_release_and_acquire_buffer2(swapchain.0.cast(), &mut in_args, &mut out)
         };
+        // Stopping: unassign/teardown may already have returned (deadline
+        // detach) — no further swapchain or surface access. Skipping the
+        // final FinishedProcessingFrame is safe; the OS reclaims abandoned
+        // swap-chain buffers at teardown.
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         if status == STATUS_PENDING || status == E_PENDING {
             unsafe {
                 let _ = WaitForSingleObject(HANDLE(frame_event.0), 100);
@@ -354,7 +433,13 @@ fn frame_loop(
             unsafe { bindings::swapchain_finished_processing_frame(swapchain.0.cast()) };
             continue;
         }
-        let publish_result = publish_frame(session_id, ring, &d3d.0, &d3d.1, meta);
+        let publish_result = publish_frame(session_id, ring, &d3d.0, &d3d.1, meta, &stop);
+        // publish_frame contains TDR-scale D3D wedge points (texture
+        // creation, CopyResource); if the stop deadline detached us while
+        // inside one, the swapchain is already torn down.
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         unsafe { bindings::swapchain_finished_processing_frame(swapchain.0.cast()) };
         if let Some(s) = &ring.section {
             s.heartbeat();
@@ -389,6 +474,7 @@ fn publish_frame(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     meta: &ffi::IDDCX_METADATA2,
+    stop: &AtomicBool,
 ) -> windows::core::Result<()> {
     if ring.section.is_none() {
         return Ok(()); // transport disabled; drain-only
@@ -508,6 +594,21 @@ fn publish_frame(
             }
             return Err(windows::core::Error::from_hresult(hr));
         }
+    }
+
+    // Stopping (possibly deadline-detached mid-wedge in texture creation
+    // or the keyed-mutex wait): frame_tex belongs to the swapchain, which
+    // teardown may already have destroyed — abort the slot without
+    // touching the surface. Releasing back at the SAME key leaves the
+    // slot's key state machine unchanged; our own textures and the shared
+    // section are process-owned and safe.
+    if stop.load(Ordering::SeqCst) {
+        let _ = unsafe { slot.mutex.ReleaseSync(key) };
+        ring.policy.writer_abort(writer.index);
+        if let Some(s) = &ring.section {
+            s.reset_slot_free(writer.index);
+        }
+        return Ok(());
     }
 
     // Shared state is already WRITING via the take-CAS above.

@@ -24,8 +24,8 @@ mod swapchain;
 tracelogging::define_provider!(PROVIDER, "NortheBridge.LuminalVGD");
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{mpsc, Mutex, OnceLock, TryLockError};
+use std::time::{Duration, Instant};
 
 use crate::dispatch::{DeviceState, HandleCtx};
 use luminal_vgd_core::modes::Mode;
@@ -103,6 +103,47 @@ pub(crate) struct MonitorRt {
     pub cursor: Option<cursor::CursorRt>,
 }
 
+impl MonitorRt {
+    /// Mark the transport ring DEAD (host unmaps) WITHOUT an unbounded
+    /// wait: the frame worker pins the ring mutex for its whole lifetime,
+    /// so after a deadline-detached (wedged) worker a plain lock() here
+    /// would block forever — in unplug that wedges the effects worker
+    /// (every later effect silently stalls), in final device exit a power
+    /// callback. On deadline the mark is skipped (traced): the host's
+    /// stale-heartbeat detection already treats a frozen ring as dead.
+    pub(crate) fn mark_ring_dead(&self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match self.ring.try_lock() {
+                Ok(ring) => {
+                    if let Some(section) = &ring.section {
+                        section.set_state(luminal_driver_proto::ring_state::DEAD);
+                    }
+                    return;
+                }
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    let ring = poisoned.into_inner();
+                    if let Some(section) = &ring.section {
+                        section.set_state(luminal_driver_proto::ring_state::DEAD);
+                    }
+                    return;
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        tracelogging::write_event!(
+                            PROVIDER,
+                            "RingDeadMarkTimeout",
+                            level(Warning)
+                        );
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct Shell {
     /// All driver decisions. Never held across an IddCx/WDF call that can
     /// re-enter the driver.
@@ -111,12 +152,28 @@ pub(crate) struct Shell {
     pub handles: Mutex<HashMap<usize, HandleCtx>>,
     /// session_id → live monitor runtime state.
     pub monitors: Mutex<HashMap<u64, MonitorRt>>,
-    /// Set once EvtIddCxAdapterInitFinished succeeds; session IOCTLs are
-    /// gated on this (control-plane requests can arrive first).
-    pub adapter: OnceLock<OsHandle>,
-    /// The WDF device, for registry persistence.
-    pub wdf_device: OnceLock<OsHandle>,
+    /// Set once the deferred adapter bring-up completes (effects worker,
+    /// after EvtIddCxAdapterInitFinished); session IOCTLs are gated on
+    /// this (control-plane requests can arrive first). Cleared at final
+    /// device exit so a replacement device re-arms bring-up. The epoch
+    /// increments on every clear: a queued AdapterReady task captured
+    /// under an older epoch must NOT republish a destroyed adapter, so
+    /// publication is epoch-checked (set_adapter_if_epoch).
+    adapter: Mutex<AdapterSlot>,
+    /// The WDF device, for registry persistence. Overwritten on every
+    /// device add — a re-added device supersedes its predecessor.
+    wdf_device: Mutex<Option<OsHandle>>,
+    /// Producer side of the effects worker (control::start_effects_thread)
+    /// that owns every IddCx/D3D side effect. None only if the worker
+    /// thread could not be spawned; queue_effects then applies inline.
+    pub(crate) effects_tx: Mutex<Option<mpsc::Sender<control::EffectsTask>>>,
     start: Instant,
+}
+
+#[derive(Default)]
+struct AdapterSlot {
+    handle: Option<OsHandle>,
+    epoch: u64,
 }
 
 static SHELL: OnceLock<Shell> = OnceLock::new();
@@ -127,8 +184,9 @@ impl Shell {
             dev: Mutex::new(dev),
             handles: Mutex::new(HashMap::new()),
             monitors: Mutex::new(HashMap::new()),
-            adapter: OnceLock::new(),
-            wdf_device: OnceLock::new(),
+            adapter: Mutex::new(AdapterSlot::default()),
+            wdf_device: Mutex::new(None),
+            effects_tx: Mutex::new(control::start_effects_thread()),
             start: Instant::now(),
         })
     }
@@ -146,7 +204,45 @@ impl Shell {
         self.start.elapsed().as_millis() as u64
     }
 
+    pub fn adapter(&self) -> Option<OsHandle> {
+        self.adapter.lock().unwrap().handle
+    }
+
+    pub fn adapter_epoch(&self) -> u64 {
+        self.adapter.lock().unwrap().epoch
+    }
+
+    /// Publish the adapter only if no clear_adapter intervened since
+    /// `epoch` was captured — a stale (pre-teardown) AdapterReady task
+    /// must never republish a destroyed adapter. Returns false when stale.
+    pub fn set_adapter_if_epoch(&self, adapter: OsHandle, epoch: u64) -> bool {
+        let mut slot = self.adapter.lock().unwrap();
+        if slot.epoch != epoch {
+            return false;
+        }
+        slot.handle = Some(adapter);
+        true
+    }
+
+    pub fn clear_adapter(&self) {
+        let mut slot = self.adapter.lock().unwrap();
+        slot.handle = None;
+        slot.epoch += 1;
+    }
+
+    pub fn wdf_device(&self) -> Option<OsHandle> {
+        *self.wdf_device.lock().unwrap()
+    }
+
+    pub fn set_wdf_device(&self, device: OsHandle) {
+        *self.wdf_device.lock().unwrap() = Some(device);
+    }
+
+    pub fn clear_wdf_device(&self) {
+        *self.wdf_device.lock().unwrap() = None;
+    }
+
     pub fn ready(&self) -> bool {
-        self.adapter.get().is_some()
+        self.adapter().is_some()
     }
 }

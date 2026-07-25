@@ -319,7 +319,11 @@ fn cursor_loop(
     // Phase 1: claim the plane. SetupHardwareCursor is rejected with
     // INVALID_PARAMETER until a path is committed on the monitor (mode
     // commit happens seconds after plug), so retry at 1 Hz on this
-    // thread's own clock — never from plug or an IddCx callback.
+    // thread's own clock — never from plug or an IddCx callback — and
+    // give up after SETUP_GIVE_UP_ROUNDS (§3.3: no unbounded retry). On
+    // give-up the plane is ceded for this monitor's lifetime and the OS
+    // keeps composing the cursor into frames, the pre-cursor behavior.
+    const SETUP_GIVE_UP_ROUNDS: u32 = 300; // ≈5 min at 1 Hz; paths commit in seconds
     let mut setup_round: u32 = 0;
     let mut last_setup_status: i32 = 0;
     loop {
@@ -336,6 +340,17 @@ fn cursor_loop(
             break;
         }
         setup_round += 1;
+        if setup_round >= SETUP_GIVE_UP_ROUNDS {
+            tracelogging::write_event!(
+                PROVIDER,
+                "CursorSetupGaveUp",
+                level(Warning),
+                u64("session", &session_id),
+                u32("rounds", &setup_round),
+                i32("status", &last_setup_status)
+            );
+            return;
+        }
         std::thread::sleep(Duration::from_millis(if setup_round < 3 { 250 } else { 1000 }));
     }
 

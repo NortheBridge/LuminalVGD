@@ -444,3 +444,111 @@ install). Rules:
   Worker::stop join, join-under-monitors-lock in evt_assign,
   apply_effects IddCx calls from callback frames, uncapped cursor setup
   retry, no device-stop teardown, process-global ADAPTER_STARTED.
+
+### Shell callback-hygiene hardening (2026-07-24 — UNVERIFIED, rides next signing round)
+
+Branch `fix/shell-callback-hygiene` (builds clean, NOT yet
+signed/installed/live-validated — do not treat as shipped) fixes the six
+latent violations above:
+
+- Effects worker thread (`vgd-effects`, control.rs) now owns every
+  IddCx/D3D side effect. IOCTL completion, the 1 s watchdog, and
+  EvtIddCxAdapterInitFinished only queue (FIFO across producers; traced
+  inline fallback if the thread cannot spawn). Adapter bring-up
+  (DXGI walk + permanent-pool replug) runs there too; ready() still
+  flips only after set_adapters + startup, preserving the NOT_READY gate
+  ordering.
+- Frame `Worker::stop` joins with the cursor worker's 500 ms detach
+  deadline; `evt_assign` stops the old worker OUTSIDE the monitors lock
+  and re-checks for unplug-during-assign before storing the new one.
+- Cursor SetupHardwareCursor retry gives up after ~5 min
+  (`CursorSetupGaveUp`; OS composes the cursor thereafter).
+- `EvtDeviceD0Exit(D3Final)` tears down workers/rings (rings marked
+  DEAD, no IddCxMonitorDeparture from a power callback) and re-arms
+  bring-up; `ADAPTER_STARTED` became a per-WDFDEVICE identity
+  (`STARTED_FOR`), so a same-process device re-add re-inits the adapter
+  while sleep/resume still skips (IddSampleDriver pattern preserved).
+
+Adversarial review of the branch confirmed and fixed three follow-on
+defects the detach semantics would have introduced (rules for any
+future detach-style teardown):
+
+- **A deadline-detach leaves the wedged thread's locks HELD.** The frame
+  worker pins the FrameRing mutex for its lifetime, so the DEAD-marking
+  in unplug/final-exit must never hard-lock() it: `mark_ring_dead()` is
+  a 500 ms try_lock poll that skips (traced `RingDeadMarkTimeout`) — the
+  host's stale-heartbeat detection covers an unmarked ring. An unbounded
+  lock there would have wedged the effects worker forever (silently
+  stalling every later effect) or a power callback.
+- **Queued tasks can outlive the device.** `AdapterReady` carries an
+  adapter-epoch snapshot; `clear_adapter()` (D3Final) bumps the epoch and
+  publication is `set_adapter_if_epoch` — a stale task is a traced no-op
+  (`AdapterReadyStale`) instead of republishing a destroyed adapter.
+  D3Final also clears the WDF device handle so a queued PersistState
+  cannot touch a destroyed WDFDEVICE.
+- **A detached worker must never touch its swapchain again.** frame_loop
+  re-checks the stop flag after the ring-lock wait, after D3D device
+  creation (the OS's routine ~10 ms unassign can land inside it), after
+  each acquire returns, after publish_frame returns (its texture
+  creation and CopyResource are TDR-scale wedge points), and inside
+  publish_frame before CopyResource touches the swapchain-owned surface
+  (aborting the slot with the same bookkeeping as the keyed-mutex
+  timeout arm, released back at the same key) — build 11 made
+  post-return swapchain use impossible via the unbounded join; with a
+  deadline the checks are what restore that guarantee. Also:
+  `STARTED_FOR` rolls back when IddCxAdapterInitAsync fails (failed
+  D0Entry gets no D0Exit).
+- **Teardown must reconcile portable state, not just runtime.**
+  Permanent-pool sessions are lease-disabled — the watchdog can NEVER
+  reap them — so D3Final (and the discarded-stale-bring-up path) calls
+  `DeviceState::device_teardown_reset()` (unit-tested), or the next
+  startup() hits DuplicateSession, creates zero members, and erases the
+  desired pool count: pool bricked. Identity reservations survive the
+  reset; the desired pool config stays for the next startup.
+- **Queued-task validity is captured at issue time.** The AdapterReady
+  epoch is captured at D0Entry (stored in `STARTED_FOR`), not inside
+  EvtIddCxAdapterInitFinished, and the mark also records the adapter
+  object IddCxAdapterInitAsync returned — InitFinished must match it (0
+  = store still in flight), so a late callback for a torn-down device
+  can neither reuse its own stale epoch nor borrow a replacement
+  device's mark. D3Final clears adapter + WDF device FIRST (before the
+  multi-second worker drain), so a bring-up racing teardown
+  deterministically takes its stale path. The whole epoch/mark protocol
+  assumes the single root-enumerated devnode (PnP serializes
+  remove-before-re-add); a multi-devnode design needs per-device marks.
+- **No stop-target gap during reassign.** evt_assign installs the new
+  worker's placeholder (stop flag, no join) in the same lock scope that
+  removes the old worker; the join handle is adopted afterwards only if
+  session id + monitor identity + the same stop Arc still match
+  (`AssignRacedUnplug` otherwise). A teardown landing anywhere in the
+  window always finds a stop flag to set. frame_loop also recovers a
+  poisoned ring mutex (into_inner) instead of cascading a panic, and a
+  PersistState arriving after clear_wdf_device traces
+  `PersistSkippedNoDevice` instead of vanishing silently.
+
+Known residual risks, reviewed and accepted for this round (tracked):
+single effects worker means one wedged IddCx call stalls all later
+effects (trade-off for ordering; ETW `MonitorArrival`-without-
+`AdapterReady`-successor patterns would show it); plug still checks the
+adapter once at entry (a D3Final landing mid-plug has the same exposure
+the pre-hardening code had — a monitor plugged after the D3Final drain
+leaks until process end); the effects thread parks in recv() for the
+process lifetime (as the frame/cursor workers already did); inline
+fallback (worker unspawnable) reverts to callback-frame application
+(traced, never-drop-effects trade-off); DESTROY→CREATE reconnect now
+serializes A's unplug before B's plug (bounded ≤ ~1.5 s worst case by
+the stop deadlines); a PersistState dropped at teardown means the last
+pre-removal state change is not persisted (benign — next state change
+rewrites the blob); a teardown landing in evt_assign's spawn→adoption
+gap stops a join-less placeholder instantly (zero grace for the healthy
+new thread — it exits at its next fence, ≤100 ms of calls against a
+still-valid-during-unassign swapchain); a plug that raced the final-exit
+drain is cleaned up when the next bring-up re-plugs the same session
+(displaced-entry stop in monitors::plug), bounded meanwhile by the
+cursor give-up cap.
+
+Signing-round validation checklist: streaming end-to-end, permanent-pool
+replug at boot, sleep/resume, driver update over a running service,
+cursor on the LG, reconnect storm (immediate DESTROY→CREATE), ETW shows
+EffectsWorkerSpawned / AdapterReady and no EffectsInlineFallback,
+RingDeadMarkTimeout, or AdapterReadyStale.

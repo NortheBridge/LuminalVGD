@@ -39,7 +39,7 @@ pub fn plug(
     edid: Box<[u8; 256]>,
 ) {
     let shell = Shell::get();
-    let Some(adapter) = shell.adapter.get().copied() else {
+    let Some(adapter) = shell.adapter() else {
         tracelogging::write_event!(PROVIDER, "PlugBeforeAdapterReady", level(Error));
         return;
     };
@@ -72,11 +72,13 @@ pub fn plug(
         let monitor = out_args.MonitorObject;
 
         // The ring section exists from plug time (state ACTIVE, no frames
-        // yet) so the host can map it as soon as CREATE_MONITOR replies.
+        // yet), before the monitor arrives. Plug runs on the effects
+        // worker shortly after the CREATE_MONITOR reply completes; the
+        // host's ring open already retries on its own timeout budget.
         let ring = std::sync::Arc::new(std::sync::Mutex::new(
             super::swapchain::FrameRing::new(session_id, ring_slots),
         ));
-        shell.monitors.lock().unwrap().insert(
+        let displaced = shell.monitors.lock().unwrap().insert(
             session_id,
             MonitorRt {
                 monitor: OsHandle(monitor.cast()),
@@ -87,6 +89,19 @@ pub fn plug(
                 cursor: None,
             },
         );
+        // A leaked prior entry (a plug that raced a final-exit drain):
+        // treat the stale runtime as unplugged — stop its workers
+        // (bounded) and mark its ring dead. Its monitor object died with
+        // the old adapter, so no departure call.
+        if let Some(mut prev) = displaced {
+            if let Some(worker) = prev.worker.take() {
+                worker.stop();
+            }
+            if let Some(cursor) = prev.cursor.as_mut() {
+                cursor.stop();
+            }
+            prev.mark_ring_dead();
+        }
 
         let mut arrival: ffi::IDARG_OUT_MONITORARRIVAL = zeroed();
         let status = bindings::monitor_arrival(monitor, &mut arrival);
@@ -115,8 +130,10 @@ pub fn plug(
 }
 
 /// Unplug: stop the frame + cursor workers (both bounded), mark the ring
-/// DEAD so the host unmaps, then IddCxMonitorDeparture. `rt` (and with it
-/// the cursor event handle) drops only after departure returns, so the OS
+/// DEAD so the host unmaps (bounded — a detached worker may still pin
+/// the ring mutex, and this path runs on the effects worker, which must
+/// never wedge), then IddCxMonitorDeparture. `rt` (and with it the
+/// cursor event handle) drops only after departure returns, so the OS
 /// never signals a closed event.
 pub fn unplug(session_id: u64) {
     let shell = Shell::get();
@@ -129,11 +146,7 @@ pub fn unplug(session_id: u64) {
     if let Some(cursor) = rt.cursor.as_mut() {
         cursor.stop();
     }
-    if let Ok(ring) = rt.ring.lock() {
-        if let Some(section) = &ring.section {
-            section.set_state(luminal_driver_proto::ring_state::DEAD);
-        }
-    }
+    rt.mark_ring_dead();
     unsafe {
         let status = bindings::monitor_departure(rt.monitor.0.cast());
         tracelogging::write_event!(
