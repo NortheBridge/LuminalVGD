@@ -445,6 +445,31 @@ install). Rules:
   apply_effects IddCx calls from callback frames, uncapped cursor setup
   retry, no device-stop teardown, process-global ADAPTER_STARTED.
 
+### Shell callback-hygiene hardening — FAILED COLD-BOOT VALIDATION (2026-07-25, build 12)
+
+Build 12 (this branch, signed and installed 2026-07-25) PASSED every
+warm-path check — ETW-verified full sessions: monitor create → assign
+storm → frames publishing in <600 ms, clean teardown, zero failure
+events (traces in the 2026-07-25 session scratchpad) — but FAILED after
+a cold boot: the monitor creates and the ring serves, yet the OS never
+activates the display ("device name pending enumeration",
+presence=inactive, topology apply leaves ZERO active displays). A/B on
+the same booted system: alpha.2 (build 11) streams perfectly; build 12
+did not. Confound noted honestly: the alpha.2 install itself rebound
+the device on a fully-booted system, and build 12 always worked on warm
+rebinds — so the implicated path is COLD-BOOT bring-up, where the
+driver initializes concurrently with the OS display stack. Prime
+suspect: the deferred adapter bring-up (InitFinished returns
+immediately; DXGI walk + set_adapters + ready() now happen on the
+effects worker) reordering boot-time initialization. Do NOT merge or
+release this branch until the cold-boot failure is root-caused and a
+signed build passes: warm stream, COLD BOOT + stream, sleep/resume,
+update-over-running-service. Collateral found the same day (host-side,
+tracked in luminalshine): session-start first-frame latency has ~0-4 s
+margin against the client's ~10 s no-video deadline (task #32), and the
+host heap-crashes (0xc0000374) when capture starts against a
+never-activated display with an empty device name (task #33).
+
 ### Shell callback-hygiene hardening (2026-07-24 — UNVERIFIED, rides next signing round)
 
 Branch `fix/shell-callback-hygiene` (builds clean, NOT yet
