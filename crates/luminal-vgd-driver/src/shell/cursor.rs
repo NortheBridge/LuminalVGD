@@ -252,9 +252,19 @@ pub(crate) fn spawn(session_id: u64, monitor: OsHandle) -> Option<CursorRt> {
     Some(CursorRt { stop, join: Some(join), event: OsHandle(event.0), detached: false })
 }
 
-/// One SetupHardwareCursor attempt ladder (EMULATION → FULL → NONE XOR
+/// One SetupHardwareCursor attempt ladder (FULL → EMULATION → NONE XOR
 /// caps). Returns the accepted variant, or the last status. Runs on the
 /// worker thread only.
+///
+/// FULL is first deliberately: with EMULATION the OS pre-converts every
+/// monochrome/XOR cursor (the I-beam over text inputs) to an alpha
+/// shape and — per the IddCx docs — "places a solid border around the
+/// cursor image", which streams as a black box around the cursor
+/// (build-11 field report). The host implements true masked/XOR
+/// compositing at encode time (the DDA-proven MASKED_COLOR converters
+/// and invert-blend), so FULL hands it real masked shapes instead.
+/// EMULATION stays as the fallback, preserving pre-build-13 behavior
+/// on any OS build that refuses FULL.
 fn setup_attempt(
     session_id: u64,
     monitor: OsHandle,
@@ -263,8 +273,8 @@ fn setup_attempt(
     last_status: &mut i32,
 ) -> bool {
     const VARIANTS: [ffi::IDDCX_XOR_CURSOR_SUPPORT; 3] = [
-        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_EMULATION,
         ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_FULL,
+        ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_EMULATION,
         ffi::IDDCX_XOR_CURSOR_SUPPORT_IDDCX_XOR_CURSOR_SUPPORT_NONE,
     ];
     for (variant, &xor_support) in VARIANTS.iter().enumerate() {
@@ -511,6 +521,23 @@ fn cursor_loop(
                     pitch,
                 );
                 last_shape_id = info.ShapeId;
+                // Shape-type visibility: one event per published shape
+                // (shapes change at human cadence, not per frame) makes
+                // every "what did the OS actually hand us" question —
+                // masked vs alpha, emulated-vs-full XOR — answerable
+                // from a single trace instead of a section dump.
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "CursorShape",
+                    level(Informational),
+                    u64("session", &session_id),
+                    u32("cursor_type", &info.CursorType),
+                    u32("kind", &(kind as u32)),
+                    u32("width", &width),
+                    u32("height", &height),
+                    u32("pitch", &(info.Pitch)),
+                    u32("shape_id", &info.ShapeId)
+                );
             }
         }
 

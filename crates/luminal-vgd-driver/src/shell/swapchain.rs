@@ -308,25 +308,15 @@ fn frame_loop(
         level(Informational),
         u64("session", &session_id)
     );
-    // Poison recovery matches mark_ring_dead: a prior worker's panic must
-    // not cascade a second panic into WUDFHost on the next assign.
-    let mut ring = ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Re-check after the (possibly long) lock wait: a worker stopped while
-    // queued behind a wedged predecessor may have been deadline-detached —
-    // its swapchain is then already torn down and must not be touched
-    // (mirrors the cursor worker's post-wait re-check).
-    if stop.load(Ordering::SeqCst) {
-        return;
-    }
-    let ring = &mut *ring;
-
-    // A reassignment means a new device: retire the old textures and bump
-    // the generation so the host re-opens by name.
-    if ring.assigned_before {
-        ring.retire_textures();
-    }
-    ring.assigned_before = true;
-
+    // Create the D3D device BEFORE touching the ring mutex, and hand it to
+    // the OS BEFORE any ring bookkeeping. The create can take seconds on a
+    // cold GPU stack, and holding the ring across it is what killed build
+    // 12's cold-boot activation: the OS's routine ~10 ms unassign deadline-
+    // detached this worker with the mutex still pinned, and the replacement
+    // assign's worker blocked on ring.lock() before it could ever call
+    // IddCxSwapChainSetDevice — the modeset transaction starved and rolled
+    // the path back. SetDevice needs no ring state, so nothing on the
+    // activation-critical path may wait on the ring.
     let d3d = match create_device_on_luid(luid) {
         Ok(d) => d,
         Err(e) => {
@@ -362,6 +352,30 @@ fn frame_loop(
             return;
         }
     }
+
+    // Poison recovery matches mark_ring_dead: a prior worker's panic must
+    // not cascade a second panic into WUDFHost on the next assign.
+    let mut ring = ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-check after the (possibly long) lock wait: a worker stopped while
+    // queued behind a wedged predecessor may have been deadline-detached —
+    // its swapchain is then already torn down and must not be touched
+    // (mirrors the cursor worker's post-wait re-check). A wait here is
+    // harmless to activation: the OS already has its device.
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
+    let ring = &mut *ring;
+
+    // A reassignment means a new device: retire the old textures and bump
+    // the generation so the host re-opens by name. Runs before any publish
+    // of this generation, which is all the ordering the host protocol
+    // needs — SetDevice having happened first only means acquirable frames
+    // queue in the swapchain until this loop starts consuming them.
+    if ring.assigned_before {
+        ring.retire_textures();
+    }
+    ring.assigned_before = true;
+
     if let Some(s) = &ring.section {
         s.set_state(ring_state::ACTIVE);
     }
