@@ -657,3 +657,24 @@ replug at boot, sleep/resume, driver update over a running service,
 cursor on the LG, reconnect storm (immediate DESTROY→CREATE), ETW shows
 EffectsWorkerSpawned / AdapterReady and no EffectsInlineFallback,
 RingDeadMarkTimeout, or AdapterReadyStale.
+
+## Incident 2026-07-27 (read before touching TDR/recovery code)
+
+Real GPU hang during a 4K240 HDR stream → Windows TDR recovery failed →
+machine-wide WDDM wedge (QueryDisplayConfig ERROR_NOT_SUPPORTED,
+reboot-only; same signature 2026-05-17 under SudoVDA). LuminalShine
+beta.5 misclassified 0x887A0004 (DXGI_ERROR_UNSUPPORTED) as TDR in an
+unbounded refuse-sessions loop, and its vdd-diagnostic still probes
+SudoVDA HWIDs (covered by the tracked SudoVDA code-excision follow-up
+above). Driver build 13 exonerated except: handshake advertises
+watchdog 3 s but `effective_lease_timeout` floors USE_DEFAULT leases at
+10 s (session.rs); CREATE_MONITOR has no surfaced/failed feedback
+(zombie sessions when dxgkrnl is dead); and no ETL trace was captured
+in the incident window — start a logman session on the provider GUID
+above before any repro attempt (WPP/IFR remains the tracked deviation).
+Open question: an IddCx virtual display was the exclusive active
+display in all three observed wedges (5/17, 7/26, 7/27) — IddCx-class
+involvement in failed TDR recovery is not excluded; repro
+discriminators are in the postmortem. Full analysis, fix plan (beta.5
+blockers + driver build-14 items), and the dev-machine
+evidence-collection checklist: `docs/POSTMORTEM-2026-07-27.md`.
