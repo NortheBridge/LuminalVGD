@@ -91,6 +91,16 @@ impl RingPolicy {
         }
     }
 
+    /// Writer could not complete the copy (bounded mutex acquire timed
+    /// out, device loss mid-write): revert the slot without publishing.
+    /// The frame is dropped and counted; any frame the acquire overwrote
+    /// was already counted by `writer_acquire`.
+    pub fn writer_abort(&mut self, index: usize) {
+        debug_assert_eq!(self.slots[index], Slot::Writing);
+        self.slots[index] = Slot::Free;
+        self.frames_dropped += 1;
+    }
+
     /// Writer finished copying: publish the slot. Returns the frame's
     /// sequence number (monotonic, gap-free on the writer side).
     pub fn publish(&mut self, index: usize) -> u64 {
@@ -123,6 +133,30 @@ impl RingPolicy {
     pub fn reader_release(&mut self, index: usize) {
         debug_assert_eq!(self.slots[index], Slot::Reading);
         self.slots[index] = Slot::Free;
+    }
+
+    /// Absorb the host's shared-slot-state transitions (the reader marks
+    /// slots READING while it holds them and FREE when done — the shared
+    /// `SlotMetadata.state` is the only channel the host has). Call for
+    /// each slot before writer decisions so:
+    /// - a host-held slot (`READING`) is never chosen for overwrite, and
+    /// - consumed slots (`FREE`) are reused without counting a drop.
+    ///
+    /// Driver-owned transitions (Writing) and unknown values are ignored.
+    pub fn reconcile_shared(&mut self, index: usize, shared_state: u32) {
+        use luminal_driver_proto::slot_state as ss;
+        self.slots[index] = match (self.slots[index], shared_state) {
+            // Host checked the slot out for reading.
+            (Slot::Published(_), s) if s == ss::READING => Slot::Reading,
+            // Host consumed (or abandoned) the slot and released it.
+            (Slot::Published(_), s) if s == ss::FREE => Slot::Free,
+            (Slot::Reading, s) if s == ss::FREE => Slot::Free,
+            // The writer lost a take-CAS race to a host claim and aborted
+            // (policy briefly said Free while the shared state is READING):
+            // respect the host's hold so the writer stops re-picking it.
+            (Slot::Free, s) if s == ss::READING => Slot::Reading,
+            (cur, _) => cur,
+        };
     }
 
     /// TDR/device-reset rebuild (§3.3 rule 2): all slots reset, generation
@@ -221,6 +255,91 @@ mod tests {
         }
         assert_eq!(r.writer_acquire(), None, "no slot: drop, don't block");
         assert_eq!(r.frames_dropped, 1);
+    }
+
+    #[test]
+    fn reconcile_reading_protects_slot_and_free_reclaims_it() {
+        use luminal_driver_proto::slot_state as ss;
+        let mut r = RingPolicy::new(2);
+        // Publish into both slots.
+        for _ in 0..2 {
+            let w = r.writer_acquire().unwrap();
+            r.publish(w.index);
+        }
+        // Host checks out slot of seq 2 (the newest) via shared state.
+        let newest = 1; // second publish landed in slot 1
+        r.reconcile_shared(newest, ss::READING);
+        assert_eq!(r.slot(newest), Slot::Reading);
+
+        // Writer must overwrite the OTHER slot, never the host-held one.
+        let w = r.writer_acquire().unwrap();
+        assert_ne!(w.index, newest);
+        r.publish(w.index);
+
+        // Host finishes: slot becomes Free and is reused WITHOUT counting
+        // a drop (the frame was consumed, not lost).
+        let drops_before = r.frames_dropped;
+        r.reconcile_shared(newest, ss::FREE);
+        assert_eq!(r.slot(newest), Slot::Free);
+        let w = r.writer_acquire().unwrap();
+        assert_eq!(w.index, newest);
+        assert_eq!(w.overwrote, None);
+        assert_eq!(r.frames_dropped, drops_before);
+    }
+
+    #[test]
+    fn reconcile_ignores_driver_owned_and_bogus_states() {
+        use luminal_driver_proto::slot_state as ss;
+        let mut r = RingPolicy::new(2);
+        let w = r.writer_acquire().unwrap();
+        // Mid-write: shared state says WRITING (we wrote it) — no change.
+        r.reconcile_shared(w.index, ss::WRITING);
+        assert_eq!(r.slot(w.index), Slot::Writing);
+        r.publish(w.index);
+        // Bogus shared value: ignored.
+        r.reconcile_shared(w.index, 0xDEAD);
+        assert!(matches!(r.slot(w.index), Slot::Published(_)));
+    }
+
+    #[test]
+    fn reconcile_free_reading_respects_host_hold_after_lost_take() {
+        use luminal_driver_proto::slot_state as ss;
+        // Full ring; the writer picks slot 0 (oldest) for overwrite, loses
+        // the shared take-CAS to a host claim, and aborts: policy went
+        // Published → Writing → Free while the shared state says READING.
+        let mut r = RingPolicy::new(2);
+        for _ in 0..2 {
+            let w = r.writer_acquire().unwrap();
+            r.publish(w.index);
+        }
+        let w = r.writer_acquire().unwrap();
+        assert_eq!(w.overwrote, Some(1));
+        r.writer_abort(w.index);
+
+        // Reconcile must absorb the host's hold so the writer stops
+        // re-picking the slot the host owns.
+        r.reconcile_shared(w.index, ss::READING);
+        assert_eq!(r.slot(w.index), Slot::Reading);
+        let w2 = r.writer_acquire().unwrap();
+        assert_ne!(w2.index, w.index, "host-held slot must not be re-picked");
+
+        // Host releases: slot reclaimed as Free.
+        r.reconcile_shared(w.index, ss::FREE);
+        assert_eq!(r.slot(w.index), Slot::Free);
+    }
+
+    #[test]
+    fn writer_abort_reverts_and_counts_without_a_sequence() {
+        let mut r = RingPolicy::new(2);
+        let w = r.writer_acquire().unwrap();
+        r.writer_abort(w.index);
+        assert_eq!(r.slot(w.index), Slot::Free);
+        assert_eq!(r.frames_dropped, 1);
+        assert_eq!(r.frames_published, 0);
+        // The next publish still starts the sequence at 1 — aborts never
+        // consume sequence numbers, so readers see no phantom gap.
+        let w = r.writer_acquire().unwrap();
+        assert_eq!(r.publish(w.index), 1);
     }
 
     #[test]

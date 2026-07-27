@@ -10,6 +10,9 @@ repository.workspace = true
 [dependencies]
 luminal-driver-proto = { path = "../luminal-driver-proto" }
 
+[dev-dependencies]
+luminal-vgd-core = { path = "../luminal-vgd-core" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Devices_DeviceAndDriverInstallation",

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "vgd-probe"
+version = "0.1.0"
+description = "Bring-up CLI for the LuminalVGD control device: open → handshake → create → status → destroy, with a hold window for eyeballing Display Settings."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+luminal-driver-proto = { path = "../luminal-driver-proto" }
+luminal-vgd-host = { path = "../luminal-vgd-host" }

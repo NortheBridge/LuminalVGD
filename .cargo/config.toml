@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# UMDF driver DLLs link the static CRT (matches cargo-wdk scaffolding);
+# scoped to the MSVC target so macOS/Linux test builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

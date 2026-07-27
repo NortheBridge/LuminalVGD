@@ -41,3 +41,6 @@
 //! | watchdog WDF timer (1 s)                | [`dispatch::watchdog_tick`] → unplug reaped monitors |
 
 pub mod dispatch;
+
+#[cfg(all(target_os = "windows", feature = "shell"))]
+pub mod shell;

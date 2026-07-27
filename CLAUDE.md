@@ -101,6 +101,563 @@ verified later; WGC fallback needs no new work. Port libvirtualdisplay's
 Merge policy: merge commits, not squash (a squash once orphaned the
 luminalshine submodule pointer); luminalshine merges require green CI.
 
+### Phase 2 — COMPLETE (2026-07-16, Windows box)
+
+**Milestone verified: CREATE_MONITOR shows a monitor in Display
+Settings**, identity retention reclaims the same connector across
+sessions, and the full probe cycle (handshake → create → status → lease →
+ping → destroy) passes. Build/sign/install flow: `scripts\
+build-driver.cmd` → `scripts\sign-driver.ps1` (eSigner, human-attended) →
+`scripts\install-driver.ps1` (elevated) → `cargo run -p vgd-probe
+--release`. Caps are SDR-only (`MULTI_MODE | PERMANENT_POOL`) until the
+HDR phases.
+
+Hard-won constraints (violating any reproduces a device start failure):
+- INF must set `UmdfKernelModeClientPolicy = AllowKernelModeClients`
+  (IndirectKmd is a kernel-mode client; without it start fails
+  0xC0000182).
+- IddCx ≥1.4 clients must wire the *2 DDIs (ParseMonitorDescription2,
+  AdapterQueryTargetInfo, CommitModes2, SetDefaultHdrMetaData,
+  QueryTargetModes2) even SDR-only.
+- `IDDCX_ADAPTER_CAPS.MaxDisplayPipelineRate` must be 0 (u64::MAX fails
+  IddCxAdapterInitAsync validation); endpoint friendly name non-NULL.
+- No device-object-wide Security SDDL in the INF — the OS graphics stack
+  opens IddCx interfaces on the same devobj unelevated. The §6
+  control-surface ACL must target the control path only (phase 7).
+- ServiceBinary must be `%12%\UMDF\...` — `%13%` run-from-DriverStore
+  fails to load on current Insider builds (problem 31).
+
+Diagnostics: ETW provider "NortheBridge.LuminalVGD", GUID
+{c501990d-df12-5581-60a8-f55d593d7f7c} (capture: `logman start s -p
+"{guid}" -ets -o out.etl`, `pnputil /restart-device`, `logman stop s
+-ets`, decode with tracerpt). DriverEntry/DeviceAdd/AdapterInitAsync
+breadcrumbs localize any bring-up failure. Deviations to revisit: WPP/IFR
+not wired (TraceLogging only); shell state is a process global keyed to
+the single root-enumerated devnode.
+
+### Phase 4 (transport) — COMPLETE (2026-07-18, Windows box)
+
+**Milestone verified: ring sequences advance while the desktop animates**
+(2,108 frames published in a 30 s hold at 4K120, ephemeral identity, no
+compositor stalls). The worker GPU-copies each acquired frame into named
+keyed-mutex shared textures and publishes through the shared ring
+section; `core::ring::RingPolicy` makes every slot decision. Ring state
+lives in MonitorRt (sequences/generation survive reassignment); section
+is created at plug (SDDL SYSTEM+Admins), textures lazily per frame-desc
+(size change ⇒ generation bump).
+
+Bring-up lessons (cost three compositor freezes to learn):
+- `IddCxSwapChainReleaseAndAcquireBuffer` returns COM **E_PENDING
+  (0x8000000A)**, not STATUS_PENDING, for "no frame yet" — treating it as
+  fatal abandons the swapchain mid-activation and stalls the compositor
+  until the OS kills WUDFHost.
+- On real acquire/publish failure: mark REBUILDING, retire textures,
+  **exit the worker** — never retry SetDevice on the same swapchain (the
+  OS drives recovery via unassign→assign; holding the dead swapchain
+  blocks modeset teardown).
+- The OS unassigns+reassigns the swapchain ~10 ms after activation
+  (routine); first SetDevice often fails DXGI_ERROR_ACCESS_LOST —
+  harmless when the exit path is clean.
+- Adapter caps: MaxDisplayPipelineRate=0 AND target-mode
+  RequiredBandwidth=0 (nonzero bandwidth vs zero budget makes every mode
+  unactivatable: Extend reverts, Scale/Resolution grayed).
+- Windows remembers per-identity topology ("Disconnect this display"
+  sticks across sessions); vgd-probe --ephemeral mints a fresh identity.
+
+Phase-5 notes: keyed-mutex protocol is key 0 pre-first-publish, key 1
+after; readability travels in SlotMetadata.state (mutex only guards
+pixels). Reader-side slot-state reconciliation (host CAS
+PUBLISHED→READING→FREE, driver honoring shared state) lands with the
+consumer. With no reader, drops ≈ published − slots (drop-oldest working
+as specified). ETW: FrameLoopStart/RingTexturesCreated/
+AcquireBufferFailedExit etc. under the provider GUID above.
+
+Next: phase 5 (LuminalShine `luminalvgd` backend consuming the ring),
+then WGC-RELIABILITY §7 alttab_stress port, cursor/gamma/HDR DDIs.
+
+### Phase 5 — lifecycle backend COMPLETE (2026-07-20, Windows box)
+
+**Milestone verified: Moonlight client streams off the virtual
+display** — LuminalShine (branch `feat/luminalvgd-backend`) auto-selects
+the LuminalVGD backend, creates a per-client monitor (multi-mode:
+framegen 240 Hz + base 120 Hz), the display helper applies the
+exclusive topology (physical monitors off) at 240 Hz with APPLY acked
+in ~1 s, WGC captures the virtual display at the client's native
+3456×2160, and both physical monitors restore on session end. Capture
+still goes through the WGC helper — the ring-consuming capture backend
+is tranche 3b.
+
+Integration lessons (all host-side, none required driver changes):
+- LuminalShine's display resolvers/predicates had to learn the NBF
+  vendor prefix and "Luminal Video Graphics Display" adapter name; the
+  driver-side identity scheme needed nothing.
+- Mode-list units: the FFI takes millihertz. LuminalShine normalized to
+  mHz and then rescaled ×1000 — Windows silently discards a 240 kHz
+  mode, leaving only the base rate. The driver's ParseMonitorDescription2
+  / QueryTargetModes2 paths were verified correct via vgd-probe +
+  EnumDisplaySettings (both modes register; preferred applies at 240 Hz).
+- HDR: the host now requests SDR for VGD displays; asking Windows to
+  enable HDR on a monitor without HDR10 caps fails the entire
+  SetDisplayConfig apply. Driver HDR10 (EDID metadata + IddCx caps +
+  10-bit ring formats) is the gating work for HDR streaming.
+- vgd-probe now accepts multiple `WxH@HZ` args (previously the last
+  one silently won), so multi-mode creates are testable standalone.
+
+Next: tranche 3b — ring-consuming capture backend in LuminalShine
+(`display_vgd` platf::display_t), driver HDR10 caps, cursor/gamma DDIs,
+WGC-RELIABILITY §7 alttab_stress port.
+
+### Tranche 3b + HDR10 — COMPLETE (2026-07-20, Windows box)
+
+**Milestones verified the same day:** (1) LuminalShine consumes the
+frame ring directly (`display_vgd_vram_t`: claim → keyed-mutex key 1 →
+GPU copy → release; no WGC helper, latency parity ~5 ms) and (2) **HDR10
+end to end** — driver build 2 (caps 0x185) creates HDR monitors
+(bit_depth=110 wire value), Windows engages advanced color off our
+CTA-861.3 EDID block, the ring carries FP16 scRGB, and LuminalShine
+encodes HEVC Main10 4:4:4 with HDR metadata. AV1 HDR 10-bit also works;
+AV1 4:4:4 is an NVENC hardware gap on RTX 5080 (not a software item).
+
+HDR bring-up lessons (one wasted signing round each — check first):
+- **IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 is a contract, not a flag.**
+  AdapterInitAsync fails STATUS_INVALID_PARAMETER unless the driver also
+  registers EvtIddCxMonitorSetGammaRamp (HDR 3x4 matrix; GammaSupport
+  must not be NONE) and acquires via IddCxSwapChainReleaseAndAcquire-
+  Buffer2 (METADATA2). See "Updates for IddCx 1.10" doc for the full
+  obligation list. ETW breadcrumbs localize this in one traced
+  pnputil /restart-device — no re-sign needed to diagnose.
+- **Proto bit_depth wire values are 8/10/110/112** (HDR carries a
+  leading "1"); hdr=1 with bit_depth=10 is BAD_BIT_DEPTH (-4), and the
+  host log only shows "result=-4" — check dispatch err codes first.
+- Ring textures follow the acquired frame's DXGI format; an
+  advanced-color toggle (BGRA8 ⇄ FP16) is a generation bump like a size
+  change. Host reader re-latches format automatically.
+- Host-side stall detection must key off `latest_sequence` vs the last
+  delivered sequence, never cumulative publish counters — an idle
+  desktop is indistinguishable from a stall by counters alone.
+
+Next: cursor + gamma DDIs (hardware cursor ABI is in proto v0.3),
+WGC-RELIABILITY §7 alttab_stress port, phase 7 packaging (installer,
+strict control-device SDDL — release blocker, uninstaller).
+
+### Ring protocol hardening — take-CAS (2026-07-22, build 3)
+
+Live streams stalled ~1 min in (latest_sequence frozen above the last
+delivered sequence; LuminalShine's breaker fell back to WGC). Root
+cause, found by the threaded protocol regression test in
+luminal-vgd-host in milliseconds: the writer picked overwrite victims
+from the reconcile snapshot and plain-stored WRITING, silently
+clobbering host claims that landed in between — the keyed mutex guards
+pixels, but the slot state machine had no atomic hand-off. Fix: the
+writer takes slots by CAS (`try_take_slot_writing`, PUBLISHED/FREE →
+WRITING) on the same atomic the host claims through; lost takes drop
+the frame and reconcile absorbs (Free, READING). Protocol rules the
+test enforces forever:
+
+- Every writer path into a slot must win a shared-state CAS first —
+  never trust the policy snapshot alone.
+- Claims re-read metadata after their CAS (READING protects the slot).
+- Consumers deliver only sequence > last-delivered: older published
+  leftovers legitimately become "freshest claimable" after the newest
+  slot is released, and != dedupe delivers them out of order.
+- Host-side health checks key off latest_sequence vs delivered, never
+  cumulative counters; a stale heartbeat means "worker stopped"
+  (swapchain unassigned during mode switches), not "worker dead" —
+  LuminalShine waits a 10 s grace before reinitializing.
+
+Verified: 10-minute vgd-probe --consume soak (0 stalls, autopsy
+tooling now built into the probe) + long multi-leg live sessions incl.
+Initial-Ping-Timeout reconnect storms.
+
+### Cursor + gamma DDIs, alttab_stress — COMPLETE (2026-07-23, build 6)
+
+**Milestones verified:** (1) hardware-cursor plane end to end — the
+driver claims the IddCx cursor (alpha + XOR-emulation, 256²) and
+republishes shape/position into the shared cursor section
+(`Global\LuminalVGD-cur-<sid>`, seqlock on `shape_generation`);
+LuminalShine reads it via `CursorView`/FFI and GPU-blends at encode
+time reusing the DDA cursor machinery. Live-validated on the LG OLED
+(HDR stream): tracking, hotspot alignment, normal HDR brightness, and
+smooth cursor motion over an idle desktop (the driver publishes no
+frames for cursor-only changes — `display_vgd` keeps a cursor-free
+copy of the last frame and redelivers it with a fresh blend). (2)
+`alttab-stress` (WGC-RELIABILITY §7 port): exclusive-fullscreen round
+trips on an ephemeral monitor with a concurrent ring consumer + wedge
+watchdog — passed with 0 stalls. `caps::GAMMA_RAMP` is advertised;
+SetGammaRamp stays acknowledge-and-trace (capture on physical displays
+is pre-LUT too, so stream parity is unchanged).
+
+Cursor bring-up lessons (each cost one traced signing round — the
+(phase, variant, status) ETW ladder made every round conclusive):
+- **IddCxMonitorSetupHardwareCursor fails STATUS_INVALID_PARAMETER
+  before a path is committed** (cursor caps are per-path; right after
+  MonitorArrival there is no path). Call it at swapchain assign; the
+  shell keeps a `cursor_pending` state and retries on every assign.
+- **FP16 (HDR) adapters reject QueryHardwareCursor v1 with
+  STATUS_NOT_SUPPORTED** — the contract wants the newer variants (v3
+  adds the cursor SdrWhiteLevel). The worker discovers the accepted
+  variant at runtime (3 → 2 → 1, latched, traced as CursorQueryMode;
+  this box latches v3). v2/v3 X/Y are only valid with PositionValid —
+  carry the last good pair across visibility-only updates.
+- Windows remembers per-identity topology: a stable-identity probe run
+  with zero frames + stale heartbeat is usually remembered-disconnect
+  state, not a driver bug — re-test with `--ephemeral` before chasing.
+- Moonlight/Sunshine has **no client-side cursor channel** — DESIGN.md
+  §3.2.3's "forward to the client" is not implementable; the host
+  composites server-side at encode time instead (same latency model as
+  the DDA path on physical displays).
+- **NEVER call into IddCx from inside an IddCx callback, and never
+  join a thread that makes IddCx calls without a deadline** (build 7,
+  the hard way): IddCx callbacks are win32k callouts, and build 6's
+  SetupHardwareCursor retry inside EvtIddCxMonitorAssignSwapChain plus
+  an unbounded cursor-worker join in unplug produced mid-stream stream
+  drops, persistent RTSP 500s (host TDR gate), unrestorable topology,
+  LiveKernelEvent 0x1b8 (win32k callout watchdog) storms every ~72 s,
+  and finally an unclean system shutdown. The cursor worker now owns
+  every cursor IddCx call (setup retried on its own clock), and
+  CursorRt::stop() detaches after 500 ms per §3.3 rule 5. Diagnostic
+  signature to remember: 0x1b8 storms in WER = one of our callbacks is
+  not returning.
+
+### Phase 7 — packaging & first release (2026-07-23, build 8)
+
+**Control-surface ACL (the §6 release blocker) shipped**: the control
+interface is registered with reference string `LuminalVGDControl`;
+EvtDeviceFileCreate authorizes control opens under caller impersonation
+(`WdfRequestImpersonate` at SecurityIdentification →
+`CheckTokenMembership` for SYSTEM / BUILTIN\Administrators — filtered
+admin tokens correctly fail), and EvtIddCxDeviceIoControl refuses every
+IOCTL on a handle that did not pass (default deny, including handles
+opened on the bare device object). OS graphics-stack opens carry other
+names and pass unhindered — a device-wide SDDL remains forbidden
+(phase-2 lesson). Packaging: install-driver.ps1 gained the §6 OS floor
+check (Win11; warn <24H2) and `-SeedTrustedPublisher` (TrustedPublisher
+only, never Root); uninstall-driver.ps1 reverses devnode + DriverStore
+package (+ optional cert); package-release.ps1 stages the release zip
+(gates: valid+timestamped signatures, FORCE_INTEGRITY clear) with
+SHA256SUMS; docs/INSTALL.md ships in the zip. Signed artifacts are
+release assets only — never committed.
+
+Version identity (one convention, three surfaces): release tag =
+SemVer + prerelease (`v0.1.0-alpha.1`); INF DriverVer / Device Manager
+= `<semver>.<build>` (`0.1.0.8` — INF versions are four numeric
+fields, so the prerelease suffix lives only in the tag), stamped via
+LUMINAL_VGD_VERSION + LUMINAL_VGD_BUILD; handshake `driver_build` = the
+same `<build>`, bumped every signing round. Unstamped dev builds keep
+the date-derived `100.YYMM.DDHH.MMSS` DriverVer.
+
+SudoVDA decision (user, 2026-07-23, FINAL): SudoVDA is unmaintained and
+unreliable — no LuminalShine version ships it going forward, and the
+LuminalShine installer actively REMOVES SudoVDA whenever detected (new
+install, update, or reinstall; drivers/luminalvgd/install.ps1 does the
+sweep: devices, DriverStore packages, SudoMaker certs, SudoMaker
+registry keys). The MSI bundles the signed LuminalVGD driver-package
+as a packaging input instead. LuminalShine's SudoVDA *code* excision
+(backend sources, third-party headers, web UI copy) is a tracked
+follow-up.
+
+### Control-surface ACL outage — root causes & fix (2026-07-24, build 11)
+
+Build 8's ACL broke streaming on installed deployments: EVERY control
+IOCTL (starting with HANDSHAKE) was refused for EVERY caller, so
+virtual display creation failed and sessions fell back to letterboxed
+physical capture with monitors left on. Fixed in build 11 (validated:
+SYSTEM-service handshake `proto 0.3 build 11`, monitor create, ring
+capture, live macOS + LG streams). Three independent defects stacked —
+each is a permanent rule:
+
+- **IddCxDeviceInitConfig replaces any WDF file-object config
+  registered before it.** Our `EvtDeviceFileCreate`/`EvtFileClose` were
+  dead code from day one — user-mode opens were only ever gated by the
+  kernel device-object DACL, and no handle was ever marked authorized.
+  Do not hang ANYTHING off file-create in an IddCx driver; the shell
+  now authorizes lazily at IOCTL time (first IOCTL on a handle runs the
+  token check against its own caller; fail closed).
+- **UMDF impersonation needs BOTH sides to opt in.** Client: CreateFile
+  must pass `SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION`
+  (luminal-vgd-host does). Driver: the INF needs
+  `UmdfImpersonationLevel = Impersonation` **in the [Install.NT.Wdf]
+  section** — in the umdf-service-install section it is SILENTLY
+  ignored. Verify after install: `ImpersonationLevel` (=2) must appear
+  in the devnode's `Device Parameters\WUDF` registry key, exactly like
+  `KernelModeClientPolicy`. Missing either side ⇒ every
+  `WdfRequestImpersonate` fails STATUS_ACCESS_DENIED (ETW
+  `IoctlDenied stage=1 code=0xC0000022`).
+- **Token evaluation is a ladder** (no single point of failure, every
+  rung traced): `OpenThreadToken(AsSelf=FALSE)` →
+  `OpenThreadToken(AsSelf=TRUE)` → `CheckTokenMembership`; policy is
+  TokenUser == SYSTEM or TokenGroups holds BUILTIN\Administrators with
+  `SE_GROUP_ENABLED` (filtered admin tokens correctly refused).
+  `WdfRequestImpersonate` prefers SecurityImpersonation and retries at
+  SecurityIdentification.
+
+Process lessons: a milestone validation counts ONLY against the exact
+shipped binary (the phase-7 "elevated probe works" note was wrong for
+final build 8 — the ACL had refused every IOCTL since it shipped); and
+diagnostics ARE the fix's first half — builds 9-10 existed mainly to
+add the ETW auth breadcrumbs and FFI `vgd_last_error()` that made the
+real defects visible in one trace each.
+
+Insider caveat (OS 29617, 2026-07-24): user-mode opens of the IddCx
+devnode are denied (error 5) below the driver for every non-SYSTEM
+caller — INCLUDING elevated Administrators, all four combinations of
+{ref-string, bare} × {SQOS, none}, zero driver ETW events, no devnode
+security overrides. Elevated vgd-probe / dev-host runs therefore cannot
+open the control device on this build; the SYSTEM service path is
+unaffected (it's how streaming runs). Re-test on future Insider flights
+before chasing "regressions" in our code.
+
+### The ">30-minute install" — script-side scan, not the driver (2026-07-24)
+
+Reported as a suspected driver deadlock after devnode attach; an
+adversarial code hunt (11 driver-side hypotheses, all refuted) proved
+the driver innocent. setupapi.dev.log showed every device install/start
+section completing sub-second — including "Restarting device completed"
+in 85 ms — while the 389–392 s gaps BETWEEN sections matched the
+install scripts' device-discovery scan exactly: Get-LuminalDevice /
+Get-DevicesByHardwareId piped Get-PnpDevice (~500 devnodes on the dev
+box) into a PER-DEVICE Get-PnpDeviceProperty round-trip (~0.8 s each ≈
+6.5 min per scan). Each script run performs 1–2 scans (install checks
+for the devnode then re-verifies; uninstall scans once), so an MSI
+update (uninstall + install ≈ 3 scans) plus an attended reinstall
+accumulates 2–5 scans at ~6.5 min each — the >30-minute report.
+Fix: `-Class Display` pre-narrow (~500 devices → 3, scan → seconds) in
+both repo scripts and LuminalShine's drivers/luminalvgd/install.ps1;
+also dropped the redundant `/install` from `pnputil /add-driver` (the
+UpdateDriverForPlugAndPlayDevices force-bind is the one device
+install). Rules:
+
+- Never pipe Get-PnpDevice into a per-device Get-PnpDeviceProperty
+  filter without narrowing the device set first. The bulk form
+  (`-InstanceId <array>`) silently returns zero rows — it is not an
+  alternative.
+- Win32_PnPEntity CIM enumeration omits phantom (not-present) devnodes
+  (97 on the dev box) — uninstall/sweep paths must stay on
+  Get-PnpDevice. Phantoms keep their Class, so class filtering is safe;
+  hardware-id matching stays mandatory (ROOT\DISPLAY\0000 here is a
+  third-party Root\MetaVirtualScreenDriver).
+- Perceived install hangs: read setupapi.dev.log section timestamps
+  FIRST — sub-second sections separated by long gaps = tooling between
+  the PnP calls, not the driver.
+- Latent shell-rule violations found (and refuted as causes of THIS
+  symptom) are tracked for the next signing round: unbounded
+  Worker::stop join, join-under-monitors-lock in evt_assign,
+  apply_effects IddCx calls from callback frames, uncapped cursor setup
+  retry, no device-stop teardown, process-global ADAPTER_STARTED.
+
+### Shell callback-hygiene hardening — FAILED COLD-BOOT VALIDATION (2026-07-25, build 12)
+
+Build 12 (this branch, signed and installed 2026-07-25) PASSED every
+warm-path check — ETW-verified full sessions: monitor create → assign
+storm → frames publishing in <600 ms, clean teardown, zero failure
+events (traces in the 2026-07-25 session scratchpad) — but FAILED after
+a cold boot: the monitor creates and the ring serves, yet the OS never
+activates the display ("device name pending enumeration",
+presence=inactive, topology apply leaves ZERO active displays). A/B on
+the same booted system: alpha.2 (build 11) streams perfectly; build 12
+did not. Confound noted honestly: the alpha.2 install itself rebound
+the device on a fully-booted system, and build 12 always worked on warm
+rebinds — so the implicated path is COLD-BOOT bring-up, where the
+driver initializes concurrently with the OS display stack. Prime
+suspect: the deferred adapter bring-up (InitFinished returns
+immediately; DXGI walk + set_adapters + ready() now happen on the
+effects worker) reordering boot-time initialization. [RESOLVED in
+build 13, v0.1.0-alpha.3 "Milestone 1 Update 2", 2026-07-26: root
+cause was the ring-lock convoy — confirmed by elimination when alpha.2
+passed the cold-boot test — fixed by moving the D3D device create and
+IddCxSwapChainSetDevice ahead of the ring lock in frame_loop. Build 13
+also reorders the cursor XOR ladder FULL-first (the "black box around
+the I-beam" was the OS EMULATION's documented border; EMULATION remains
+the fallback) and adds the CursorShape ETW event. Released signed at
+user direction; confirm the field checklist on the installed build
+(warm stream, COLD BOOT + stream, sleep/resume,
+update-over-running-service, I-beam-over-textbox) before LuminalShine
+beta.5 ships the pair.] Collateral found the same day (host-side,
+tracked in luminalshine): session-start first-frame latency has ~0-4 s
+margin against the client's ~10 s no-video deadline (task #32), and the
+host heap-crashes (0xc0000374) when capture starts against a
+never-activated display with an empty device name (task #33).
+
+### Build 12 cold-boot failure — root-cause analysis (2026-07-26, code-level)
+
+Two independent adversarial reviews of the full build-11→12 diff (plus
+live system evidence) narrowed the failure to two surviving hypotheses.
+Fast Startup is DISABLED on the dev box (HiberbootEnabled=0, hibernation
+off), so the failing boot was a TRUE cold boot with a fresh WUDFHost —
+every hiberboot/D3Final-resume theory is dead, and the OS-facing
+mode-negotiation/activation code is byte-identical between builds (the
+failing binary predates 64a6912's ETW; monitor create+arrival succeeding
+proves adapter bring-up completed driver-side).
+
+**H1 (leading, build-12-specific): detach + unbounded ring lock + D3D
+create under the lock = activation convoy.** At first activation the OS
+routinely does assign → ~10 ms unassign → assign. Worker 1 takes the
+ring mutex UNBOUNDED for its whole life (swapchain.rs:313) and calls
+create_device_on_luid UNDER it (swapchain.rs:330). Cold (or degraded)
+boots make that first D3D create in WUDFHost slow; past 500 ms the
+unassign's Worker::stop detaches (swapchain.rs:135-148,
+FrameWorkerStopTimeout) leaving the mutex pinned, and assign #2's worker
+blocks unboundedly at ring.lock() before it can IddCxSwapChainSetDevice
+— the OS modeset transaction never gets its device and rolls the path
+back: presence inactive, no GDI name, zero active displays. Build 11
+joined unboundedly instead — slow but ORDERED, which is why alpha.2
+streamed perfectly the same evening. Corroboration: the host measured
+5-10 s NvEnc/D3D device creation that same evening (luminalshine #32
+data) — device creation WAS pathologically slow on the failing boot.
+Every wait was individually bounded; the COMPOSITION (detach + unbounded
+lock + OS call under lock) recreated an unbounded wait on the
+activation-critical path. Rule: never hold the ring mutex (or any lock a
+teardown path needs) across create_device_on_luid or any OS call; a
+detach only ends the wait, not the lock ownership.
+
+**H2 (fallback, pre-existing): boot-time adapter finalization wedge.**
+InitFinished returning in microseconds (vs build 11 blocking through the
+DXGI walk) lets the OS finalize the indirect adapter at the earliest
+boot moment; if the display broker wedges there, it never solicits
+parse/query/commit for later monitors. Would exist in build 11's cold
+boot too (never tested — the A/B confound).
+
+**VERDICT (2026-07-26): H1 CONFIRMED by elimination — user validated
+alpha.2 streams perfectly from a cold boot.** The failure is
+build-12-specific; H2 (pre-existing boot-time adapter wedge) is refuted.
+Build 13 must carry the convoy fix below; the cold-boot validation gate
+stays (H1's trigger — slow first D3D create — is timing-dependent, so
+one passing cold boot on build 13 with the fix + ETW confirming
+FrameLoopStart after assign #2 is the acceptance bar).
+
+**Original discriminators (for the record):** (a) alpha.2 + cold boot +
+stream (free, next reboot): works → H1 confirmed-by-elimination
+(build-12-specific); fails → H2-class pre-existing bug. (b) Build-13 cold trace with 64a6912 ETW:
+H1 shows AssignSwapChain + FrameWorkerStopTimeout + FrameWorkerSpawned
+without FrameLoopStart; H2 shows MonitorArrival then ZERO
+ParseDescription2/QueryTargetModes2/CommitModes2. No trace of the
+failing evening survives on disk — do not go looking.
+
+**Build-13 fix directions (H1 — correct regardless of verdict):** move
+create_device_on_luid BEFORE the ring.lock() in frame_loop (the create
+needs no ring state), and/or make the post-spawn ring acquisition a
+bounded try-lock poll like mark_ring_dead. Either restores ordered
+SetDevice delivery; both together remove the convoy class entirely.
+Secondary hardening candidates from the reviews: retry/re-queue for the
+one-shot InitFinished skip paths (AdapterReadyStale is currently
+permanent until re-add); the one-shot boot-time DXGI adapter list
+(set_adapters never refreshes — dispatch.rs:199's comment describes
+wiring that does not exist); evt_assign returning STATUS_SUCCESS for
+unknown monitors hides drops from the OS. Standing constraint the warm
+traces proved: IddCx re-enters the driver synchronously on the effects
+thread (SetDefaultHdrMetaData inside IddCxMonitorArrival, UnassignSwapChain
+inside IddCxMonitorDeparture) — any DDI handler that blocks on the
+effects queue, or an effects task holding a lock a DDI handler takes,
+deadlocks.
+
+### Shell callback-hygiene hardening (2026-07-24 — UNVERIFIED, rides next signing round)
+
+Branch `fix/shell-callback-hygiene` (builds clean, NOT yet
+signed/installed/live-validated — do not treat as shipped) fixes the six
+latent violations above:
+
+- Effects worker thread (`vgd-effects`, control.rs) now owns every
+  IddCx/D3D side effect. IOCTL completion, the 1 s watchdog, and
+  EvtIddCxAdapterInitFinished only queue (FIFO across producers; traced
+  inline fallback if the thread cannot spawn). Adapter bring-up
+  (DXGI walk + permanent-pool replug) runs there too; ready() still
+  flips only after set_adapters + startup, preserving the NOT_READY gate
+  ordering.
+- Frame `Worker::stop` joins with the cursor worker's 500 ms detach
+  deadline; `evt_assign` stops the old worker OUTSIDE the monitors lock
+  and re-checks for unplug-during-assign before storing the new one.
+- Cursor SetupHardwareCursor retry gives up after ~5 min
+  (`CursorSetupGaveUp`; OS composes the cursor thereafter).
+- `EvtDeviceD0Exit(D3Final)` tears down workers/rings (rings marked
+  DEAD, no IddCxMonitorDeparture from a power callback) and re-arms
+  bring-up; `ADAPTER_STARTED` became a per-WDFDEVICE identity
+  (`STARTED_FOR`), so a same-process device re-add re-inits the adapter
+  while sleep/resume still skips (IddSampleDriver pattern preserved).
+
+Adversarial review of the branch confirmed and fixed three follow-on
+defects the detach semantics would have introduced (rules for any
+future detach-style teardown):
+
+- **A deadline-detach leaves the wedged thread's locks HELD.** The frame
+  worker pins the FrameRing mutex for its lifetime, so the DEAD-marking
+  in unplug/final-exit must never hard-lock() it: `mark_ring_dead()` is
+  a 500 ms try_lock poll that skips (traced `RingDeadMarkTimeout`) — the
+  host's stale-heartbeat detection covers an unmarked ring. An unbounded
+  lock there would have wedged the effects worker forever (silently
+  stalling every later effect) or a power callback.
+- **Queued tasks can outlive the device.** `AdapterReady` carries an
+  adapter-epoch snapshot; `clear_adapter()` (D3Final) bumps the epoch and
+  publication is `set_adapter_if_epoch` — a stale task is a traced no-op
+  (`AdapterReadyStale`) instead of republishing a destroyed adapter.
+  D3Final also clears the WDF device handle so a queued PersistState
+  cannot touch a destroyed WDFDEVICE.
+- **A detached worker must never touch its swapchain again.** frame_loop
+  re-checks the stop flag after the ring-lock wait, after D3D device
+  creation (the OS's routine ~10 ms unassign can land inside it), after
+  each acquire returns, after publish_frame returns (its texture
+  creation and CopyResource are TDR-scale wedge points), and inside
+  publish_frame before CopyResource touches the swapchain-owned surface
+  (aborting the slot with the same bookkeeping as the keyed-mutex
+  timeout arm, released back at the same key) — build 11 made
+  post-return swapchain use impossible via the unbounded join; with a
+  deadline the checks are what restore that guarantee. Also:
+  `STARTED_FOR` rolls back when IddCxAdapterInitAsync fails (failed
+  D0Entry gets no D0Exit).
+- **Teardown must reconcile portable state, not just runtime.**
+  Permanent-pool sessions are lease-disabled — the watchdog can NEVER
+  reap them — so D3Final (and the discarded-stale-bring-up path) calls
+  `DeviceState::device_teardown_reset()` (unit-tested), or the next
+  startup() hits DuplicateSession, creates zero members, and erases the
+  desired pool count: pool bricked. Identity reservations survive the
+  reset; the desired pool config stays for the next startup.
+- **Queued-task validity is captured at issue time.** The AdapterReady
+  epoch is captured at D0Entry (stored in `STARTED_FOR`), not inside
+  EvtIddCxAdapterInitFinished, and the mark also records the adapter
+  object IddCxAdapterInitAsync returned — InitFinished must match it (0
+  = store still in flight), so a late callback for a torn-down device
+  can neither reuse its own stale epoch nor borrow a replacement
+  device's mark. D3Final clears adapter + WDF device FIRST (before the
+  multi-second worker drain), so a bring-up racing teardown
+  deterministically takes its stale path. The whole epoch/mark protocol
+  assumes the single root-enumerated devnode (PnP serializes
+  remove-before-re-add); a multi-devnode design needs per-device marks.
+- **No stop-target gap during reassign.** evt_assign installs the new
+  worker's placeholder (stop flag, no join) in the same lock scope that
+  removes the old worker; the join handle is adopted afterwards only if
+  session id + monitor identity + the same stop Arc still match
+  (`AssignRacedUnplug` otherwise). A teardown landing anywhere in the
+  window always finds a stop flag to set. frame_loop also recovers a
+  poisoned ring mutex (into_inner) instead of cascading a panic, and a
+  PersistState arriving after clear_wdf_device traces
+  `PersistSkippedNoDevice` instead of vanishing silently.
+
+Known residual risks, reviewed and accepted for this round (tracked):
+single effects worker means one wedged IddCx call stalls all later
+effects (trade-off for ordering; ETW `MonitorArrival`-without-
+`AdapterReady`-successor patterns would show it); plug still checks the
+adapter once at entry (a D3Final landing mid-plug has the same exposure
+the pre-hardening code had — a monitor plugged after the D3Final drain
+leaks until process end); the effects thread parks in recv() for the
+process lifetime (as the frame/cursor workers already did); inline
+fallback (worker unspawnable) reverts to callback-frame application
+(traced, never-drop-effects trade-off); DESTROY→CREATE reconnect now
+serializes A's unplug before B's plug (bounded ≤ ~1.5 s worst case by
+the stop deadlines); a PersistState dropped at teardown means the last
+pre-removal state change is not persisted (benign — next state change
+rewrites the blob); a teardown landing in evt_assign's spawn→adoption
+gap stops a join-less placeholder instantly (zero grace for the healthy
+new thread — it exits at its next fence, ≤100 ms of calls against a
+still-valid-during-unassign swapchain); a plug that raced the final-exit
+drain is cleaned up when the next bring-up re-plugs the same session
+(displaced-entry stop in monitors::plug), bounded meanwhile by the
+cursor give-up cap.
+
+Signing-round validation checklist: streaming end-to-end, permanent-pool
+replug at boot, sleep/resume, driver update over a running service,
+cursor on the LG, reconnect storm (immediate DESTROY→CREATE), ETW shows
+EffectsWorkerSpawned / AdapterReady and no EffectsInlineFallback,
+RingDeadMarkTimeout, or AdapterReadyStale.
+
 ## Incident 2026-07-27 (read before touching TDR/recovery code)
 
 Real GPU hang during a 4K240 HDR stream → Windows TDR recovery failed →
@@ -108,10 +665,16 @@ machine-wide WDDM wedge (QueryDisplayConfig ERROR_NOT_SUPPORTED,
 reboot-only; same signature 2026-05-17 under SudoVDA). LuminalShine
 beta.5 misclassified 0x887A0004 (DXGI_ERROR_UNSUPPORTED) as TDR in an
 unbounded refuse-sessions loop, and its vdd-diagnostic still probes
-SudoVDA HWIDs. Driver build 13 exonerated except: watchdog advertises
-3 s but core floors leases at 10 s; CREATE_MONITOR has no
-surfaced/failed feedback (zombie sessions); §3.3.6 ETW/WPP not shipping.
-Full analysis, fix plan (beta.5 blockers + driver build 14), and the
-dev-machine evidence checklist: `docs/POSTMORTEM-2026-07-27.md`.
-NOTE: the deployed build-13 IddCx shell is ahead of this repo's main —
-merge the Windows-side branch back before further driver work.
+SudoVDA HWIDs (covered by the tracked SudoVDA code-excision follow-up
+above). Driver build 13 exonerated except: handshake advertises
+watchdog 3 s but `effective_lease_timeout` floors USE_DEFAULT leases at
+10 s (session.rs); CREATE_MONITOR has no surfaced/failed feedback
+(zombie sessions when dxgkrnl is dead); and no ETL trace was captured
+in the incident window — start a logman session on the provider GUID
+above before any repro attempt (WPP/IFR remains the tracked deviation).
+Open question: an IddCx virtual display was the exclusive active
+display in all three observed wedges (5/17, 7/26, 7/27) — IddCx-class
+involvement in failed TDR recovery is not excluded; repro
+discriminators are in the postmortem. Full analysis, fix plan (beta.5
+blockers + driver build-14 items), and the dev-machine
+evidence-collection checklist: `docs/POSTMORTEM-2026-07-27.md`.

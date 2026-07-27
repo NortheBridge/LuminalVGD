@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+---
+name: CI
+permissions: {}
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Setup Rust
+        run: rustup update --no-self-update stable
+
+      - name: Build
+        # Default features only: the IddCx/D3D `shell` feature needs the
+        # eWDK, which hosted runners don't provide. The attended
+        # driver-package build lives in scripts/build-driver.cmd.
+        run: cargo build --workspace --release --locked
+
+      - name: Test
+        run: cargo test --workspace --release --locked
+
+      - name: Stage build artifact
+        # vgd-probe.exe is the bring-up CLI and the only shippable binary
+        # from a non-eWDK build; luminal_vgd_driver.dll is an empty stub
+        # without the shell feature, so staging it would only mislead.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item target/release/vgd-probe.exe staging/
+          Copy-Item packaging/luminalvgd.inf staging/
+          @(
+            "repository: ${{ github.repository }}"
+            "commit:     ${{ github.sha }}"
+            "ref:        ${{ github.ref }}"
+            "run:        ${{ github.run_id }}"
+            "rustc:      $(rustc -V)"
+            "built:      $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+          ) | Set-Content staging/BUILDINFO.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: luminalvgd-build
+          path: staging/
+          if-no-files-found: error

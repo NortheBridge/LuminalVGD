@@ -279,6 +279,18 @@ impl SessionTable {
         Ok(m)
     }
 
+    /// Remove every session — full runtime teardown (final device exit).
+    /// Same identity semantics as [`destroy`](Self::destroy): ephemeral
+    /// identities release their connector reservation, retained ones keep
+    /// it. Needed because lease-disabled sessions (permanent-pool members)
+    /// can never leave via [`tick`](Self::tick).
+    pub fn destroy_all(&mut self) {
+        let ids: Vec<u64> = self.monitors.keys().copied().collect();
+        for id in ids {
+            let _ = self.destroy(id);
+        }
+    }
+
     /// Feed the lease for one session.
     pub fn ping(&mut self, now_ms: u64, session_id: u64) -> Result<(), CoreError> {
         let m = self.monitors.get_mut(&session_id).ok_or(CoreError::NoSuchSession)?;

@@ -58,6 +58,12 @@ pub struct DeviceState {
 #[derive(Default)]
 pub struct HandleCtx {
     pub handshaken: bool,
+    /// DESIGN.md §6 control-surface ACL: set by the shell at file-create
+    /// when the handle was opened through the control reference string by
+    /// SYSTEM or an elevated Administrator. The shell refuses every IOCTL
+    /// (including HANDSHAKE) on unauthorized handles before dispatch runs;
+    /// the default is deny.
+    pub authorized: bool,
 }
 
 /// Side effects the shell must apply after a successful dispatch. The
@@ -76,7 +82,9 @@ pub enum Effect {
         modes: Vec<Mode>,
         adapter_luid: u64,
         ring_slots: u32,
-        edid: [u8; 256],
+        /// Boxed: keeps Effect variants near-uniform in size (effects
+        /// travel by value through Vec<Effect>).
+        edid: Box<[u8; 256]>,
     },
     /// Unplug the monitor and free its ring (explicit destroy, pool
     /// shrink, or watchdog reap).
@@ -168,7 +176,7 @@ fn plug_effect(m: &Monitor, ring_slots: u32) -> Effect {
         modes: m.modes.clone(),
         adapter_luid: m.adapter_luid,
         ring_slots,
-        edid: monitor_edid(m),
+        edid: Box::new(monitor_edid(m)),
     }
 }
 
@@ -191,6 +199,19 @@ impl DeviceState {
     /// Shell refreshes this on adapter arrival/departure notifications.
     pub fn set_adapters(&mut self, adapters: Vec<AdapterInfo>) {
         self.adapters = adapters;
+    }
+
+    /// Reconcile portable state with a full runtime teardown (final
+    /// device exit, or a discarded stale bring-up): every monitor's
+    /// runtime is gone, so drop every table session — lease-disabled
+    /// permanent-pool members included, which `tick()` can never reap —
+    /// while the desired pool config stays so the next [`startup`]
+    /// recreates its members. Skipping this bricks the pool on a
+    /// same-process device re-add: startup's create_trusted hits
+    /// DuplicateSession, creates zero members, and erases the desired
+    /// count. Identity reservations survive per `destroy_all` semantics.
+    pub fn device_teardown_reset(&mut self) {
+        self.table.destroy_all();
     }
 
     /// Recreate persisted permanent-pool members. Call once at device
@@ -762,6 +783,47 @@ mod tests {
         let plugs = effects.iter().filter(|e| matches!(e, Effect::PlugMonitor { .. })).count();
         assert_eq!(plugs, 1, "pool of 1 recreated at boot");
         assert_eq!(d2.table.len(), 1);
+    }
+
+    #[test]
+    fn teardown_reset_preserves_pool_for_next_startup() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+
+        let pool = PermanentPoolConfig {
+            count: 2,
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+            bit_depth: 8,
+            hdr: 0,
+            physical_width_mm: 0,
+            physical_height_mm: 0,
+            name: [0; 32],
+        };
+        let mut out4 = vec![0u8; 4];
+        dispatch(&mut d, &mut h, 0, ioctl::IOCTL_SET_PERMANENT_POOL, &as_bytes(&pool), &mut out4);
+        assert_eq!(from_bytes::<i32>(&out4), err::OK);
+        assert_eq!(d.table.len(), 2);
+
+        // Final device exit: runtime torn down, portable state reconciled.
+        d.device_teardown_reset();
+        assert_eq!(d.table.len(), 0, "lease-disabled pool members removed");
+
+        // Replacement device: startup must recreate the full pool.
+        // (Without the reset, create_trusted hits DuplicateSession,
+        // creates zero members, and erases the desired count.)
+        let effects = d.startup(1_000);
+        let plugs = effects.iter().filter(|e| matches!(e, Effect::PlugMonitor { .. })).count();
+        assert_eq!(plugs, 2, "pool recreated after teardown reset");
+        assert_eq!(d.table.len(), 2);
+
+        // And the cycle repeats: a second teardown + startup still works.
+        d.device_teardown_reset();
+        let effects = d.startup(2_000);
+        let plugs = effects.iter().filter(|e| matches!(e, Effect::PlugMonitor { .. })).count();
+        assert_eq!(plugs, 2);
     }
 
     #[test]
