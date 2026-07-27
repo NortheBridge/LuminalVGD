@@ -100,3 +100,18 @@ verified later; WGC fallback needs no new work. Port libvirtualdisplay's
 `alttab_stress` for the WGC-RELIABILITY.md §7 race when phase 4 lands.
 Merge policy: merge commits, not squash (a squash once orphaned the
 luminalshine submodule pointer); luminalshine merges require green CI.
+
+## Incident 2026-07-27 (read before touching TDR/recovery code)
+
+Real GPU hang during a 4K240 HDR stream → Windows TDR recovery failed →
+machine-wide WDDM wedge (QueryDisplayConfig ERROR_NOT_SUPPORTED,
+reboot-only; same signature 2026-05-17 under SudoVDA). LuminalShine
+beta.5 misclassified 0x887A0004 (DXGI_ERROR_UNSUPPORTED) as TDR in an
+unbounded refuse-sessions loop, and its vdd-diagnostic still probes
+SudoVDA HWIDs. Driver build 13 exonerated except: watchdog advertises
+3 s but core floors leases at 10 s; CREATE_MONITOR has no
+surfaced/failed feedback (zombie sessions); §3.3.6 ETW/WPP not shipping.
+Full analysis, fix plan (beta.5 blockers + driver build 14), and the
+dev-machine evidence checklist: `docs/POSTMORTEM-2026-07-27.md`.
+NOTE: the deployed build-13 IddCx shell is ahead of this repo's main —
+merge the Windows-side branch back before further driver work.
