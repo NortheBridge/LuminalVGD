@@ -3,7 +3,7 @@
 
 use core::mem::{size_of, zeroed};
 use core::ptr::{null_mut, addr_of_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use wdk_sys::{
     call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT,
@@ -15,7 +15,7 @@ use wdk_sys::{
 };
 
 use super::bindings::{self, ffi};
-use super::{control, dxgi, monitors, OsHandle, Shell, DRIVER_BUILD, PROVIDER, SHELL_CAPS};
+use super::{control, monitors, OsHandle, Shell, DRIVER_BUILD, PROVIDER, SHELL_CAPS};
 use crate::dispatch::{watchdog_tick, DeviceState, DriverConfig};
 
 fn interface_guid() -> GUID {
@@ -57,6 +57,7 @@ unsafe extern "C" fn evt_device_add(
     let mut pnp: WDF_PNPPOWER_EVENT_CALLBACKS = zeroed();
     pnp.Size = size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as u32;
     pnp.EvtDeviceD0Entry = Some(evt_d0_entry);
+    pnp.EvtDeviceD0Exit = Some(evt_d0_exit);
     call_unsafe_wdf_function_binding!(WdfDeviceInitSetPnpPowerEventCallbacks, device_init, &mut pnp);
 
     // Per-handle contexts (handshake gating) ride on file objects.
@@ -142,7 +143,7 @@ unsafe extern "C" fn evt_device_add(
         ..DriverConfig::default()
     };
     let shell = Shell::init(DeviceState::new(cfg, persisted.as_deref()));
-    let _ = shell.wdf_device.set(OsHandle(device.cast()));
+    shell.set_wdf_device(OsHandle(device.cast()));
 
     // 1 s periodic watchdog (feeds dispatch::watchdog_tick).
     let mut tc: WDF_TIMER_CONFIG = zeroed();
@@ -168,8 +169,31 @@ unsafe extern "C" fn evt_device_add(
     STATUS_SUCCESS
 }
 
-/// Adapter bring-up happens on first D0 entry (IddSampleDriver pattern).
-static ADAPTER_STARTED: AtomicBool = AtomicBool::new(false);
+/// Which WDFDEVICE the adapter has been brought up for, plus the adapter
+/// epoch captured when IddCxAdapterInitAsync was issued. Same-device D0
+/// re-entries (sleep/resume) skip re-init — the IddSampleDriver pattern —
+/// but a DIFFERENT device (same-process devnode re-add after removal)
+/// re-arms bring-up. The process-global one-shot this replaces skipped
+/// the second device silently, leaving the OS waiting on an indirect
+/// adapter that would never initialize. The epoch is captured HERE (not
+/// in EvtIddCxAdapterInitFinished) so an InitFinished delivered after a
+/// D3Final teardown carries the pre-teardown epoch and goes stale
+/// instead of republishing a destroyed adapter.
+/// Singleton assumption: exactly one live LuminalVGD devnode (INF
+/// root-enumerated singleton) — PnP serializes remove-before-re-add, which
+/// is what makes the single global mark and the D0Entry epoch capture
+/// sound. A multi-devnode design would need per-device marks.
+struct StartMark {
+    device: usize,
+    /// IDDCX_ADAPTER returned by IddCxAdapterInitAsync; 0 while init is
+    /// still in flight. Ties EvtIddCxAdapterInitFinished to the device
+    /// that issued it, so a late callback for a torn-down device cannot
+    /// borrow a replacement device's mark.
+    adapter: usize,
+    epoch: u64,
+}
+
+static STARTED_FOR: Mutex<Option<StartMark>> = Mutex::new(None);
 
 /// Static endpoint diagnostics (telemetry-only per the header).
 static MODEL: [u16; 11] = super::wide("LuminalVGD");
@@ -180,8 +204,13 @@ unsafe extern "C" fn evt_d0_entry(
     device: WDFDEVICE,
     _previous_state: WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
-    if ADAPTER_STARTED.swap(true, Ordering::SeqCst) {
-        return STATUS_SUCCESS;
+    {
+        let epoch = Shell::get().adapter_epoch();
+        let mut started = STARTED_FOR.lock().unwrap();
+        if started.as_ref().is_some_and(|m| m.device == device as usize) {
+            return STATUS_SUCCESS;
+        }
+        *started = Some(StartMark { device: device as usize, adapter: 0, epoch });
     }
 
     let mut version: ffi::IDDCX_ENDPOINT_VERSION = zeroed();
@@ -223,6 +252,21 @@ unsafe extern "C" fn evt_d0_entry(
         level(Informational),
         i32("status", &status)
     );
+    let mut started = STARTED_FOR.lock().unwrap();
+    if status != STATUS_SUCCESS {
+        // Failed D0Entry gets no D0Exit from WDF — roll the marker back
+        // here or a retry on this device could never re-arm bring-up.
+        if started.as_ref().is_some_and(|m| m.device == device as usize) {
+            *started = None;
+        }
+    } else if let Some(mark) =
+        started.as_mut().filter(|m| m.device == device as usize)
+    {
+        // Record the adapter so InitFinished can prove the callback is
+        // ours (InitFinished may race this store; it accepts adapter==0
+        // as "init in flight on this device").
+        mark.adapter = out_args.AdapterObject as usize;
+    }
     status
 }
 
@@ -241,17 +285,84 @@ unsafe extern "C" fn evt_adapter_init_finished(
         return STATUS_SUCCESS;
     }
 
-    let shell = Shell::get();
-    let adapters = dxgi::enumerate();
-    let effects = {
-        let mut dev = shell.dev.lock().unwrap();
-        dev.set_adapters(adapters);
-        dev.startup(shell.now_ms())
+    // Everything heavy is deferred to the effects worker: the DXGI walk
+    // is D3D work and the permanent-pool replug calls into IddCx, and
+    // neither may run on this win32k-callout frame (builds 6/7 rule).
+    // The worker publishes ready() in the same order the inline version
+    // did (adapters + startup first). The epoch comes from the D0Entry
+    // capture (StartMark), so an InitFinished arriving after a D3Final
+    // teardown is provably stale; the adapter-identity check keeps a
+    // late callback for a torn-down device from borrowing a replacement
+    // device's mark (0 = the D0Entry-side store may still be in flight).
+    // A missing/mismatched mark means nothing to bring up.
+    let epoch = {
+        let started = STARTED_FOR.lock().unwrap();
+        started.as_ref().and_then(|m| {
+            (m.adapter == adapter as usize || m.adapter == 0).then_some(m.epoch)
+        })
     };
-    let _ = shell.adapter.set(OsHandle(adapter.cast()));
-    // Recreate persisted permanent-pool displays, outside the lock.
-    control::apply_effects(effects);
-    tracelogging::write_event!(PROVIDER, "AdapterReady", level(Informational));
+    let Some(epoch) = epoch else {
+        tracelogging::write_event!(PROVIDER, "AdapterReadyStale", level(Warning));
+        return STATUS_SUCCESS;
+    };
+    control::queue_adapter_ready(OsHandle(adapter.cast()), epoch);
+    STATUS_SUCCESS
+}
+
+/// Final-exit teardown. Only D3Final (device stop/remove) tears down:
+/// stop every worker under its bounded deadline, mark rings DEAD so
+/// hosts unmap, forget the monitor objects (the OS destroys them with
+/// the adapter — no IddCxMonitorDeparture from a power callback), and
+/// clear the adapter so a replacement device re-arms bring-up. Sleep
+/// transitions keep all state: the OS unassigns swap chains around Dx
+/// itself and the monitors persist across resume.
+unsafe extern "C" fn evt_d0_exit(
+    device: WDFDEVICE,
+    target_state: WDF_POWER_DEVICE_STATE,
+) -> NTSTATUS {
+    if target_state != wdk_sys::_WDF_POWER_DEVICE_STATE::WdfPowerDeviceD3Final {
+        return STATUS_SUCCESS;
+    }
+    let Some(shell) = Shell::try_get() else { return STATUS_SUCCESS };
+    tracelogging::write_event!(PROVIDER, "DeviceFinalExit", level(Informational));
+    // Clear FIRST, before the (multi-second worst case) drain below:
+    // clear_adapter bumps the adapter epoch, so a bring-up racing this
+    // teardown deterministically takes its stale path instead of
+    // publishing the doomed adapter and plugging monitors into a map we
+    // already drained; clearing the WDF device keeps a queued
+    // PersistState from touching a destroyed WDFDEVICE handle.
+    shell.clear_adapter();
+    shell.clear_wdf_device();
+    let drained: Vec<(u64, super::MonitorRt)> = {
+        let mut monitors = shell.monitors.lock().unwrap();
+        monitors.drain().collect()
+    };
+    for (session_id, mut rt) in drained {
+        if let Some(worker) = rt.worker.take() {
+            worker.stop();
+        }
+        if let Some(cursor) = rt.cursor.as_mut() {
+            cursor.stop();
+        }
+        // Bounded (a detached worker may still pin the ring mutex).
+        rt.mark_ring_dead();
+        tracelogging::write_event!(
+            PROVIDER,
+            "MonitorTornDown",
+            level(Informational),
+            u64("session", &session_id)
+        );
+    }
+    // Portable-state reconciliation: every monitor runtime is gone, so
+    // drop every table session — lease-disabled pool members included
+    // (the watchdog can never reap those) — while the desired pool
+    // config stays. Without this a replacement device's startup() hits
+    // DuplicateSession and bricks the pool.
+    shell.dev.lock().unwrap().device_teardown_reset();
+    let mut started = STARTED_FOR.lock().unwrap();
+    if started.as_ref().is_some_and(|m| m.device == device as usize) {
+        *started = None;
+    }
     STATUS_SUCCESS
 }
 
@@ -264,7 +375,7 @@ unsafe extern "C" fn evt_watchdog_tick(_timer: WDFTIMER) {
         let mut dev = shell.dev.lock().unwrap();
         watchdog_tick(&mut dev, shell.now_ms())
     };
-    if !effects.is_empty() {
-        control::apply_effects(effects);
-    }
+    // Queued, not applied: lease-reap unplugs join workers and call
+    // IddCxMonitorDeparture, which must not run on a WDF timer frame.
+    control::queue_effects(effects);
 }

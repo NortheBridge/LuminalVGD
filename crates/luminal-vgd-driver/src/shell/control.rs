@@ -22,8 +22,10 @@ use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 /// `Win32_Security` feature set.
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
+use std::sync::mpsc;
+
 use super::PROVIDER;
-use super::{monitors, Shell};
+use super::{dxgi, monitors, OsHandle, Shell};
 use crate::dispatch::{dispatch, Effect, HandleCtx, Status};
 use luminal_driver_proto::ioctl;
 
@@ -361,7 +363,13 @@ pub unsafe fn read_persisted(device: WDFDEVICE) -> Option<Vec<u8>> {
 
 unsafe fn write_persisted(blob: &[u8]) {
     let shell = Shell::get();
-    let Some(device) = shell.wdf_device.get() else { return };
+    let Some(device) = shell.wdf_device() else {
+        // Device already tore down (clear_wdf_device at D3Final): the
+        // write is dropped, not applied to a destroyed handle. Traced —
+        // the next start re-reads the previous blob.
+        tracelogging::write_event!(PROVIDER, "PersistSkippedNoDevice", level(Warning));
+        return;
+    };
     let Some(key) = open_device_key(device.0.cast(), KEY_WRITE_ACCESS) else {
         return;
     };
@@ -385,9 +393,126 @@ unsafe fn write_persisted(blob: &[u8]) {
     }
 }
 
-/// Apply dispatcher side effects. Called with NO locks held — plugging
-/// and unplugging call into IddCx (DESIGN.md §3.3 rule 3).
-pub fn apply_effects(effects: Vec<Effect>) {
+/// Work items for the effects worker thread. Everything here calls into
+/// IddCx and/or D3D, which must never happen on an IddCx callback or WDF
+/// timer frame — those are win32k callouts, and calling back in deadlocks
+/// against the locks win32k holds while calling us (0x1b8 storms,
+/// builds 6/7; see CLAUDE.md).
+pub(crate) enum EffectsTask {
+    Apply(Vec<Effect>),
+    /// Deferred EvtIddCxAdapterInitFinished bring-up: the DXGI walk,
+    /// DeviceState::startup (permanent-pool replug), then publishing the
+    /// adapter handle — which flips Shell::ready and un-gates session
+    /// IOCTLs, in exactly that order. `epoch` was captured at queue time;
+    /// a D3Final teardown in between bumps it, and the stale task must
+    /// then do nothing (the adapter object it carries is destroyed).
+    AdapterReady { adapter: OsHandle, epoch: u64 },
+}
+
+/// Spawn the effects worker at device add (from Shell::init). Returns
+/// None on spawn failure; the queue functions then apply inline (the
+/// pre-worker behavior) rather than dropping effects.
+pub(crate) fn start_effects_thread() -> Option<mpsc::Sender<EffectsTask>> {
+    let (tx, rx) = mpsc::channel::<EffectsTask>();
+    let spawned = std::thread::Builder::new().name("vgd-effects".into()).spawn(move || {
+        tracelogging::write_event!(PROVIDER, "EffectsWorkerSpawned", level(Informational));
+        for task in rx {
+            match task {
+                EffectsTask::Apply(effects) => apply_now(effects),
+                EffectsTask::AdapterReady { adapter, epoch } => {
+                    run_adapter_ready(adapter, epoch)
+                }
+            }
+        }
+    });
+    match spawned {
+        Ok(_) => Some(tx),
+        Err(_) => {
+            tracelogging::write_event!(PROVIDER, "EffectsWorkerSpawnFailed", level(Error));
+            None
+        }
+    }
+}
+
+/// Hand `task` to the effects worker. Returns the task back if the worker
+/// is unavailable (never spawned, or its receiver is gone) so the caller
+/// can fall back inline — a send error round-trips the same value.
+fn send_task(task: EffectsTask) -> Option<EffectsTask> {
+    let shell = Shell::get();
+    let guard = shell.effects_tx.lock().unwrap();
+    match guard.as_ref() {
+        Some(tx) => match tx.send(task) {
+            Ok(()) => None,
+            Err(mpsc::SendError(task)) => Some(task),
+        },
+        None => Some(task),
+    }
+}
+
+/// Queue dispatcher side effects for the effects worker (FIFO across all
+/// producers). Callers may hold no locks the worker also takes; the send
+/// itself never blocks. Inline fallback (traced) if the worker is gone —
+/// effects must never be silently dropped.
+pub(crate) fn queue_effects(effects: Vec<Effect>) {
+    if effects.is_empty() {
+        return;
+    }
+    if let Some(EffectsTask::Apply(effects)) = send_task(EffectsTask::Apply(effects)) {
+        tracelogging::write_event!(PROVIDER, "EffectsInlineFallback", level(Warning));
+        apply_now(effects);
+    }
+}
+
+/// Queue the deferred adapter bring-up (EvtIddCxAdapterInitFinished).
+pub(crate) fn queue_adapter_ready(adapter: OsHandle, epoch: u64) {
+    if let Some(EffectsTask::AdapterReady { adapter, epoch }) =
+        send_task(EffectsTask::AdapterReady { adapter, epoch })
+    {
+        tracelogging::write_event!(PROVIDER, "EffectsInlineFallback", level(Warning));
+        run_adapter_ready(adapter, epoch);
+    }
+}
+
+/// Adapter bring-up, off the EvtIddCxAdapterInitFinished frame: both the
+/// DXGI factory walk (D3D work) and the permanent-pool replug (IddCx
+/// monitor create/arrival) violate the callback rules when run inline.
+/// The adapter handle is published (ready() flips true) only after
+/// set_adapters + startup — the same ordering the inline version had, so
+/// a CREATE_MONITOR racing bring-up still sees NOT_READY until the
+/// adapter list exists. Epoch-guarded at both ends: a D3Final teardown
+/// between queue and execution (or between startup and publication)
+/// makes this a traced no-op instead of republishing a destroyed
+/// adapter.
+fn run_adapter_ready(adapter: OsHandle, epoch: u64) {
+    let shell = Shell::get();
+    if shell.adapter_epoch() != epoch {
+        tracelogging::write_event!(PROVIDER, "AdapterReadyStale", level(Warning));
+        return;
+    }
+    let adapters = dxgi::enumerate();
+    let effects = {
+        let mut dev = shell.dev.lock().unwrap();
+        dev.set_adapters(adapters);
+        dev.startup(shell.now_ms())
+    };
+    if !shell.set_adapter_if_epoch(adapter, epoch) {
+        // Undo startup()'s table mutations: its pool sessions are
+        // lease-disabled (the watchdog can never reap them) and their
+        // monitors were never plugged — left in place they would brick
+        // the next bring-up with DuplicateSession. Identity reservations
+        // survive the reset.
+        shell.dev.lock().unwrap().device_teardown_reset();
+        tracelogging::write_event!(PROVIDER, "AdapterReadyStale", level(Warning));
+        return;
+    }
+    apply_now(effects);
+    tracelogging::write_event!(PROVIDER, "AdapterReady", level(Informational));
+}
+
+/// Apply dispatcher side effects. Runs on the effects worker (or the
+/// traced inline fallback). Called with NO locks held — plugging and
+/// unplugging call into IddCx (DESIGN.md §3.3 rule 3).
+fn apply_now(effects: Vec<Effect>) {
     for effect in effects {
         match effect {
             Effect::PlugMonitor {
@@ -565,8 +690,9 @@ pub unsafe extern "C" fn evt_ioctl(
         info as u64
     );
 
-    // OS work strictly after request completion, with no locks held.
-    apply_effects(result.effects);
+    // OS work strictly after request completion — queued to the effects
+    // worker, never applied on this IddCx callback frame.
+    queue_effects(result.effects);
 }
 
 pub unsafe extern "C" fn evt_file_create(
