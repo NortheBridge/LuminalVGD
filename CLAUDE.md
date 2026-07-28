@@ -678,3 +678,29 @@ involvement in failed TDR recovery is not excluded; repro
 discriminators are in the postmortem. Full analysis, fix plan (beta.5
 blockers + driver build-14 items), and the dev-machine
 evidence-collection checklist: `docs/POSTMORTEM-2026-07-27.md`.
+
+### Build 14 — TDR duck-out + watchdog contract (2026-07-27, UNVERIFIED — rides next signing round)
+
+Branch `feat/tdr-duck-out`. Addresses the incident's IddCx-class open
+question from the offensive side: when a frame worker's D3D device
+reports removal (GetDeviceRemovedReason — cannot fire on the routine
+~10 ms unassign), the effects worker DEPARTS every monitor so a failing
+OS TDR recovery can never wait on the indirect display path, parking
+identity + ring; a poller probes the RENDER adapter's LUID (never the
+default adapter — hybrid-GPU false positive) on throwaway 15 s-deadline
+threads, and re-arrives the same monitors (same container GUID +
+connector) on recovery. Budgets: one duck in flight (CAS), max 3 cycles
+per incident (10-min stability window resets), 10-min recovery budget,
+every give-up path drains + dead-marks + clears the pending latch.
+Failed departure re-inserts the monitor (never park an arrived
+monitor); duck_all self-drains on mid-loop D3Final; plug() purges a
+parked twin BEFORE creating its ring section (shared-section name
+aliasing). Also DEFAULT_WATCHDOG_SECS 3→10 (advertised == enforced
+lease floor; core test locks it). Adversarially reviewed twice: 4
+confirmed recovery-path defects fixed + re-verified FIXED; residual
+classes documented in the review (all pre-existing accepted).
+Validation additions for this round's checklist: ETW
+TdrDuckStart(cycle)/TdrDuckDeparted/TdrReplugged/TdrDuckAbandoned(reason)/
+TdrRecoveryProbeHung/TdrDuckTornDownMidFlight; a TDR-injection or
+driver-verifier-forced device-removal pass would exercise the duck; a
+plain stream + reconnect must show ZERO Tdr* events.
