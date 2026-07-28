@@ -517,6 +517,14 @@ mod tests {
     #[test]
     fn lease_timeouts_resolve_and_clamp() {
         assert_eq!(effective_lease_timeout(0, 3), 10_000, "default floor");
+        // The advertised default must be the enforced one: a handshake
+        // reporting DEFAULT_WATCHDOG_SECS and a USE_DEFAULT lease must
+        // agree (the 3 s / 10 s mismatch shipped through alpha.3).
+        assert_eq!(
+            effective_lease_timeout(0, DEFAULT_WATCHDOG_SECS),
+            DEFAULT_WATCHDOG_SECS * 1000,
+            "advertised watchdog matches the enforced lease floor"
+        );
         assert_eq!(effective_lease_timeout(0, 60), 60_000);
         assert_eq!(effective_lease_timeout(0, 0), LEASE_TIMEOUT_DISABLED);
         assert_eq!(effective_lease_timeout(LEASE_TIMEOUT_DISABLED, 3), LEASE_TIMEOUT_DISABLED);

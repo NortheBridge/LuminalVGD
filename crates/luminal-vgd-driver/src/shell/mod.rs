@@ -60,7 +60,7 @@ pub(crate) const DRIVER_BUILD: u32 = match option_env!("LUMINAL_VGD_BUILD") {
         }
         n
     }
-    None => 13,
+    None => 14,
 };
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
@@ -91,6 +91,18 @@ pub(crate) struct MonitorRt {
     /// IddCxMonitorCreate stays stable while the map rehashes.
     pub edid: Box<[u8; 256]>,
     pub modes: Vec<Mode>,
+    /// Plug identity, kept so a TDR duck-out can re-arrive the same
+    /// monitor (same container GUID via display_id, same connector)
+    /// without a round trip through the host.
+    pub display_id: u64,
+    pub connector_index: u32,
+    /// The adapter this monitor renders on: seeded from the plug's
+    /// DeviceState choice, overwritten by every assign's
+    /// RenderAdapterLuid (the authoritative value). The TDR recovery
+    /// poller probes THIS adapter — probing the default adapter would
+    /// false-positive off a healthy iGPU while the render dGPU is still
+    /// wedged.
+    pub adapter_luid: u64,
     pub worker: Option<swapchain::Worker>,
     /// The transport ring (section + policy + textures). Lives here, not
     /// in the worker, so sequences and the generation persist across
@@ -112,36 +124,57 @@ impl MonitorRt {
     /// callback. On deadline the mark is skipped (traced): the host's
     /// stale-heartbeat detection already treats a frozen ring as dead.
     pub(crate) fn mark_ring_dead(&self) {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            match self.ring.try_lock() {
-                Ok(ring) => {
-                    if let Some(section) = &ring.section {
-                        section.set_state(luminal_driver_proto::ring_state::DEAD);
-                    }
+        mark_ring_dead_arc(&self.ring);
+    }
+}
+
+/// Bounded DEAD-marking for a bare ring Arc (see MonitorRt::mark_ring_dead
+/// for the rationale) — also used for parked (ducked) monitors, which
+/// hold their ring outside a MonitorRt.
+pub(crate) fn mark_ring_dead_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match ring.try_lock() {
+            Ok(ring) => {
+                if let Some(section) = &ring.section {
+                    section.set_state(luminal_driver_proto::ring_state::DEAD);
+                }
+                return;
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let ring = poisoned.into_inner();
+                if let Some(section) = &ring.section {
+                    section.set_state(luminal_driver_proto::ring_state::DEAD);
+                }
+                return;
+            }
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    tracelogging::write_event!(
+                        PROVIDER,
+                        "RingDeadMarkTimeout",
+                        level(Warning)
+                    );
                     return;
                 }
-                Err(TryLockError::Poisoned(poisoned)) => {
-                    let ring = poisoned.into_inner();
-                    if let Some(section) = &ring.section {
-                        section.set_state(luminal_driver_proto::ring_state::DEAD);
-                    }
-                    return;
-                }
-                Err(TryLockError::WouldBlock) => {
-                    if Instant::now() >= deadline {
-                        tracelogging::write_event!(
-                            PROVIDER,
-                            "RingDeadMarkTimeout",
-                            level(Warning)
-                        );
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
+}
+
+/// A monitor parked during a GPU reset: departed from the OS so TDR
+/// recovery never waits on the indirect display, with everything needed
+/// to re-arrive it kept alive (the ring Arc preserves sequences and the
+/// generation across the gap, exactly like a swap-chain reassignment).
+pub(crate) struct DuckedMonitor {
+    pub session_id: u64,
+    pub display_id: u64,
+    pub connector_index: u32,
+    pub adapter_luid: u64,
+    pub edid: Box<[u8; 256]>,
+    pub modes: Vec<Mode>,
+    pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
 }
 
 pub(crate) struct Shell {
@@ -152,6 +185,29 @@ pub(crate) struct Shell {
     pub handles: Mutex<HashMap<usize, HandleCtx>>,
     /// session_id → live monitor runtime state.
     pub monitors: Mutex<HashMap<u64, MonitorRt>>,
+    /// Monitors departed during a GPU reset, awaiting re-arrival once the
+    /// stack recovers (TDR duck-out; control.rs). Purged when the same
+    /// session is destroyed or re-plugged while parked.
+    pub ducked: Mutex<Vec<DuckedMonitor>>,
+    /// One duck-out in flight at a time: set (CAS) when a frame worker
+    /// observes device removal, cleared when the replug (or give-up)
+    /// completes. Keeps N workers failing off one GPU reset from queueing
+    /// N duck tasks.
+    pub tdr_duck_pending: std::sync::atomic::AtomicBool,
+    /// Duck cycles in the current INCIDENT. A wedge where device creation
+    /// succeeds but activation still fails would otherwise flap
+    /// duck→replug→duck forever; past the cap the give-up path runs
+    /// instead. Reset by clear_adapter (a re-added device starts fresh)
+    /// and by run_tdr_duck when the last recovery is old enough that this
+    /// is clearly a NEW incident — three genuine, fully-recovered TDRs
+    /// spread across a long boot must not exhaust the budget and turn the
+    /// fourth into a silent abandon.
+    pub tdr_duck_cycles: std::sync::atomic::AtomicU32,
+    /// Driver-clock ms of the last successful replug (0 = never). Used
+    /// only for the incident-window reset above; written by the effects
+    /// worker, read by run_tdr_duck on the same thread (atomic for the
+    /// cross-thread clear_adapter reset path).
+    pub tdr_last_recovery_ms: std::sync::atomic::AtomicU64,
     /// Set once the deferred adapter bring-up completes (effects worker,
     /// after EvtIddCxAdapterInitFinished); session IOCTLs are gated on
     /// this (control-plane requests can arrive first). Cleared at final
@@ -184,6 +240,10 @@ impl Shell {
             dev: Mutex::new(dev),
             handles: Mutex::new(HashMap::new()),
             monitors: Mutex::new(HashMap::new()),
+            ducked: Mutex::new(Vec::new()),
+            tdr_duck_pending: std::sync::atomic::AtomicBool::new(false),
+            tdr_duck_cycles: std::sync::atomic::AtomicU32::new(0),
+            tdr_last_recovery_ms: std::sync::atomic::AtomicU64::new(0),
             adapter: Mutex::new(AdapterSlot::default()),
             wdf_device: Mutex::new(None),
             effects_tx: Mutex::new(control::start_effects_thread()),
@@ -228,6 +288,7 @@ impl Shell {
         let mut slot = self.adapter.lock().unwrap();
         slot.handle = None;
         slot.epoch += 1;
+        self.tdr_duck_cycles.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn wdf_device(&self) -> Option<OsHandle> {

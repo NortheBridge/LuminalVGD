@@ -353,6 +353,22 @@ unsafe extern "C" fn evt_d0_exit(
             u64("session", &session_id)
         );
     }
+    // Monitors parked by a TDR duck-out are already departed (no IddCx
+    // call needed — must not be one, this is a power callback); their
+    // rings just go dead so the host stops waiting. The epoch bump above
+    // already made the recovery poller and any queued replug stale.
+    let parked: Vec<super::DuckedMonitor> = shell.ducked.lock().unwrap().drain(..).collect();
+    for d in &parked {
+        super::mark_ring_dead_arc(&d.ring);
+    }
+    if !parked.is_empty() {
+        tracelogging::write_event!(
+            PROVIDER,
+            "DuckedTornDown",
+            level(Informational),
+            u64("count", &(parked.len() as u64))
+        );
+    }
     // Portable-state reconciliation: every monitor runtime is gone, so
     // drop every table session — lease-disabled pool members included
     // (the watchdog can never reap those) — while the desired pool

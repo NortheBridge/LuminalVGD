@@ -192,6 +192,9 @@ pub unsafe extern "C" fn evt_assign(
             u64("session", &session_id),
             u64("luid", &luid)
         );
+        // The assign's RenderAdapterLuid is the authoritative render
+        // adapter for this monitor; the TDR recovery poller probes it.
+        rt.adapter_luid = luid;
         let old = rt.worker.replace(Worker { stop: stop.clone(), join: None });
         (session_id, rt.ring.clone(), old)
     };
@@ -253,6 +256,20 @@ pub unsafe extern "C" fn evt_unassign(monitor: ffi::IDDCX_MONITOR) -> NTSTATUS {
         worker.stop();
     }
     STATUS_SUCCESS
+}
+
+/// Can the given render adapter create a D3D11 device right now? The
+/// TDR recovery poller's "is the display stack back" probe. Probing the
+/// SPECIFIC render LUID matters: on a hybrid iGPU+dGPU machine a
+/// default-adapter probe would answer for a healthy iGPU while the
+/// wedged dGPU our monitors render on is still down.
+///
+/// WARNING: D3D11CreateDevice against a wedged stack can block
+/// indefinitely — callers must run this on a throwaway thread with a
+/// deadline, never on the poller's own clock (the build-12 lesson:
+/// individually-bounded waits compose into unbounded ones).
+pub(crate) fn probe_adapter_on_luid(luid: u64) -> bool {
+    create_device_on_luid(luid).is_ok()
 }
 
 fn create_device_on_luid(
@@ -438,6 +455,7 @@ fn frame_loop(
                 s.set_state(ring_state::REBUILDING);
             }
             ring.retire_textures();
+            maybe_queue_tdr_duck(session_id, &d3d.0);
             return;
         }
 
@@ -475,8 +493,31 @@ fn frame_loop(
                 s.set_state(ring_state::REBUILDING);
             }
             ring.retire_textures();
+            maybe_queue_tdr_duck(session_id, &d3d.0);
             return;
         }
+    }
+}
+
+/// Distinguish "this swapchain is being replaced" (routine — the OS's
+/// ~10 ms unassign, mode switches) from "the GPU itself reset" and queue
+/// a TDR duck-out only for the latter. The discriminator is the D3D
+/// device: swapchain-level failures with a healthy device are handled by
+/// the OS's unassign→assign cycle; a removed device means every monitor
+/// on this adapter is about to fail the same way, and a failing OS TDR
+/// recovery must not be left waiting on our indirect display path.
+fn maybe_queue_tdr_duck(session_id: u64, device: &ID3D11Device) {
+    let removed = unsafe { device.GetDeviceRemovedReason() };
+    if let Err(reason) = removed {
+        let code = reason.code().0;
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDeviceRemoved",
+            level(Warning),
+            u64("session", &session_id),
+            i32("reason", &code)
+        );
+        super::control::queue_tdr_duck();
     }
 }
 
