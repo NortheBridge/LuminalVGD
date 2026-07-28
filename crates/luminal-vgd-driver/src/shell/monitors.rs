@@ -34,7 +34,7 @@ pub fn plug(
     display_id: u64,
     connector_index: u32,
     modes: Vec<Mode>,
-    _adapter_luid: u64,
+    adapter_luid: u64,
     ring_slots: u32,
     edid: Box<[u8; 256]>,
 ) {
@@ -43,6 +43,21 @@ pub fn plug(
         tracelogging::write_event!(PROVIDER, "PlugBeforeAdapterReady", level(Error));
         return;
     };
+
+    // Purge any parked (ducked) copy of this session FIRST — before the
+    // FrameRing below creates its shared section. A stale parked entry
+    // still holds the old section alive under the same name, and
+    // CreateFileMappingW would silently reopen it instead of creating a
+    // fresh one — two ring Arcs aliasing one section. Dead-mark so the
+    // host stops waiting on the stale mapping.
+    {
+        let mut ducked = shell.ducked.lock().unwrap();
+        if let Some(pos) = ducked.iter().position(|d| d.session_id == session_id) {
+            let d = ducked.remove(pos);
+            drop(ducked);
+            super::mark_ring_dead_arc(&d.ring);
+        }
+    }
 
     unsafe {
         let mut info: ffi::IDDCX_MONITOR_INFO = zeroed();
@@ -84,6 +99,9 @@ pub fn plug(
                 monitor: OsHandle(monitor.cast()),
                 edid,
                 modes,
+                display_id,
+                connector_index,
+                adapter_luid,
                 worker: None,
                 ring,
                 cursor: None,
@@ -137,6 +155,24 @@ pub fn plug(
 /// never signals a closed event.
 pub fn unplug(session_id: u64) {
     let shell = Shell::get();
+    // A destroy landing while the session is parked in a TDR duck-out:
+    // the monitor is already departed, so only the parked spec needs to
+    // go (its ring is marked dead like the normal path below).
+    {
+        let mut ducked = shell.ducked.lock().unwrap();
+        if let Some(pos) = ducked.iter().position(|d| d.session_id == session_id) {
+            let d = ducked.remove(pos);
+            drop(ducked);
+            super::mark_ring_dead_arc(&d.ring);
+            tracelogging::write_event!(
+                PROVIDER,
+                "UnplugWhileDucked",
+                level(Informational),
+                u64("session", &session_id)
+            );
+            return;
+        }
+    }
     let Some(mut rt) = shell.monitors.lock().unwrap().remove(&session_id) else {
         return;
     };
@@ -156,6 +192,204 @@ pub fn unplug(session_id: u64) {
             u64("session", &session_id),
             i32("status", &status)
         );
+    }
+}
+
+/// TDR duck-out, step 1: depart every live monitor so a failed OS TDR
+/// recovery can never wait on the indirect display path, parking each
+/// monitor's identity + ring for re-arrival. Runs on the effects worker
+/// (departure is an IddCx call and re-enters the driver synchronously —
+/// same constraints as unplug). Returns how many monitors were parked.
+///
+/// The parked ring is set REBUILDING, not DEAD: the host's capture layer
+/// treats REBUILDING as "coming back" (same as a reassignment). (In
+/// practice a real TDR outlasts the host's stale-heartbeat grace and it
+/// reinitializes through the ordinary destroy/create paths anyway — the
+/// mark is correctness, not the recovery contract.)
+///
+/// `expected_epoch` is the adapter epoch this duck was queued under: a
+/// D3Final teardown can land mid-loop (its ducked drain and this loop's
+/// pushes interleave), so on any epoch change the whole parked set is
+/// self-drained here — otherwise entries pushed after the teardown's
+/// drain would leak and later replug as ghost monitors.
+pub fn duck_all(expected_epoch: u64) -> usize {
+    let shell = super::Shell::get();
+    let drained: Vec<(u64, super::MonitorRt)> = {
+        let mut monitors = shell.monitors.lock().unwrap();
+        monitors.drain().collect()
+    };
+    let mut parked = 0usize;
+    for (session_id, mut rt) in drained {
+        if let Some(worker) = rt.worker.take() {
+            worker.stop();
+        }
+        if let Some(cursor) = rt.cursor.as_mut() {
+            cursor.stop();
+        }
+        // Single bounded attempt: a detached worker may pin the ring
+        // mutex, and unlike mark_ring_dead there is no urgency to win —
+        // the host's stale-heartbeat detection covers an unmarked ring.
+        if let Ok(ring) = rt.ring.try_lock() {
+            if let Some(s) = &ring.section {
+                s.set_state(luminal_driver_proto::ring_state::REBUILDING);
+            }
+        }
+        let status = unsafe { bindings::monitor_departure(rt.monitor.0.cast()) };
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDuckDeparted",
+            level(Warning),
+            u64("session", &session_id),
+            i32("status", &status)
+        );
+        if status != STATUS_SUCCESS {
+            // The monitor is still arrived — parking it would leave an
+            // occupied connector that a replug (or the host's DESTROY,
+            // whose ducked fast-path assumes already-departed) can never
+            // reclaim. Put it back; unplug/teardown will depart it
+            // through the normal path when its session ends.
+            shell.monitors.lock().unwrap().insert(session_id, rt);
+            continue;
+        }
+        shell.ducked.lock().unwrap().push(super::DuckedMonitor {
+            session_id,
+            display_id: rt.display_id,
+            connector_index: rt.connector_index,
+            adapter_luid: rt.adapter_luid,
+            edid: rt.edid,
+            modes: rt.modes,
+            ring: rt.ring,
+        });
+        parked += 1;
+    }
+    // Teardown raced this loop: everything parked above may postdate the
+    // D3Final drain. Clean up after ourselves — the epoch bump already
+    // made the poller and any queued replug stale, so nothing else will.
+    if shell.adapter_epoch() != expected_epoch {
+        let stale: Vec<super::DuckedMonitor> = shell.ducked.lock().unwrap().drain(..).collect();
+        for d in &stale {
+            super::mark_ring_dead_arc(&d.ring);
+        }
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDuckTornDownMidFlight",
+            level(Warning),
+            u64("drained", &(stale.len() as u64))
+        );
+        return 0;
+    }
+    parked
+}
+
+/// TDR duck-out, step 2: re-arrive every parked monitor after the display
+/// stack recovered. Same container GUID (derived from display_id) and
+/// connector, so Windows reattaches the remembered identity/topology.
+/// Runs on the effects worker. A create/arrival failure drops that
+/// monitor (traced, ring marked dead) — the host recreates the session
+/// through the normal CREATE path on its next attempt.
+pub fn replug_ducked() {
+    let shell = super::Shell::get();
+    let parked: Vec<super::DuckedMonitor> = {
+        let mut ducked = shell.ducked.lock().unwrap();
+        ducked.drain(..).collect()
+    };
+    let Some(adapter) = shell.adapter() else {
+        // Adapter torn down while parked (device removal/re-add): the
+        // fresh bring-up replugs from DeviceState instead.
+        for d in &parked {
+            super::mark_ring_dead_arc(&d.ring);
+        }
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrReplugNoAdapter",
+            level(Warning),
+            u64("count", &(parked.len() as u64))
+        );
+        return;
+    };
+
+    for d in parked {
+        unsafe {
+            let mut info: ffi::IDDCX_MONITOR_INFO = zeroed();
+            info.Size = size_of::<ffi::IDDCX_MONITOR_INFO>() as u32;
+            info.MonitorType = ffi::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY_DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+            info.ConnectorIndex = d.connector_index;
+            info.MonitorContainerId = container_guid(d.display_id);
+            info.MonitorDescription.Size = size_of::<ffi::IDDCX_MONITOR_DESCRIPTION>() as u32;
+            info.MonitorDescription.Type = ffi::IDDCX_MONITOR_DESCRIPTION_TYPE_IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+            info.MonitorDescription.DataSize = 256;
+            info.MonitorDescription.pData = d.edid.as_ptr().cast::<core::ffi::c_void>().cast_mut();
+
+            let mut in_args: ffi::IDARG_IN_MONITORCREATE = zeroed();
+            in_args.pMonitorInfo = &mut info;
+            let mut out_args: ffi::IDARG_OUT_MONITORCREATE = zeroed();
+            let status = bindings::monitor_create(adapter.0.cast(), &in_args, &mut out_args);
+            if status != STATUS_SUCCESS {
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "TdrReplugCreateFailed",
+                    level(Error),
+                    u64("session", &d.session_id),
+                    i32("status", &status)
+                );
+                super::mark_ring_dead_arc(&d.ring);
+                continue;
+            }
+            let monitor = out_args.MonitorObject;
+
+            // Reinstate the runtime with the ORIGINAL ring Arc: sequences
+            // and the generation continue, and the next assign retires
+            // textures exactly like any reassignment.
+            let displaced = shell.monitors.lock().unwrap().insert(
+                d.session_id,
+                super::MonitorRt {
+                    monitor: super::OsHandle(monitor.cast()),
+                    edid: d.edid,
+                    modes: d.modes,
+                    display_id: d.display_id,
+                    connector_index: d.connector_index,
+                    adapter_luid: d.adapter_luid,
+                    worker: None,
+                    ring: d.ring,
+                    cursor: None,
+                },
+            );
+            if let Some(mut prev) = displaced {
+                // A CREATE for the same session raced the replug (the
+                // purge in plug() and this insert are not one atomic
+                // step). Keep the newer entry's ring dead-marked and
+                // stop its workers — mirror the displaced-entry handling
+                // in plug().
+                if let Some(worker) = prev.worker.take() {
+                    worker.stop();
+                }
+                if let Some(cursor) = prev.cursor.as_mut() {
+                    cursor.stop();
+                }
+                prev.mark_ring_dead();
+            }
+
+            let mut arrival: ffi::IDARG_OUT_MONITORARRIVAL = zeroed();
+            let status = bindings::monitor_arrival(monitor, &mut arrival);
+            tracelogging::write_event!(
+                PROVIDER,
+                "TdrReplugged",
+                level(Informational),
+                u64("session", &d.session_id),
+                i32("status", &status)
+            );
+            if status != STATUS_SUCCESS {
+                if let Some(rt) = shell.monitors.lock().unwrap().remove(&d.session_id) {
+                    rt.mark_ring_dead();
+                }
+                continue;
+            }
+
+            let cursor = super::cursor::spawn(d.session_id, super::OsHandle(monitor.cast()));
+            if let Some(rt) = shell.monitors.lock().unwrap().get_mut(&d.session_id) {
+                rt.cursor = cursor;
+            }
+        }
     }
 }
 

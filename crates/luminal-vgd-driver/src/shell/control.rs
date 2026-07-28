@@ -407,6 +407,18 @@ pub(crate) enum EffectsTask {
     /// a D3Final teardown in between bumps it, and the stale task must
     /// then do nothing (the adapter object it carries is destroyed).
     AdapterReady { adapter: OsHandle, epoch: u64 },
+    /// TDR duck-out: a frame worker observed device removal on its D3D
+    /// device (a GPU reset). Depart every monitor so a failing OS TDR
+    /// recovery can never wait on the indirect display path — the
+    /// working hypothesis for the 5/17, 7/26 and 7/27 machine-wide
+    /// wedges, where an IddCx display was the exclusive active display
+    /// each time (docs/POSTMORTEM-2026-07-27.md). Parked monitors
+    /// re-arrive via TdrReplug once the recovery poller sees the GPU
+    /// answer device creation again.
+    TdrDuck { epoch: u64 },
+    /// Re-arrive the monitors parked by TdrDuck (queued by the recovery
+    /// poller thread when the display stack answers again).
+    TdrReplug { epoch: u64 },
 }
 
 /// Spawn the effects worker at device add (from Shell::init). Returns
@@ -422,6 +434,8 @@ pub(crate) fn start_effects_thread() -> Option<mpsc::Sender<EffectsTask>> {
                 EffectsTask::AdapterReady { adapter, epoch } => {
                     run_adapter_ready(adapter, epoch)
                 }
+                EffectsTask::TdrDuck { epoch } => run_tdr_duck(epoch),
+                EffectsTask::TdrReplug { epoch } => run_tdr_replug(epoch),
             }
         }
     });
@@ -471,6 +485,202 @@ pub(crate) fn queue_adapter_ready(adapter: OsHandle, epoch: u64) {
         tracelogging::write_event!(PROVIDER, "EffectsInlineFallback", level(Warning));
         run_adapter_ready(adapter, epoch);
     }
+}
+
+/// Called by a frame worker that observed device removal (a GPU reset).
+/// One duck per incident: the pending CAS dedupes N workers failing off
+/// one reset. The worker thread is not a callback frame, but the
+/// departure work still belongs on the effects worker for ordering with
+/// every other IddCx side effect; there is deliberately no inline
+/// fallback here (a duck that cannot be queued is dropped and re-armed
+/// by the next failing worker).
+pub(crate) fn queue_tdr_duck() {
+    let shell = Shell::get();
+    if shell
+        .tdr_duck_pending
+        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .is_err()
+    {
+        return; // one already in flight
+    }
+    let epoch = shell.adapter_epoch();
+    if send_task(EffectsTask::TdrDuck { epoch }).is_some() {
+        shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracelogging::write_event!(PROVIDER, "TdrDuckQueueFailed", level(Warning));
+    }
+}
+
+/// How long the recovery poller keeps probing before giving up. A real
+/// TDR recovers in ~2 minutes; a machine-wide wedge never does (only a
+/// reboot clears it), and parked monitors must not linger forever.
+const TDR_RECOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const TDR_RECOVERY_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Duck cycles per adapter epoch before giving up outright: a wedge
+/// where device creation succeeds but activation still fails would
+/// otherwise flap duck→replug→duck for as long as the wedge lasts.
+const TDR_MAX_DUCK_CYCLES: u32 = 3;
+
+/// One probe may hang this long before the poller counts it failed and
+/// (rate-limited) tries a fresh one. A hung probe thread stays detached
+/// and exits whenever the OS call finally returns.
+const TDR_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const TDR_PROBE_RESPAWN_AFTER_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Drain the parked set and mark its rings dead — the shared give-up
+/// path (deadline, spawn failure, cycle cap, stale replug/poller).
+fn abandon_ducked(reason: &str) -> u64 {
+    let shell = Shell::get();
+    let parked: Vec<super::DuckedMonitor> = shell.ducked.lock().unwrap().drain(..).collect();
+    for d in &parked {
+        super::mark_ring_dead_arc(&d.ring);
+    }
+    let count = parked.len() as u64;
+    if count > 0 {
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDuckAbandoned",
+            level(Warning),
+            str8("reason", reason),
+            u64("abandoned", &count)
+        );
+    }
+    count
+}
+
+fn run_tdr_duck(epoch: u64) {
+    let shell = Shell::get();
+    if shell.adapter_epoch() != epoch {
+        shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracelogging::write_event!(PROVIDER, "TdrDuckStale", level(Warning));
+        return;
+    }
+    let cycle = shell.tdr_duck_cycles.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let parked = monitors::duck_all(epoch);
+    tracelogging::write_event!(
+        PROVIDER,
+        "TdrDuckStart",
+        level(Warning),
+        u64("parked", &(parked as u64)),
+        u32("cycle", &cycle)
+    );
+    if parked == 0 {
+        shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    if cycle > TDR_MAX_DUCK_CYCLES {
+        // Flapping: recovery keeps "succeeding" and the monitors keep
+        // failing. Stop churning modesets; only a reboot (or device
+        // re-add, which resets the cycle counter) gets monitors back.
+        abandon_ducked("cycle cap");
+        shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    // Probe the adapter the parked monitors actually render on.
+    let probe_luid = shell
+        .ducked
+        .lock()
+        .unwrap()
+        .first()
+        .map(|d| d.adapter_luid)
+        .unwrap_or(0);
+
+    // The poller lives on its own thread: the effects worker must stay
+    // free for other effects while the GPU recovers (a parked recv()-loop
+    // there would stall every later plug/unplug/persist).
+    let spawned = std::thread::Builder::new().name("vgd-tdr-recovery".into()).spawn(move || {
+        let shell = Shell::get();
+        let deadline = std::time::Instant::now() + TDR_RECOVERY_BUDGET;
+        // The D3D probe runs on a THROWAWAY thread: D3D11CreateDevice
+        // against a wedged stack can block indefinitely, and the poller's
+        // own clock (epoch/empty/deadline checks below) must keep ticking
+        // regardless — a hung probe must not turn the bounded budget into
+        // an unbounded one or leave tdr_duck_pending stuck forever.
+        let mut probe: Option<(std::thread::JoinHandle<bool>, std::time::Instant)> = None;
+        let mut last_hang_at: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(TDR_RECOVERY_PROBE_EVERY);
+            if shell.adapter_epoch() != epoch {
+                // Device teardown while parked. duck_all's own epoch
+                // re-check covers a teardown racing the park loop, but
+                // this poller may still own entries parked BEFORE the
+                // teardown's drain — clean them deterministically.
+                abandon_ducked("poller stale");
+                shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                tracelogging::write_event!(PROVIDER, "TdrRecoveryPollerStale", level(Informational));
+                return;
+            }
+            if shell.ducked.lock().unwrap().is_empty() {
+                // Every parked session was destroyed or re-plugged.
+                shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            if let Some((handle, started)) = probe.take() {
+                if handle.is_finished() {
+                    let recovered = handle.join().unwrap_or(false);
+                    if recovered {
+                        tracelogging::write_event!(PROVIDER, "TdrRecoveryDetected", level(Informational));
+                        if send_task(EffectsTask::TdrReplug { epoch }).is_some() {
+                            // Effects worker gone (process teardown): park
+                            // state is cleaned up by final exit.
+                            shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        return;
+                    }
+                } else if started.elapsed() >= TDR_PROBE_DEADLINE {
+                    // Hung inside the OS call — detach and rate-limit
+                    // respawns (each would hang the same way; the leak is
+                    // bounded by the respawn interval and they exit when
+                    // the call finally returns).
+                    drop(handle);
+                    last_hang_at = Some(std::time::Instant::now());
+                    tracelogging::write_event!(PROVIDER, "TdrRecoveryProbeHung", level(Warning));
+                } else {
+                    probe = Some((handle, started));
+                }
+            }
+            if probe.is_none() {
+                let respawn_ok = match last_hang_at {
+                    Some(at) => at.elapsed() >= TDR_PROBE_RESPAWN_AFTER_HANG,
+                    None => true,
+                };
+                if respawn_ok {
+                    if let Ok(handle) = std::thread::Builder::new()
+                        .name("vgd-tdr-probe".into())
+                        .spawn(move || super::swapchain::probe_adapter_on_luid(probe_luid))
+                    {
+                        probe = Some((handle, std::time::Instant::now()));
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                // Never recovered: the machine needs a reboot. Drop the
+                // parked state deterministically (rings dead → the host
+                // gives up cleanly; sessions die by DESTROY or lease).
+                abandon_ducked("recovery deadline");
+                shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                tracelogging::write_event!(PROVIDER, "TdrRecoveryGaveUp", level(Warning));
+                return;
+            }
+        }
+    });
+    if spawned.is_err() {
+        // No poller — treat as an immediate give-up so nothing leaks.
+        abandon_ducked("poller spawn failed");
+        shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracelogging::write_event!(PROVIDER, "TdrRecoveryPollerSpawnFailed", level(Error));
+    }
+}
+
+fn run_tdr_replug(epoch: u64) {
+    let shell = Shell::get();
+    if shell.adapter_epoch() != epoch {
+        abandon_ducked("replug stale");
+        tracelogging::write_event!(PROVIDER, "TdrReplugStale", level(Warning));
+    } else {
+        monitors::replug_ducked();
+    }
+    shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Adapter bring-up, off the EvtIddCxAdapterInitFinished frame: both the

@@ -171,7 +171,14 @@ pub const DEFAULT_MAX_MONITORS: u32 = 10;
 pub const ABI_MAX_MONITORS: u32 = 16;
 /// Watchdog timeout in seconds; 0 disables. Driver destroys monitors whose
 /// owner stops PINGing (host crash => no zombie displays).
-pub const DEFAULT_WATCHDOG_SECS: u32 = 3;
+///
+/// 10, not the SudoVDA-inherited 3: `effective_lease_timeout` floors
+/// USE_DEFAULT leases at `DEFAULT_LEASE_TIMEOUT_MS` (10 s) regardless,
+/// so 3 was never honored — the handshake advertised "watchdog 3 s"
+/// while orphaned monitors actually lived ~10-11 s (measured in the
+/// 2026-07-27 field incident). The advertised value now matches the
+/// enforced one.
+pub const DEFAULT_WATCHDOG_SECS: u32 = 10;
 /// Frame ring slot count (shared keyed-mutex textures).
 pub const DEFAULT_RING_SLOTS: u32 = 3;
 /// Hard ABI ceiling on ring slots.
