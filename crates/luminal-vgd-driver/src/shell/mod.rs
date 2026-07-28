@@ -194,11 +194,20 @@ pub(crate) struct Shell {
     /// completes. Keeps N workers failing off one GPU reset from queueing
     /// N duck tasks.
     pub tdr_duck_pending: std::sync::atomic::AtomicBool,
-    /// Duck cycles this adapter epoch. A wedge where device creation
+    /// Duck cycles in the current INCIDENT. A wedge where device creation
     /// succeeds but activation still fails would otherwise flap
     /// duck→replug→duck forever; past the cap the give-up path runs
-    /// instead. Reset by clear_adapter (a re-added device starts fresh).
+    /// instead. Reset by clear_adapter (a re-added device starts fresh)
+    /// and by run_tdr_duck when the last recovery is old enough that this
+    /// is clearly a NEW incident — three genuine, fully-recovered TDRs
+    /// spread across a long boot must not exhaust the budget and turn the
+    /// fourth into a silent abandon.
     pub tdr_duck_cycles: std::sync::atomic::AtomicU32,
+    /// Driver-clock ms of the last successful replug (0 = never). Used
+    /// only for the incident-window reset above; written by the effects
+    /// worker, read by run_tdr_duck on the same thread (atomic for the
+    /// cross-thread clear_adapter reset path).
+    pub tdr_last_recovery_ms: std::sync::atomic::AtomicU64,
     /// Set once the deferred adapter bring-up completes (effects worker,
     /// after EvtIddCxAdapterInitFinished); session IOCTLs are gated on
     /// this (control-plane requests can arrive first). Cleared at final
@@ -234,6 +243,7 @@ impl Shell {
             ducked: Mutex::new(Vec::new()),
             tdr_duck_pending: std::sync::atomic::AtomicBool::new(false),
             tdr_duck_cycles: std::sync::atomic::AtomicU32::new(0),
+            tdr_last_recovery_ms: std::sync::atomic::AtomicU64::new(0),
             adapter: Mutex::new(AdapterSlot::default()),
             wdf_device: Mutex::new(None),
             effects_tx: Mutex::new(control::start_effects_thread()),

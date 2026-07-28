@@ -555,8 +555,24 @@ fn run_tdr_duck(epoch: u64) {
         tracelogging::write_event!(PROVIDER, "TdrDuckStale", level(Warning));
         return;
     }
-    let cycle = shell.tdr_duck_cycles.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // A duck arriving long after the last successful recovery is a NEW
+    // incident, not a continuation of the old flap — reset the budget so
+    // sparse genuine TDRs across a long boot never exhaust it (which
+    // would silently abandon permanent-pool monitors on the 4th).
+    const INCIDENT_WINDOW_MS: u64 = 10 * 60 * 1000;
+    let last_recovery = shell.tdr_last_recovery_ms.load(std::sync::atomic::Ordering::SeqCst);
+    if last_recovery != 0 && shell.now_ms().saturating_sub(last_recovery) > INCIDENT_WINDOW_MS {
+        shell.tdr_duck_cycles.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
     let parked = monitors::duck_all(epoch);
+    if parked == 0 {
+        // Nothing to park (already unplugged, or torn down mid-loop):
+        // deliberately does NOT consume a cycle — spurious ducks must
+        // not eat the incident budget.
+        shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    let cycle = shell.tdr_duck_cycles.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     tracelogging::write_event!(
         PROVIDER,
         "TdrDuckStart",
@@ -564,10 +580,6 @@ fn run_tdr_duck(epoch: u64) {
         u64("parked", &(parked as u64)),
         u32("cycle", &cycle)
     );
-    if parked == 0 {
-        shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
-        return;
-    }
     if cycle > TDR_MAX_DUCK_CYCLES {
         // Flapping: recovery keeps "succeeding" and the monitors keep
         // failing. Stop churning modesets; only a reboot (or device
@@ -679,6 +691,12 @@ fn run_tdr_replug(epoch: u64) {
         tracelogging::write_event!(PROVIDER, "TdrReplugStale", level(Warning));
     } else {
         monitors::replug_ducked();
+        // Timestamp, not a counter reset: a flap re-ducks within seconds
+        // (well inside the incident window) so the cap still binds; only
+        // sustained stability starts a fresh budget.
+        shell
+            .tdr_last_recovery_ms
+            .store(shell.now_ms().max(1), std::sync::atomic::Ordering::SeqCst);
     }
     shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
 }
