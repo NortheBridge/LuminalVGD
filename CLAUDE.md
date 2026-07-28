@@ -679,9 +679,14 @@ discriminators are in the postmortem. Full analysis, fix plan (beta.5
 blockers + driver build-14 items), and the dev-machine
 evidence-collection checklist: `docs/POSTMORTEM-2026-07-27.md`.
 
-### Build 14 — TDR duck-out + watchdog contract (2026-07-27, UNVERIFIED — rides next signing round)
+### Build 14 — TDR duck-out + watchdog contract (2026-07-27; signed and released as v0.1.0-alpha.4 "Build 14" at user direction)
 
-Branch `feat/tdr-duck-out`. Addresses the incident's IddCx-class open
+[Field validation checklist below still to confirm on the installed
+build — warm stream, COLD BOOT + stream, sleep/resume,
+update-over-running-service, zero Tdr* events on a plain stream —
+before the next LuminalShine release ships the pair as default.]
+
+Merged from `feat/tdr-duck-out`. Addresses the incident's IddCx-class open
 question from the offensive side: when a frame worker's D3D device
 reports removal (GetDeviceRemovedReason — cannot fire on the routine
 ~10 ms unassign), the effects worker DEPARTS every monitor so a failing
