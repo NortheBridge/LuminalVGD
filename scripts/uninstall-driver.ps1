@@ -55,7 +55,7 @@ if ($oemInfs.Count -eq 0) {
 try {
     logman stop 'LuminalVGD' -ets *> $null
     Remove-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\LuminalVGD' -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-Item -Path (Join-Path $env:ProgramData 'LuminalShine\config\etw\luminalvgd.etl') -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $env:ProgramData 'LuminalShine\etw') -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "ETW AutoLogger removed."
 } catch {
     Write-Warning "ETW AutoLogger removal failed (continuing): $($_.Exception.Message)"

@@ -153,7 +153,11 @@ try {
     $etwSessionName = 'LuminalVGD'
     $etwProviderGuid = '{c501990d-df12-5581-60a8-f55d593d7f7c}'
     $etwSessionGuid = '{b7e5e8ab-6a7c-4e64-9f9e-4d1a2c50c5a1}'
-    $etwLogDir = Join-Path $env:ProgramData 'LuminalShine\config\etw'
+    # Deliberately OUTSIDE ProgramData\LuminalShine\config: that directory
+    # carries a protected DACL + System-IL no-write-up label that blocks
+    # directory creation from a manual elevated (non-SYSTEM) run — which
+    # is exactly how this script runs on the dev box.
+    $etwLogDir = Join-Path $env:ProgramData 'LuminalShine\etw'
     $etwLogFile = Join-Path $etwLogDir 'luminalvgd.etl'
 
     New-Item -ItemType Directory -Force -Path $etwLogDir | Out-Null
@@ -167,6 +171,10 @@ try {
     New-ItemProperty -Path $key -Name 'MaxFileSize' -Value 8 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path $key -Name 'BufferSize' -Value 16 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path $key -Name 'FlushTimer' -Value 5 -PropertyType DWord -Force | Out-Null
+    # CRITICAL: rotate per boot (the wedge is cleared BY rebooting — the
+    # previous boot's file IS the evidence; without FileMax the reboot
+    # overwrites it before it can be collected).
+    New-ItemProperty -Path $key -Name 'FileMax' -Value 3 -PropertyType DWord -Force | Out-Null
     $prov = Join-Path $key $etwProviderGuid
     New-Item -Path $prov -Force | Out-Null
     New-ItemProperty -Path $prov -Name 'Enabled' -Value 1 -PropertyType DWord -Force | Out-Null
@@ -174,11 +182,15 @@ try {
     # All keyword bits: -1 as Int64 carries the 0xFFFFFFFFFFFFFFFF pattern.
     New-ItemProperty -Path $prov -Name 'MatchAnyKeyword' -Value ([Int64]-1) -PropertyType QWord -Force | Out-Null
 
+    # Cover the current boot with a live session (-ft 5 so a hard power
+    # cut mid-wedge loses at most 5 s of events; distinct file name keeps
+    # it clear of the AutoLogger's rotation set).
     logman query $etwSessionName -ets *> $null
     if ($LASTEXITCODE -ne 0) {
-        logman create trace $etwSessionName -ets -o $etwLogFile -f bincirc -max 8 -bs 16 -p $etwProviderGuid 0xffffffffffffffff 0x5 *> $null
+        $liveFile = Join-Path $etwLogDir 'luminalvgd-live.etl'
+        logman create trace $etwSessionName -ets -o $liveFile -f bincirc -max 8 -bs 16 -ft 5 -p $etwProviderGuid 0xffffffffffffffff 0x5 *> $null
     }
-    Write-Host "ETW AutoLogger '$etwSessionName' registered (circular 8 MB at $etwLogFile)."
+    Write-Host "ETW AutoLogger '$etwSessionName' registered (circular 8 MB x3 boots at $etwLogDir)."
 } catch {
     Write-Warning "ETW AutoLogger setup failed (continuing): $($_.Exception.Message)"
 }
