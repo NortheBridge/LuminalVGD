@@ -90,6 +90,12 @@ typedef struct VgdCreateRequest {
    * NUL-padded UTF-16LE.
    */
   uint16_t friendly_name[32];
+  /**
+   * Desired HDR peak luminance in nits for the monitor EDID's
+   * CTA-861.3 block. 0 = driver default (≈993 nits). Ignored for SDR
+   * monitors and by pre-0.4 drivers (proto 0.4 additive field).
+   */
+  uint32_t max_nits;
 } VgdCreateRequest;
 
 typedef struct VgdCreateReply {

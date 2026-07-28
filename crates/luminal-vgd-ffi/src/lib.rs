@@ -97,6 +97,10 @@ pub struct VgdCreateRequest {
     pub physical_height_mm: u32,
     /// NUL-padded UTF-16LE.
     pub friendly_name: [u16; 32],
+    /// Desired HDR peak luminance in nits for the monitor EDID's
+    /// CTA-861.3 block. 0 = driver default (≈993 nits). Ignored for SDR
+    /// monitors and by pre-0.4 drivers (proto 0.4 additive field).
+    pub max_nits: u32,
 }
 
 #[repr(C)]
@@ -233,6 +237,8 @@ pub unsafe extern "C" fn vgd_create_monitor(
             hdr: r.hdr,
             edid_serial: 0,
             flags: r.flags,
+            max_nits: r.max_nits,
+            reserved0: 0,
             mode_count: r.mode_count,
             modes,
             physical_width_mm: r.physical_width_mm,

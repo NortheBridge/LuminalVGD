@@ -18,7 +18,7 @@ use luminal_driver_proto::{
     HandshakeRequest, PermanentPoolConfig, PingRequest, QueryLeaseReply, QueryLeaseRequest,
     QueryPermanentPoolReply, RingHeader, SetRenderAdapterRequest, SlotMetadata,
     CURSOR_HEADER_VERSION, CURSOR_MAGIC, CURSOR_SHAPE_OFFSET, LUMINAL_VGD_INTERFACE_GUID,
-    PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR, RING_SLOTS_OFFSET,
+    PROTO_VERSION_MAJOR, RING_SLOTS_OFFSET,
 };
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -147,9 +147,15 @@ impl VgdDevice {
     }
 
     pub fn handshake(&self) -> io::Result<HandshakeReply> {
+        // Announce the REQUIRED minor, not the compiled one: the driver's
+        // compat rule is driver_minor >= announced_minor, and this host
+        // degrades gracefully when 0.4-only fields are ignored (max_nits
+        // reads as the driver default on 0.3). Announcing the compiled
+        // minor would hard-fail every session against a build-14 (0.3)
+        // driver for a feature the host does not require.
         let req = HandshakeRequest {
             host_proto_major: PROTO_VERSION_MAJOR,
-            host_proto_minor: PROTO_VERSION_MINOR,
+            host_proto_minor: luminal_driver_proto::PROTO_VERSION_MINOR_REQUIRED,
         };
         self.ioctl_inout(ioctl::IOCTL_HANDSHAKE, &req)
     }

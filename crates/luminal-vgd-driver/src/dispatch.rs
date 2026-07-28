@@ -130,6 +130,24 @@ fn read_req<T: Copy>(input: &[u8]) -> Option<T> {
     Some(unsafe { core::ptr::read_unaligned(input.as_ptr().cast::<T>()) })
 }
 
+/// CREATE_MONITOR-specific reader: the other side of the additive-tail
+/// contract. A 0.3 host sends the legacy 168-byte request; the appended
+/// 0.4 fields (`max_nits`/`reserved0`) read as zeros — the documented
+/// "driver default" semantics — so old hosts keep working against new
+/// drivers with no version dance.
+fn read_create_request(input: &[u8]) -> Option<CreateMonitorRequest> {
+    if let Some(req) = read_req::<CreateMonitorRequest>(input) {
+        return Some(req);
+    }
+    if input.len() < luminal_driver_proto::CREATE_MONITOR_REQUEST_SIZE_V3 {
+        return None;
+    }
+    let mut padded = [0u8; core::mem::size_of::<CreateMonitorRequest>()];
+    padded[..luminal_driver_proto::CREATE_MONITOR_REQUEST_SIZE_V3]
+        .copy_from_slice(&input[..luminal_driver_proto::CREATE_MONITOR_REQUEST_SIZE_V3]);
+    Some(unsafe { core::ptr::read_unaligned(padded.as_ptr().cast::<CreateMonitorRequest>()) })
+}
+
 /// Write a full reply or nothing.
 fn write_reply<T: Copy>(output: &mut [u8], reply: &T) -> Option<usize> {
     let n = core::mem::size_of::<T>();
@@ -164,6 +182,7 @@ fn monitor_edid(m: &Monitor) -> [u8; 256] {
         product_code: m.product_code,
         physical_width_mm: m.physical_width_mm,
         physical_height_mm: m.physical_height_mm,
+        max_nits: m.max_nits,
     })
     .bytes
 }
@@ -323,7 +342,7 @@ pub fn dispatch(
         }
 
         ioctl::IOCTL_CREATE_MONITOR => {
-            let Some(req) = read_req::<CreateMonitorRequest>(input) else {
+            let Some(req) = read_create_request(input) else {
                 return DispatchResult::bad_buffer();
             };
             let mut reply = CreateMonitorReply {
@@ -588,6 +607,8 @@ mod tests {
             physical_width_mm: 0,
             physical_height_mm: 0,
             friendly_name: [0; 32],
+            max_nits: 0,
+            reserved0: 0,
         }
     }
 
@@ -633,6 +654,57 @@ mod tests {
             Effect::PersistState(blob) => {
                 let state = persist::parse(blob).unwrap();
                 assert_eq!(state.reservations, vec![(0xCAFE, 0)]);
+            }
+            other => panic!("unexpected effect {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_v3_sized_create_request_is_accepted_with_default_nits() {
+        // A proto-0.3 host sends the 168-byte CreateMonitorRequest (no
+        // max_nits/reserved0 tail). The driver must accept it and treat
+        // the missing tail as zeros — i.e. the default-luminance EDID.
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        let req = create_req(0xB2);
+        let full = as_bytes(&req);
+        let legacy = &full[..luminal_driver_proto::CREATE_MONITOR_REQUEST_SIZE_V3];
+        let mut out = vec![0u8; core::mem::size_of::<CreateMonitorReply>()];
+        let r = dispatch(&mut d, &mut h, 1000, ioctl::IOCTL_CREATE_MONITOR, legacy, &mut out);
+        assert_eq!(r.status, Status::Ok);
+        let reply: CreateMonitorReply = from_bytes(&out);
+        assert_eq!(reply.result, err::OK);
+        // And anything SHORTER than the legacy size stays rejected.
+        let mut out2 = vec![0u8; core::mem::size_of::<CreateMonitorReply>()];
+        let r2 = dispatch(
+            &mut d,
+            &mut h,
+            1000,
+            ioctl::IOCTL_CREATE_MONITOR,
+            &full[..luminal_driver_proto::CREATE_MONITOR_REQUEST_SIZE_V3 - 4],
+            &mut out2,
+        );
+        assert_eq!(r2.status, Status::BadBuffer);
+    }
+
+    #[test]
+    fn create_request_nits_reaches_the_edid() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        let mut req = create_req(0xC3);
+        req.bit_depth = 110;
+        req.hdr = 1;
+        req.max_nits = 800;
+        let (reply, effects) = do_create(&mut d, &mut h, &req);
+        assert_eq!(reply.result, err::OK);
+        match &effects[0] {
+            Effect::PlugMonitor { edid, .. } => {
+                // CTA extension: colorimetry block at ext[4..8], HDR
+                // metadata block at ext[8..15]; max-luminance code is
+                // ext[12] (absolute byte 140). 800 nits = code 128.
+                assert_eq!(edid[140], 128, "max luminance code for 800 nits");
             }
             other => panic!("unexpected effect {other:?}"),
         }

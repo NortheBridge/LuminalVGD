@@ -65,6 +65,12 @@ pub fn member_request(config: &PermanentPoolConfig, index: u32) -> CreateMonitor
         physical_width_mm: config.physical_width_mm,
         physical_height_mm: config.physical_height_mm,
         friendly_name: config.name,
+        // Pool displays keep the driver-default HDR luminance: adding a
+        // nits field to PermanentPoolConfig would re-layout the persisted
+        // blob and drop existing pools on upgrade (persist::parse is
+        // defensive). Revisit under a persist-format version bump.
+        max_nits: 0,
+        reserved0: 0,
     }
 }
 
