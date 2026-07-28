@@ -32,7 +32,20 @@ pub const PROTO_VERSION_MAJOR: u16 = 0;
 /// monitors, physical dimensions, cursor section, permanent pool, render-
 /// adapter IOCTL (libvirtualdisplay behavior fold-in; see
 /// THIRD-PARTY-NOTICES.md).
-pub const PROTO_VERSION_MINOR: u16 = 3;
+/// v0.4: `CreateMonitorRequest.max_nits` (host-configurable HDR peak
+/// luminance for the EDID CTA-861.3 block; 0 = the 0.3 default). Purely
+/// additive: the driver accepts the legacy 0.3 request size (missing
+/// tail reads as zeros), so hosts should announce
+/// [`PROTO_VERSION_MINOR_REQUIRED`] at handshake — not this constant —
+/// unless they genuinely refuse to run without 0.4 features.
+pub const PROTO_VERSION_MINOR: u16 = 4;
+
+/// The minimum driver minor a host actually REQUIRES. Hosts that degrade
+/// gracefully when 0.4 fields are ignored (the nits value simply stays at
+/// the driver default) announce this at handshake so 0.3 drivers keep
+/// working; `versions_compatible` treats the announced value as the
+/// host's floor.
+pub const PROTO_VERSION_MINOR_REQUIRED: u16 = 3;
 
 /// Device interface GUID for the LuminalVGD control device.
 /// {B3A7F2D4-6E1C-4A98-9D3B-5C0E8F714A26} — LuminalVGD-owned; do not reuse
@@ -347,7 +360,20 @@ pub struct CreateMonitorRequest {
     /// Monitor friendly name for the EDID descriptor, NUL-padded UTF-16LE
     /// (truncated to 13 chars by EDID rules; longer is fine here).
     pub friendly_name: [u16; 32],
+    /// Desired HDR peak luminance ("max nits") for the EDID's CTA-861.3
+    /// block. 0 => driver default (≈993 nits — the pre-0.4 behavior, and
+    /// what a zero-initialized or legacy 0.3-sized request yields).
+    /// Quantized to the CTA 8-bit log code (~2% steps, floor ≈51 nits).
+    /// Ignored for SDR monitors. Added in proto 0.4.
+    pub max_nits: u32,
+    /// Reserved alignment partner for `max_nits`; must be 0.
+    pub reserved0: u32,
 }
+
+/// Byte size of `CreateMonitorRequest` before proto 0.4 appended
+/// `max_nits`/`reserved0`. Drivers accept this legacy size and treat the
+/// missing tail as zeros so 0.3 hosts keep working unchanged.
+pub const CREATE_MONITOR_REQUEST_SIZE_V3: usize = 168;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -757,8 +783,11 @@ mod layout_tests {
 
     const_assert_eq!(size_of::<ModeSpec>(), 12);
 
-    const_assert_eq!(size_of::<CreateMonitorRequest>(), 168);
+    // 0.4: 168 (v0.3) + max_nits u32 + reserved0 u32 = 176. The legacy
+    // size stays a named constant because drivers accept it forever.
+    const_assert_eq!(size_of::<CreateMonitorRequest>(), 176);
     const_assert_eq!(align_of::<CreateMonitorRequest>(), 8);
+    const_assert_eq!(CREATE_MONITOR_REQUEST_SIZE_V3, 168);
 
     const_assert_eq!(size_of::<CreateMonitorReply>(), 160);
     const_assert_eq!(align_of::<CreateMonitorReply>(), 8);

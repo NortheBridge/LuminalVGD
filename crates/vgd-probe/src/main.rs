@@ -203,6 +203,8 @@ fn main() -> ExitCode {
         physical_width_mm: 0,
         physical_height_mm: 0,
         friendly_name,
+        max_nits: 0,
+        reserved0: 0,
     };
     let reply = match dev.create_monitor(&req) {
         Ok(r) => r,

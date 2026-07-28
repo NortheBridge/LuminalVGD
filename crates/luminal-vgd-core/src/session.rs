@@ -49,6 +49,9 @@ pub struct Monitor {
     pub adapter_luid: u64,
     pub physical_width_mm: u32,
     pub physical_height_mm: u32,
+    /// Desired HDR peak luminance in nits for the EDID's CTA-861.3 block.
+    /// 0 => driver default (≈993 nits). Proto 0.4.
+    pub max_nits: u32,
     pub friendly_name: [u16; 32],
     pub flags: u32,
     /// Effective lease timeout in ms; `u32::MAX` = never expires.
@@ -253,6 +256,7 @@ impl SessionTable {
             adapter_luid,
             physical_width_mm: req.physical_width_mm,
             physical_height_mm: req.physical_height_mm,
+            max_nits: req.max_nits,
             friendly_name: req.friendly_name,
             flags: req.flags,
             lease_timeout_ms: effective_lease_timeout(req.lease_timeout_ms, self.watchdog_secs),
@@ -430,6 +434,8 @@ mod tests {
             physical_width_mm: 0,
             physical_height_mm: 0,
             friendly_name: [0; 32],
+            max_nits: 0,
+            reserved0: 0,
         }
     }
 
