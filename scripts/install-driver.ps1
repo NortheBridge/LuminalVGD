@@ -140,4 +140,46 @@ if ($dev) {
     $inf = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_DriverInfPath' -ErrorAction SilentlyContinue).Data
     if ($inf) { Write-Host "Driver bound: $inf" } else { Write-Warning "devnode present but no driver bound yet — re-run 'pnputil /scan-devices'" }
 }
+
+# --- ETW persistence --------------------------------------------------------
+# TraceLogging events are LOST unless a session is recording when they fire;
+# both failed-TDR-recovery postmortems (2026-07-27, 2026-07-28) ended at "no
+# trace was capturing — duck-out behavior unverifiable". Register a small
+# circular AutoLogger on the provider (records from every boot) and start an
+# identical live session for the current boot. Best-effort: diagnostics must
+# never fail an install. Mirrors the LuminalShine MSI driver script — keep
+# the two in sync.
+try {
+    $etwSessionName = 'LuminalVGD'
+    $etwProviderGuid = '{c501990d-df12-5581-60a8-f55d593d7f7c}'
+    $etwSessionGuid = '{b7e5e8ab-6a7c-4e64-9f9e-4d1a2c50c5a1}'
+    $etwLogDir = Join-Path $env:ProgramData 'LuminalShine\config\etw'
+    $etwLogFile = Join-Path $etwLogDir 'luminalvgd.etl'
+
+    New-Item -ItemType Directory -Force -Path $etwLogDir | Out-Null
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\$etwSessionName"
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'GUID' -Value $etwSessionGuid -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'Start' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'FileName' -Value $etwLogFile -PropertyType String -Force | Out-Null
+    # 0x2 = EVENT_TRACE_FILE_MODE_CIRCULAR
+    New-ItemProperty -Path $key -Name 'LogFileMode' -Value 2 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'MaxFileSize' -Value 8 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'BufferSize' -Value 16 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'FlushTimer' -Value 5 -PropertyType DWord -Force | Out-Null
+    $prov = Join-Path $key $etwProviderGuid
+    New-Item -Path $prov -Force | Out-Null
+    New-ItemProperty -Path $prov -Name 'Enabled' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $prov -Name 'EnableLevel' -Value 5 -PropertyType DWord -Force | Out-Null
+    # All keyword bits: -1 as Int64 carries the 0xFFFFFFFFFFFFFFFF pattern.
+    New-ItemProperty -Path $prov -Name 'MatchAnyKeyword' -Value ([Int64]-1) -PropertyType QWord -Force | Out-Null
+
+    logman query $etwSessionName -ets *> $null
+    if ($LASTEXITCODE -ne 0) {
+        logman create trace $etwSessionName -ets -o $etwLogFile -f bincirc -max 8 -bs 16 -p $etwProviderGuid 0xffffffffffffffff 0x5 *> $null
+    }
+    Write-Host "ETW AutoLogger '$etwSessionName' registered (circular 8 MB at $etwLogFile)."
+} catch {
+    Write-Warning "ETW AutoLogger setup failed (continuing): $($_.Exception.Message)"
+}
 Write-Host "Verify with: cargo run -p vgd-probe --release"

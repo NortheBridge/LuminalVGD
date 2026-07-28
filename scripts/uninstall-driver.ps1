@@ -51,7 +51,17 @@ if ($oemInfs.Count -eq 0) {
     }
 }
 
-# 3. Optional: remove the signer certificate from TrustedPublisher.
+# 3. Remove the ETW AutoLogger registered by install-driver.ps1 (best-effort).
+try {
+    logman stop 'LuminalVGD' -ets *> $null
+    Remove-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\LuminalVGD' -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $env:ProgramData 'LuminalShine\config\etw\luminalvgd.etl') -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "ETW AutoLogger removed."
+} catch {
+    Write-Warning "ETW AutoLogger removal failed (continuing): $($_.Exception.Message)"
+}
+
+# 4. Optional: remove the signer certificate from TrustedPublisher.
 if ($RemovePublisherCert) {
     $subjects = Get-ChildItem Cert:\LocalMachine\TrustedPublisher |
         Where-Object Subject -like '*NortheBridge*'
