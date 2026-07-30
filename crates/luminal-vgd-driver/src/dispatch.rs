@@ -19,8 +19,8 @@
 use luminal_driver_proto::{
     err, ioctl, names, versions_compatible, CreateMonitorReply, CreateMonitorRequest,
     DestroyMonitorRequest, HandshakeRequest, PermanentPoolConfig, PingRequest,
-    QueryLeaseReply, QueryLeaseRequest, SetRenderAdapterRequest, ABI_MAX_RING_SLOTS,
-    DEFAULT_RING_SLOTS,
+    QueryLeaseReply, QueryLeaseRequest, SetRenderAdapterRequest, UpdateModesReply,
+    UpdateModesRequest, ABI_MAX_RING_SLOTS, DEFAULT_RING_SLOTS, MAX_MODES_PER_MONITOR,
 };
 use luminal_vgd_core::adapter::AdapterInfo;
 use luminal_vgd_core::edid::{self, EdidParams};
@@ -114,6 +114,18 @@ pub enum Effect {
     /// Unplug the monitor and free its ring (explicit destroy, pool
     /// shrink, or watchdog reap).
     UnplugMonitor { session_id: u64 },
+    /// Replace the mode list a LIVE monitor advertises (proto 0.5
+    /// `UPDATE_MODES`) — no departure, no re-arrival, no ring churn.
+    ///
+    /// `modes` is the FULL post-merge list, already validated and already
+    /// a superset of what the monitor advertises, so the shell never has
+    /// to reason about what to keep. It exists as an Effect (rather than
+    /// as work done inline in `dispatch`) for the same reason plug and
+    /// unplug do: applying it calls `IddCxMonitorUpdateModes2`, which the
+    /// OS answers by re-entering our mode DDIs synchronously, and that
+    /// may only ever happen on the effects worker with no lock held
+    /// (DESIGN.md §3.3 rule 3).
+    UpdateModes { session_id: u64, modes: Vec<Mode> },
     /// Store this blob under the device registry key; hand it back to
     /// `DeviceState::new` on next start (identity retention + pool).
     PersistState(Vec<u8>),
@@ -171,6 +183,27 @@ fn read_create_request(input: &[u8]) -> Option<CreateMonitorRequest> {
     padded[..luminal_driver_proto::CREATE_MONITOR_REQUEST_SIZE_V3]
         .copy_from_slice(&input[..luminal_driver_proto::CREATE_MONITOR_REQUEST_SIZE_V3]);
     Some(unsafe { core::ptr::read_unaligned(padded.as_ptr().cast::<CreateMonitorRequest>()) })
+}
+
+/// UPDATE_MODES-specific reader (proto 0.5). Identical in shape to
+/// [`read_create_request`] and present from the opcode's first day: the
+/// full size first, then exactly one named legacy size with the tail
+/// zero-padded. Today the two sizes are the same, so this is a plain
+/// read — the point is that the NEXT minor which appends a field only has
+/// to add a `UPDATE_MODES_REQUEST_SIZE_V<n>` constant and one branch,
+/// instead of reconstructing the baseline after the fact the way
+/// `CREATE_MONITOR_REQUEST_SIZE_V3` had to be.
+fn read_update_modes_request(input: &[u8]) -> Option<UpdateModesRequest> {
+    if let Some(req) = read_req::<UpdateModesRequest>(input) {
+        return Some(req);
+    }
+    if input.len() < luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5 {
+        return None;
+    }
+    let mut padded = [0u8; core::mem::size_of::<UpdateModesRequest>()];
+    padded[..luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5]
+        .copy_from_slice(&input[..luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5]);
+    Some(unsafe { core::ptr::read_unaligned(padded.as_ptr().cast::<UpdateModesRequest>()) })
 }
 
 /// Write a full reply or nothing.
@@ -454,6 +487,84 @@ pub fn dispatch(
             }
         }
 
+        ioctl::IOCTL_UPDATE_MODES => {
+            let Some(req) = read_update_modes_request(input) else {
+                return DispatchResult::bad_buffer();
+            };
+            // Check the OUTPUT buffer before touching the table. Every
+            // other opcode validates it only at write_reply time, which
+            // leaves a caller with a short output buffer having mutated
+            // the session while the effect that would have told the OS is
+            // dropped with the BadBuffer result. Harmless for a create
+            // (the session simply exists un-plugged and the watchdog
+            // reaps it); NOT harmless here, where it would silently
+            // diverge the durable list from the advertised one for the
+            // rest of the session's life.
+            if output.len() < core::mem::size_of::<UpdateModesReply>() {
+                return DispatchResult::bad_buffer();
+            }
+            let mut reply = UpdateModesReply {
+                session_id: req.session_id,
+                result: err::OK,
+                mode_count: 0,
+                reserved: [0; 6],
+            };
+            let mut effects = Vec::new();
+            // `mode_count` in force on ANY outcome except "no such
+            // session", so a host that is refused still learns what the
+            // monitor is advertising right now rather than guessing.
+            let current = dev
+                .table
+                .get(req.session_id)
+                .map(|m| m.modes.len() as u32)
+                .unwrap_or(0);
+            reply.mode_count = current;
+            if !handle.handshaken {
+                reply.result = err::NOT_HANDSHAKEN;
+            } else if req.mode_count == 0
+                || req.mode_count > MAX_MODES_PER_MONITOR
+                || req.mode_count as usize > req.modes.len()
+            {
+                // Bounds-check before slicing; `validate_list` would reject
+                // these too, but a panic-free slice is not optional in a
+                // driver reading an untrusted buffer.
+                reply.result = err::BAD_MODE;
+            } else {
+                // `flags` is deliberately not validated: unknown bits are
+                // IGNORED, matching create_flags, so a newer host cannot
+                // be refused by an older driver over a bit it set. A
+                // future flag that changes semantics ships with its own
+                // caps bit instead.
+                let specs = &req.modes[..req.mode_count as usize];
+                match dev.table.update_modes(req.session_id, specs, dev.cfg.caps) {
+                    Ok((modes, added)) => {
+                        reply.mode_count = modes.len() as u32;
+                        // added == 0 ⇒ the list is already a superset of
+                        // the request. Report success and emit NO effect:
+                        // pushing an unchanged list at the OS is a modeset
+                        // risk taken for nothing.
+                        if added > 0 {
+                            effects.push(Effect::UpdateModes {
+                                session_id: req.session_id,
+                                modes,
+                            });
+                        }
+                        // No PersistState: the blob carries identity
+                        // reservations and the pool config only — never
+                        // mode lists — so there is nothing new to write.
+                        // The merged list still survives an in-process
+                        // replug because it lives in the session table,
+                        // which is what `plug_effect` reads.
+                    }
+                    Err(e) => reply.result = e.code(),
+                }
+            }
+            match write_reply(output, &reply) {
+                Some(n) => DispatchResult { status: Status::Ok, bytes_written: n, effects },
+                None => DispatchResult::bad_buffer(),
+            }
+        }
+
         ioctl::IOCTL_PING => {
             let Some(req) = read_req::<PingRequest>(input) else {
                 return DispatchResult::bad_buffer();
@@ -593,7 +704,8 @@ mod tests {
     use super::*;
     use luminal_driver_proto::{
         caps, GetStatusReply, HandshakeReply, ModeSpec, QueryPermanentPoolReply,
-        LEASE_TIMEOUT_USE_DEFAULT, PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR,
+        UpdateModesReply, UpdateModesRequest, LEASE_TIMEOUT_USE_DEFAULT, PROTO_VERSION_MAJOR,
+        PROTO_VERSION_MINOR,
     };
 
     const CAPS: u32 =
@@ -1038,6 +1150,252 @@ mod tests {
         let effects = watchdog_tick(&mut d, 4_001);
         assert_eq!(effects[0], Effect::UnplugMonitor { session_id: 1 });
         assert!(matches!(effects[1], Effect::PersistState(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Build 17 / proto 0.5: UPDATE_MODES.
+    // -----------------------------------------------------------------
+
+    fn update_req(session_id: u64, specs: &[ModeSpec]) -> UpdateModesRequest {
+        let mut modes = [ModeSpec::default(); 4];
+        modes[..specs.len()].copy_from_slice(specs);
+        UpdateModesRequest {
+            session_id,
+            flags: 0,
+            mode_count: specs.len() as u32,
+            modes,
+            reserved: [0; 4],
+        }
+    }
+
+    fn do_update(
+        d: &mut DeviceState,
+        h: &mut HandleCtx,
+        req: &UpdateModesRequest,
+    ) -> (UpdateModesReply, Vec<Effect>) {
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(d, h, 2000, ioctl::IOCTL_UPDATE_MODES, &as_bytes(req), &mut out);
+        assert_eq!(r.status, Status::Ok);
+        (from_bytes(&out), r.effects)
+    }
+
+    /// The build-17 milestone in one test: a monitor created at the base
+    /// rate (the Moonlight "Desktop" stream) gains the
+    /// frame-generation-doubled rate on a LIVE session — one UpdateModes
+    /// effect, no unplug, no plug, no monitor cycle anywhere.
+    #[test]
+    fn update_modes_adds_the_framegen_rate_to_a_live_monitor() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &create_req(0xD4));
+
+        let base = ModeSpec { width: 2560, height: 1440, refresh_millihz: 120_000 };
+        let doubled = ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 };
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xD4, &[base, doubled]));
+        assert_eq!(reply.result, err::OK);
+        assert_eq!(reply.session_id, 0xD4);
+        assert_eq!(reply.mode_count, 2);
+
+        assert_eq!(effects.len(), 1, "no plug, no unplug, no persist");
+        match &effects[0] {
+            Effect::UpdateModes { session_id, modes } => {
+                assert_eq!(*session_id, 0xD4);
+                assert_eq!(modes.len(), 2);
+                assert_eq!(modes[0].refresh_millihz, 120_000, "preferred mode preserved");
+                assert_eq!(modes[1].refresh_millihz, 240_000);
+            }
+            other => panic!("unexpected effect {other:?}"),
+        }
+        // Durable copy updated, so a replug-from-DeviceState carries it.
+        assert_eq!(d.table.get(0xD4).unwrap().modes.len(), 2);
+
+        // Resending the same desired list is a no-op: no effect at all, so
+        // the OS is never asked to renegotiate for nothing.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xD4, &[base, doubled]));
+        assert_eq!((reply.result, reply.mode_count), (err::OK, 2));
+        assert!(effects.is_empty());
+    }
+
+    /// Constraint 1: every refusal is a REPLY code with the current mode
+    /// count intact — never a failed IRP, never an effect, never a
+    /// disturbed session.
+    #[test]
+    fn update_modes_refusals_leave_the_session_alone() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &create_req(9));
+        let good = ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 };
+
+        // Not handshaken: refused, and the live count still reported.
+        let mut un = HandleCtx::default();
+        let (reply, effects) = do_update(&mut d, &mut un, &update_req(9, &[good]));
+        assert_eq!(reply.result, err::NOT_HANDSHAKEN);
+        assert_eq!(reply.mode_count, 1, "modes in force still reported");
+        assert!(effects.is_empty());
+
+        // Unknown session: 0 modes in force is the one case that means
+        // "there is nothing there".
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(1234, &[good]));
+        assert_eq!((reply.result, reply.mode_count), (err::NO_SUCH_SESSION, 0));
+        assert!(effects.is_empty());
+
+        // mode_count 0 and mode_count > MAX are both bounds-checked
+        // before anything slices the array.
+        let mut empty = update_req(9, &[good]);
+        empty.mode_count = 0;
+        let (reply, effects) = do_update(&mut d, &mut h, &empty);
+        assert_eq!((reply.result, reply.mode_count), (err::BAD_MODE, 1));
+        assert!(effects.is_empty());
+        let mut too_many = update_req(9, &[good]);
+        too_many.mode_count = luminal_driver_proto::MAX_MODES_PER_MONITOR + 1;
+        assert_eq!(do_update(&mut d, &mut h, &too_many).0.result, err::BAD_MODE);
+
+        // Out-of-envelope mode.
+        let bad = ModeSpec { width: 3, height: 3, refresh_millihz: 1 };
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(9, &[bad]));
+        assert_eq!((reply.result, reply.mode_count), (err::BAD_MODE, 1));
+        assert!(effects.is_empty());
+
+        // Short input and short output buffers stay BadBuffer.
+        let full = as_bytes(&update_req(9, &[good]));
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(
+            &mut d, &mut h, 0, ioctl::IOCTL_UPDATE_MODES,
+            &full[..luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5 - 4], &mut out,
+        );
+        assert_eq!(r.status, Status::BadBuffer);
+        // A short OUTPUT buffer must be rejected BEFORE the table is
+        // touched: the effect would be dropped with the BadBuffer result,
+        // so a mutation here would leave the durable list permanently
+        // ahead of what the monitor advertises.
+        let mut tiny = vec![0u8; 8];
+        let r = dispatch(&mut d, &mut h, 0, ioctl::IOCTL_UPDATE_MODES, &full, &mut tiny);
+        assert_eq!(r.status, Status::BadBuffer);
+        assert!(r.effects.is_empty());
+        assert_eq!(d.table.get(9).unwrap().modes.len(), 1, "short reply buffer changed nothing");
+
+        // Through all of that, the monitor never changed.
+        assert_eq!(d.table.get(9).unwrap().modes.len(), 1);
+    }
+
+    /// FORWARD compatibility, request side: a FUTURE host that appends
+    /// fields sends a LARGER buffer, and this driver must accept it and
+    /// ignore the tail — that is the whole additive-growth contract, and
+    /// it only works if the exact 0.5 size is also still accepted.
+    #[test]
+    fn update_modes_accepts_the_v5_size_and_a_future_larger_request() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &create_req(11));
+        let doubled = ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 };
+        let full = as_bytes(&update_req(11, &[doubled]));
+        assert_eq!(full.len(), luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5);
+
+        // Exactly the 0.5 size.
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(&mut d, &mut h, 0, ioctl::IOCTL_UPDATE_MODES, &full, &mut out);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(from_bytes::<UpdateModesReply>(&out).result, err::OK);
+
+        // A hypothetical 0.6 host: same prefix, 32 bytes of new tail.
+        let mut d2 = dev();
+        let mut h2 = HandleCtx::default();
+        shake(&mut d2, &mut h2);
+        do_create(&mut d2, &mut h2, &create_req(11));
+        let mut future = full.clone();
+        future.extend_from_slice(&[0xAB; 32]);
+        let mut out2 = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(&mut d2, &mut h2, 0, ioctl::IOCTL_UPDATE_MODES, &future, &mut out2);
+        assert_eq!(r.status, Status::Ok);
+        let reply: UpdateModesReply = from_bytes(&out2);
+        assert_eq!((reply.result, reply.mode_count), (err::OK, 2));
+
+        // Unknown flag bits are IGNORED, not refused — an older driver
+        // must never reject a newer host over a bit it does not know.
+        let mut flagged = update_req(11, &[ModeSpec { width: 1920, height: 1080, refresh_millihz: 60_000 }]);
+        flagged.flags = 0xDEAD_BEEF;
+        assert_eq!(do_update(&mut d2, &mut h2, &flagged).0.result, err::OK);
+    }
+
+    /// BACKWARD compatibility, the direction that matters most: a host
+    /// built against proto 0.3/0.4 — which announces the required FLOOR,
+    /// not its compiled minor — still handshakes against this 0.5 driver
+    /// and drives every pre-0.5 opcode unchanged. It simply never sends
+    /// 0x809.
+    #[test]
+    fn a_pre_05_host_is_completely_unaffected_by_the_new_opcode() {
+        for announced in [3u16, 4u16] {
+            let mut d = dev();
+            let mut h = HandleCtx::default();
+            let req = HandshakeRequest {
+                host_proto_major: PROTO_VERSION_MAJOR,
+                host_proto_minor: announced,
+            };
+            let mut out = vec![0u8; core::mem::size_of::<HandshakeReply>()];
+            let r = dispatch(&mut d, &mut h, 0, ioctl::IOCTL_HANDSHAKE, &as_bytes(&req), &mut out);
+            assert_eq!(r.status, Status::Ok);
+            let reply: HandshakeReply = from_bytes(&out);
+            assert_eq!(reply.driver_proto_minor, PROTO_VERSION_MINOR);
+            assert_eq!(reply.driver_proto_minor, 5);
+            assert!(h.handshaken, "0.{announced} host still handshakes against 0.5");
+
+            // And its session IOCTLs still work.
+            let (create, effects) = do_create(&mut d, &mut h, &create_req(3));
+            assert_eq!(create.result, err::OK);
+            assert!(matches!(effects[0], Effect::PlugMonitor { .. }));
+        }
+    }
+
+    /// The structural backstop for the other direction: a build-17 HOST
+    /// talking to an older driver. There is no way to simulate an old
+    /// driver here, so the property under test is the one that makes the
+    /// fallback safe — an unrecognized code produces `UnknownCode`
+    /// (STATUS_INVALID_DEVICE_REQUEST → an I/O error host-side), never a
+    /// zero-filled reply that could read as success.
+    #[test]
+    fn an_unknown_opcode_can_never_look_like_an_update_modes_success() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(
+            &mut d, &mut h, 0, ioctl::ctl_code(0x80A),
+            &as_bytes(&update_req(1, &[ModeSpec { width: 1920, height: 1080, refresh_millihz: 60_000 }])),
+            &mut out,
+        );
+        assert_eq!(r.status, Status::UnknownCode);
+        assert_eq!(r.bytes_written, 0, "nothing written — no false success");
+        assert!(r.effects.is_empty());
+    }
+
+    /// The caps bit is the host's feature gate, so it has to be ON in the
+    /// handshake this driver actually returns — not merely defined.
+    #[test]
+    fn handshake_advertises_dynamic_modes_when_the_driver_has_it() {
+        let mut d = DeviceState::new(
+            DriverConfig {
+                caps: CAPS | caps::DYNAMIC_MODES,
+                driver_build: 17,
+                ..DriverConfig::default()
+            },
+            None,
+        );
+        let mut h = HandleCtx::default();
+        let mut out = vec![0u8; core::mem::size_of::<HandshakeReply>()];
+        dispatch(
+            &mut d, &mut h, 0, ioctl::IOCTL_HANDSHAKE,
+            &as_bytes(&HandshakeRequest {
+                host_proto_major: PROTO_VERSION_MAJOR,
+                host_proto_minor: luminal_driver_proto::PROTO_VERSION_MINOR_REQUIRED,
+            }),
+            &mut out,
+        );
+        let reply: HandshakeReply = from_bytes(&out);
+        assert_ne!(reply.caps & caps::DYNAMIC_MODES, 0);
+        assert_eq!(reply.driver_build, 17);
     }
 
     #[test]

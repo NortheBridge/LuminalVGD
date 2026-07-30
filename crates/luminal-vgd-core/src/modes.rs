@@ -125,6 +125,45 @@ impl Mode {
         }
         Ok(out)
     }
+
+    /// Additive merge for `UPDATE_MODES` (proto 0.5): return `current`
+    /// with every entry of `added` that is not already advertised
+    /// appended, capped at `MAX_MODES_PER_MONITOR`.
+    ///
+    /// Append-only is the whole safety argument for changing the mode list
+    /// of a LIVE monitor, and every clause below is load-bearing:
+    ///
+    /// - `current[0]` is never displaced, so the EDID's preferred detailed
+    ///   timing (frozen at `IddCxMonitorCreate`, and NOT reissuable
+    ///   afterwards) keeps describing the mode the driver still calls
+    ///   preferred, and `PreferredMonitorModeIdx = 0` keeps meaning what
+    ///   the OS was told at arrival.
+    /// - No entry is ever removed, so the mode the OS currently has
+    ///   COMMITTED is still in the list after the update. The driver
+    ///   cannot identify the committed mode (`EvtIddCxMonitorCommitModes2`
+    ///   stores nothing), so "never drop anything" is the only way to
+    ///   guarantee the update does not invalidate it — which is what keeps
+    ///   an update from forcing a modeset on a live stream.
+    /// - Duplicates collapse, so a host that resends its full desired list
+    ///   every time is idempotent rather than cap-exhausting.
+    ///
+    /// Returns `(merged, added_count)`. `added_count == 0` means the
+    /// update is a no-op and the caller should not disturb the OS at all.
+    pub fn merge_additive(current: &[Mode], added: &[Mode]) -> (Vec<Mode>, usize) {
+        let mut out = current.to_vec();
+        let mut appended = 0usize;
+        for mode in added {
+            if out.len() >= MAX_MODES_PER_MONITOR as usize {
+                break;
+            }
+            if out.contains(mode) {
+                continue;
+            }
+            out.push(*mode);
+            appended += 1;
+        }
+        (out, appended)
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +267,55 @@ mod tests {
         // Duplicates rejected.
         let dup = [specs[0], specs[0]];
         assert_eq!(Mode::validate_list(&dup, 2, 8, 0, ALL_CAPS).err(), Some(CoreError::BadMode));
+    }
+
+    fn m(hz: u32) -> Mode {
+        Mode::validate(2560, 1440, hz, 8, 0, ALL_CAPS).unwrap()
+    }
+
+    /// Build 17: the merge that makes a live mode list growable. The
+    /// motivating case is the whole reason the opcode exists — a monitor
+    /// created at the base rate for a Moonlight desktop stream, then a
+    /// frame-generation game launches and the doubled rate has to become
+    /// available WITHOUT a destroy/create cycle.
+    #[test]
+    fn additive_merge_adds_the_framegen_rate_without_disturbing_the_live_one() {
+        let live = vec![m(120_000)];
+        let (merged, added) = Mode::merge_additive(&live, &[m(240_000)]);
+        assert_eq!(added, 1);
+        assert_eq!(merged, vec![m(120_000), m(240_000)]);
+        // Preferred timing untouched: the EDID still describes modes[0].
+        assert_eq!(merged[0], live[0]);
+    }
+
+    #[test]
+    fn additive_merge_never_removes_and_never_reorders() {
+        let live = vec![m(120_000), m(240_000)];
+        // A host asking for ONLY the doubled rate cannot drop the base
+        // rate — the OS may have it committed right now.
+        let (merged, added) = Mode::merge_additive(&live, &[m(240_000)]);
+        assert_eq!((merged.as_slice(), added), (live.as_slice(), 0));
+        // Nor can it promote a later mode to preferred.
+        let (merged, added) = Mode::merge_additive(&live, &[m(240_000), m(60_000)]);
+        assert_eq!(merged, vec![m(120_000), m(240_000), m(60_000)]);
+        assert_eq!(added, 1);
+        assert_eq!(merged[0], live[0]);
+    }
+
+    #[test]
+    fn additive_merge_is_idempotent_and_capped() {
+        let live = vec![m(120_000)];
+        let want = [m(120_000), m(240_000)];
+        let (once, added_once) = Mode::merge_additive(&live, &want);
+        let (twice, added_twice) = Mode::merge_additive(&once, &want);
+        assert_eq!(once, twice, "resending the same desired list changes nothing");
+        assert_eq!((added_once, added_twice), (1, 0));
+
+        // At the cap, extra entries are dropped rather than displacing
+        // anything already advertised.
+        let full = vec![m(60_000), m(90_000), m(120_000), m(240_000)];
+        assert_eq!(full.len(), MAX_MODES_PER_MONITOR as usize);
+        let (merged, added) = Mode::merge_additive(&full, &[m(30_000)]);
+        assert_eq!((merged, added), (full, 0));
     }
 }

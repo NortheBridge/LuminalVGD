@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use luminal_driver_proto::{
     create_flags, err, ring_state, CreateMonitorRequest, GetStatusReply, ModeSpec,
-    LEASE_TIMEOUT_USE_DEFAULT, MAX_MODES_PER_MONITOR,
+    UpdateModesRequest, LEASE_TIMEOUT_USE_DEFAULT, MAX_MODES_PER_MONITOR,
 };
 use luminal_vgd_host::device::{CursorView, RingView, VgdDevice};
 
@@ -67,6 +67,16 @@ struct Args {
     /// Watch the shared cursor section during the hold: print position/
     /// visibility changes and fetch each new shape (caps::HW_CURSOR).
     cursor: bool,
+    /// `--add-mode WxH@HZ` (repeatable): modes to push onto the LIVE
+    /// monitor partway through the hold via UPDATE_MODES (proto 0.5).
+    /// This is the standalone way to exercise build 17 — and the way to
+    /// answer the one question the headers do not: whether the OS
+    /// re-solicits ParseMonitorDescription2 after an
+    /// IddCxMonitorUpdateModes2, which is what decides if a dynamically
+    /// ADDED mode can survive the OS's monitor∩target intersection.
+    add_modes: Vec<ModeSpec>,
+    /// Seconds into the hold at which to issue the update.
+    add_after_secs: u64,
 }
 
 /// Default mode list when none is given: 4K120 preferred (LG-OLED-class
@@ -87,6 +97,8 @@ fn parse_args() -> Result<Args, String> {
         ephemeral: false,
         consume: false,
         cursor: false,
+        add_modes: Vec::new(),
+        add_after_secs: 5,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -99,21 +111,32 @@ fn parse_args() -> Result<Args, String> {
                 let v = it.next().ok_or("--hold needs a value")?;
                 args.hold_secs = v.parse().map_err(|_| format!("bad --hold value: {v}"))?;
             }
-            mode if mode.contains('x') => {
-                // WxH or WxH@HZ (HZ may be fractional, e.g. 59.94)
-                let (dims, hz) = mode.split_once('@').unwrap_or((mode, "60"));
-                let (w, h) = dims.split_once('x').ok_or_else(|| format!("bad mode: {mode}"))?;
-                let hz: f64 = hz.parse().map_err(|_| format!("bad refresh: {hz}"))?;
-                args.explicit_modes.push(ModeSpec {
-                    width: w.parse().map_err(|_| format!("bad width: {w}"))?,
-                    height: h.parse().map_err(|_| format!("bad height: {h}"))?,
-                    refresh_millihz: (hz * 1000.0).round() as u32,
-                });
+            "--add-mode" => {
+                let v = it.next().ok_or("--add-mode needs a WxH@HZ value")?;
+                args.add_modes.push(parse_mode(&v)?);
             }
+            "--add-after" => {
+                let v = it.next().ok_or("--add-after needs a value")?;
+                args.add_after_secs =
+                    v.parse().map_err(|_| format!("bad --add-after value: {v}"))?;
+            }
+            mode if mode.contains('x') => args.explicit_modes.push(parse_mode(mode)?),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
     Ok(args)
+}
+
+/// `WxH` or `WxH@HZ` (HZ may be fractional, e.g. 59.94).
+fn parse_mode(mode: &str) -> Result<ModeSpec, String> {
+    let (dims, hz) = mode.split_once('@').unwrap_or((mode, "60"));
+    let (w, h) = dims.split_once('x').ok_or_else(|| format!("bad mode: {mode}"))?;
+    let hz: f64 = hz.parse().map_err(|_| format!("bad refresh: {hz}"))?;
+    Ok(ModeSpec {
+        width: w.parse().map_err(|_| format!("bad width: {w}"))?,
+        height: h.parse().map_err(|_| format!("bad height: {h}"))?,
+        refresh_millihz: (hz * 1000.0).round() as u32,
+    })
 }
 
 fn main() -> ExitCode {
@@ -122,7 +145,8 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("vgd-probe: {e}");
             eprintln!(
-                "usage: vgd-probe [status] [WxH@HZ ...] [--hold SECS] [--ephemeral] [--consume] [--cursor]"
+                "usage: vgd-probe [status] [WxH@HZ ...] [--hold SECS] [--ephemeral] [--consume] [--cursor]\n\
+                 \x20      [--add-mode WxH@HZ ...] [--add-after SECS]"
             );
             return ExitCode::FAILURE;
         }
@@ -406,6 +430,49 @@ fn main() -> ExitCode {
             Err(e) => {
                 eprintln!("  PING failed: {e}");
                 break;
+            }
+        }
+        // Build 17: push extra modes onto the LIVE monitor, once, partway
+        // through the hold. The interesting evidence is in the ETW trace
+        // rather than here: UpdateModesApplied, then whether
+        // ParseDescription2 / QueryTargetModes2 reappear with dynamic > 0
+        // (the OS re-soliciting the list — the added mode can surface) or
+        // do not (the target-only push never reaches the monitor∩target
+        // intersection, and dynamic ADD is not achievable this way).
+        // Display Settings on the monitor is the user-visible half.
+        if !args.add_modes.is_empty() && tick + 1 == args.add_after_secs {
+            let mut modes = [ModeSpec::default(); MAX_MODES_PER_MONITOR as usize];
+            let mut wanted: Vec<ModeSpec> = mode_list.clone();
+            for m in &args.add_modes {
+                if !wanted.contains(m) && wanted.len() < MAX_MODES_PER_MONITOR as usize {
+                    wanted.push(*m);
+                }
+            }
+            modes[..wanted.len()].copy_from_slice(&wanted);
+            let upd = UpdateModesRequest {
+                session_id,
+                flags: 0,
+                mode_count: wanted.len() as u32,
+                modes,
+                reserved: [0; 4],
+            };
+            print!("  UPDATE_MODES ->");
+            for m in &wanted {
+                print!(" {}x{}@{:.3}", m.width, m.height, m.refresh_millihz as f64 / 1000.0);
+            }
+            println!();
+            match dev.update_modes(&upd) {
+                Ok(r) if r.result == err::OK => {
+                    println!(
+                        "    accepted: {} modes in force (accepted != applied — check ETW)",
+                        r.mode_count
+                    );
+                }
+                Ok(r) => eprintln!("    driver refused: result {} ({} in force)", r.result, r.mode_count),
+                // The expected shape against a pre-0.5 driver: the opcode
+                // is unknown, the IOCTL fails, and the session carries on
+                // untouched. Never fatal.
+                Err(e) => eprintln!("    ioctl failed (pre-0.5 driver?): {e}"),
             }
         }
         if let Some(view) = &ring {

@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 
 use luminal_driver_proto::{
     create_flags, ring_state, CreateMonitorRequest, GetStatusReply, HandshakeReply,
-    MonitorStatus, ABI_MAX_MONITORS, DEFAULT_LEASE_TIMEOUT_MS, LEASE_TIMEOUT_DISABLED,
-    LEASE_TIMEOUT_USE_DEFAULT, MAX_LEASE_TIMEOUT_MS, MIN_LEASE_TIMEOUT_MS,
-    PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR,
+    ModeSpec, MonitorStatus, ABI_MAX_MONITORS, DEFAULT_LEASE_TIMEOUT_MS,
+    LEASE_TIMEOUT_DISABLED, LEASE_TIMEOUT_USE_DEFAULT, MAX_LEASE_TIMEOUT_MS,
+    MIN_LEASE_TIMEOUT_MS, PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR,
 };
 
 use crate::adapter::{select_adapter, AdapterInfo};
@@ -271,6 +271,53 @@ impl SessionTable {
             last_error: 0,
         };
         Ok(self.monitors.entry(req.session_id).or_insert(monitor))
+    }
+
+    /// `UPDATE_MODES` (proto 0.5): grow a live monitor's advertised mode
+    /// list. Returns `(list in force, how many were appended)`; an
+    /// `added == 0` result means the request was a no-op and the caller
+    /// must NOT disturb the OS.
+    ///
+    /// Bit depth and dynamic range are NOT taken from the request: they
+    /// are monitor-wide, derived from an EDID that cannot be reissued on a
+    /// live monitor, so every new entry is validated against the session's
+    /// existing depth. A request that would need a different depth is
+    /// simply a mode the envelope rejects — never a silent depth change.
+    ///
+    /// The stored list is the host's INTENT. It is what a later replug
+    /// from `DeviceState` (device re-add, D3Final re-bring-up, permanent
+    /// pool restore) plugs with — which is why the update has to land
+    /// here and not only in the shell's runtime copy, or every one of
+    /// those paths would silently revert to the create-time list.
+    pub fn update_modes(
+        &mut self,
+        session_id: u64,
+        specs: &[ModeSpec],
+        drv_caps: u32,
+    ) -> Result<(Vec<Mode>, usize), CoreError> {
+        let m = self.monitors.get(&session_id).ok_or(CoreError::NoSuchSession)?;
+        // Monitor-wide depth/range, from the list the monitor already has.
+        let (bit_depth_raw, hdr_raw) = {
+            let pref = m.preferred_mode();
+            (pref.bit_depth.as_raw(), u32::from(pref.hdr))
+        };
+        let requested = Mode::validate_list(
+            specs,
+            specs.len() as u32,
+            bit_depth_raw,
+            hdr_raw,
+            drv_caps,
+        )?;
+        let (merged, added) = Mode::merge_additive(&m.modes, &requested);
+        if added > 0 {
+            // Only mutate after every fallible step has passed, so a
+            // rejected request leaves the session exactly as it was.
+            self.monitors
+                .get_mut(&session_id)
+                .expect("looked up above")
+                .modes = merged.clone();
+        }
+        Ok((merged, added))
     }
 
     /// Explicit teardown at stream end. Retained identities keep their
@@ -593,6 +640,85 @@ mod tests {
         bad.mode_count = 0;
         assert_eq!(t.create(0, &bad, CAPS, &adapters(), 0).err(), Some(CoreError::BadMode));
         assert_eq!(t.len(), 1);
+    }
+
+    /// Build 17: the durable half of a live mode-list change. This copy —
+    /// not the shell's runtime one — is what every replug-from-DeviceState
+    /// path plugs with, so if the update did not land here it would revert
+    /// on the next device re-add, D3Final re-bring-up, or pool restore.
+    #[test]
+    fn update_modes_appends_to_the_stored_list_without_disturbing_the_preferred_mode() {
+        let mut t = table();
+        t.create(0, &req(1), CAPS, &adapters(), 0).unwrap();
+        assert_eq!(t.get(1).unwrap().modes.len(), 1);
+
+        // The motivating case: add the frame-generation-doubled rate to a
+        // monitor created at the base rate.
+        let doubled = ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 };
+        let (list, added) = t.update_modes(1, &[doubled], CAPS).unwrap();
+        assert_eq!((list.len(), added), (2, 1));
+        let m = t.get(1).unwrap();
+        assert_eq!(m.modes.len(), 2);
+        assert_eq!(m.preferred_mode().refresh_millihz, 60_000, "preferred untouched");
+        assert_eq!(m.modes[1].refresh_millihz, 120_000);
+
+        // Idempotent: resending the same list is a traced no-op, not a
+        // second push at the OS.
+        let (list, added) = t.update_modes(1, &[doubled], CAPS).unwrap();
+        assert_eq!((list.len(), added), (2, 0));
+    }
+
+    #[test]
+    fn update_modes_rejects_bad_input_without_touching_the_session() {
+        let mut t = table();
+        t.create(0, &req(1), CAPS, &adapters(), 0).unwrap();
+        let before = t.get(1).unwrap().modes.clone();
+
+        // Unknown session.
+        assert_eq!(
+            t.update_modes(99, &[ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 }], CAPS)
+                .err(),
+            Some(CoreError::NoSuchSession)
+        );
+        // Empty list.
+        assert_eq!(t.update_modes(1, &[], CAPS).err(), Some(CoreError::BadMode));
+        // Out-of-envelope entry: the whole request fails, nothing partial.
+        let bad = [
+            ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 },
+            ModeSpec { width: 3, height: 3, refresh_millihz: 1 },
+        ];
+        assert_eq!(t.update_modes(1, &bad, CAPS).err(), Some(CoreError::BadMode));
+        // Over the cap.
+        let many = [ModeSpec { width: 1920, height: 1080, refresh_millihz: 30_000 }; 5];
+        assert_eq!(t.update_modes(1, &many, CAPS).err(), Some(CoreError::BadMode));
+        assert_eq!(t.get(1).unwrap().modes, before, "session untouched by every rejection");
+    }
+
+    /// The monitor-wide depth is EDID-derived and the EDID cannot be
+    /// reissued on a live monitor, so an update can never change it: new
+    /// entries are validated against the session's existing depth, and a
+    /// caps-gated depth the driver lacks cannot sneak in through this path.
+    #[test]
+    fn update_modes_inherits_the_sessions_bit_depth() {
+        let mut t = table();
+        let mut hdr = req(1);
+        hdr.bit_depth = 110;
+        hdr.hdr = 1;
+        t.create(0, &hdr, CAPS, &adapters(), 0).unwrap();
+        let (list, added) = t
+            .update_modes(1, &[ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 }], CAPS)
+            .unwrap();
+        assert_eq!(added, 1);
+        assert!(list.iter().all(|m| m.hdr && m.bit_depth.as_raw() == 110));
+
+        // Same monitor, a driver WITHOUT the HDR cap: the existing depth no
+        // longer validates, so the update fails cleanly instead of
+        // downgrading the monitor's depth behind the host's back.
+        assert_eq!(
+            t.update_modes(1, &[ModeSpec { width: 1280, height: 720, refresh_millihz: 60_000 }], caps::MULTI_MODE)
+                .err(),
+            Some(CoreError::HdrUnsupported)
+        );
     }
 
     #[test]

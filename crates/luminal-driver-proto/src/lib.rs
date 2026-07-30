@@ -38,7 +38,14 @@ pub const PROTO_VERSION_MAJOR: u16 = 0;
 /// tail reads as zeros), so hosts should announce
 /// [`PROTO_VERSION_MINOR_REQUIRED`] at handshake — not this constant —
 /// unless they genuinely refuse to run without 0.4 features.
-pub const PROTO_VERSION_MINOR: u16 = 4;
+/// v0.5: `UPDATE_MODES` (`FN_UPDATE_MODES`) — change a LIVE monitor's
+/// advertised mode list without a DESTROY+CREATE cycle, plus
+/// [`caps::DYNAMIC_MODES`], [`UpdateModesRequest`]/[`UpdateModesReply`]
+/// and [`err::UPDATE_FAILED`]. Purely additive: no existing struct,
+/// IOCTL value, or error code moved, so a 0.3/0.4 host that never sends
+/// the new opcode is unaffected. Hosts detect the capability with the
+/// caps bit (see its docs) and fall back to the create-time mode list.
+pub const PROTO_VERSION_MINOR: u16 = 5;
 
 /// The minimum driver minor a host actually REQUIRES. Hosts that degrade
 /// gracefully when 0.4 fields are ignored (the nits value simply stays at
@@ -84,6 +91,24 @@ pub mod caps {
     pub const MULTI_MODE: u32 = 1 << 7;
     /// Permanent display pool IOCTLs supported.
     pub const PERMANENT_POOL: u32 = 1 << 8;
+    /// `UPDATE_MODES` (proto 0.5) is implemented: a LIVE monitor's
+    /// advertised mode list can grow without a destroy/create cycle.
+    ///
+    /// THE detection mechanism for the feature — preferred over comparing
+    /// `driver_proto_minor >= 5`, because caps travel in both the
+    /// handshake reply and `GET_STATUS`, cross the FFI in `VgdCaps.caps`,
+    /// and (unlike a monotonic version number) can be CLEARED by a driver
+    /// that has the opcode compiled in but had to disable the capability.
+    /// A host that sends `UPDATE_MODES` without this bit set is not
+    /// broken — an older driver answers `STATUS_INVALID_DEVICE_REQUEST`,
+    /// never a false success — but it wastes a round trip and logs
+    /// nothing useful.
+    ///
+    /// Deliberately NOT [`REFRESH_DOUBLING`] (1 << 4): that bit is
+    /// defined, has never been set by any shipped driver, and means
+    /// something else. Repurposing a shipped ABI constant is how a
+    /// capability check silently starts lying.
+    pub const DYNAMIC_MODES: u32 = 1 << 9;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +138,9 @@ pub mod ioctl {
     pub const FN_QUERY_LEASE: u32 = 0x806;
     pub const FN_SET_PERMANENT_POOL: u32 = 0x807;
     pub const FN_QUERY_PERMANENT_POOL: u32 = 0x808;
+    /// Proto 0.5. Appended — the nine below it keep their function
+    /// numbers and their encoded IOCTL values forever.
+    pub const FN_UPDATE_MODES: u32 = 0x809;
 
     /// In: [`HandshakeRequest`](super::HandshakeRequest), out: [`HandshakeReply`](super::HandshakeReply).
     pub const IOCTL_HANDSHAKE: u32 = ctl_code(FN_HANDSHAKE);
@@ -134,6 +162,16 @@ pub mod ioctl {
     pub const IOCTL_SET_PERMANENT_POOL: u32 = ctl_code(FN_SET_PERMANENT_POOL);
     /// In: none, out: [`QueryPermanentPoolReply`](super::QueryPermanentPoolReply).
     pub const IOCTL_QUERY_PERMANENT_POOL: u32 = ctl_code(FN_QUERY_PERMANENT_POOL);
+    /// In: [`UpdateModesRequest`](super::UpdateModesRequest), out:
+    /// [`UpdateModesReply`](super::UpdateModesReply). Proto 0.5, gated on
+    /// [`caps::DYNAMIC_MODES`](super::caps::DYNAMIC_MODES).
+    ///
+    /// Grows the advertised mode list of a LIVE monitor (see
+    /// [`UpdateModesRequest`](super::UpdateModesRequest) for the
+    /// additive-merge semantics). An older driver answers
+    /// `STATUS_INVALID_DEVICE_REQUEST` for this code, which surfaces as an
+    /// I/O failure host-side — never as a false success.
+    pub const IOCTL_UPDATE_MODES: u32 = ctl_code(FN_UPDATE_MODES);
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +206,16 @@ pub mod err {
     pub const IDENTITY_IN_USE: i32 = -11;
     /// Permanent-pool config invalid (count above cap, bad mode…).
     pub const BAD_POOL: i32 = -12;
+    /// `UPDATE_MODES`: the advertised list could NOT be changed and the
+    /// PREVIOUS list is still in force. This is the constraint-1 degrade
+    /// signal — never a departed monitor, never a refused session.
+    ///
+    /// Note where it can appear: the `UPDATE_MODES` reply completes before
+    /// the driver calls the OS, so the reply carries driver-side
+    /// validation only. This code surfaces afterwards, as the affected
+    /// monitor's sticky `MonitorStatus.last_error` in `GET_STATUS`
+    /// (plus an ETW event with stage and status).
+    pub const UPDATE_FAILED: i32 = -13;
     /// Unspecified driver-internal failure; details in `GET_STATUS`.
     pub const INTERNAL: i32 = -100;
 }
@@ -399,6 +447,82 @@ pub struct CreateMonitorReply {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DestroyMonitorRequest {
     pub session_id: u64,
+}
+
+/// `UPDATE_MODES` (proto 0.5): grow a LIVE monitor's advertised mode list
+/// without a destroy/create cycle.
+///
+/// **Semantics are ADDITIVE-MERGE, and that is a safety property, not a
+/// convenience.** The driver unions `modes[..mode_count]` into the
+/// session's current list, preserving the existing order and appending
+/// only modes that are not already advertised (capped at
+/// [`MAX_MODES_PER_MONITOR`]). Consequences that the design depends on:
+///
+/// - `modes[0]` never changes, so the EDID's preferred detailed timing —
+///   frozen at `IddCxMonitorCreate` and underivable afterwards — stays
+///   truthful, and `PreferredMonitorModeIdx` keeps meaning what it did.
+/// - The mode the OS has currently committed can never disappear, so the
+///   update cannot force a modeset on a display that is mid-stream.
+/// - A capability can never be REMOVED by this opcode. Shrinking a live
+///   list is deliberately not expressible; end the session instead.
+///
+/// The bit depth / dynamic range are monitor-wide and fixed at create —
+/// they are derived from the EDID, which cannot be reissued on a live
+/// monitor — so this request carries no depth field and the driver
+/// validates every entry against the session's existing depth.
+///
+/// `flags` is a bitmask with no bits defined in 0.5. Drivers IGNORE
+/// unknown bits (matching `create_flags` handling), so any future flag
+/// that changes semantics must ship with its own `caps::*` bit.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpdateModesRequest {
+    pub session_id: u64,
+    /// Reserved bitmask; no bits defined in 0.5. Unknown bits ignored.
+    pub flags: u32,
+    /// Number of valid entries in `modes` (1..=`MAX_MODES_PER_MONITOR`).
+    pub mode_count: u32,
+    pub modes: [ModeSpec; MAX_MODES_PER_MONITOR as usize],
+    /// Growth budget; must be 0. Requests may grow by APPENDING after
+    /// this (see [`UPDATE_MODES_REQUEST_SIZE_V5`]) because the driver's
+    /// reader accepts larger-than-expected input buffers.
+    pub reserved: [u32; 4],
+}
+
+/// Byte size of [`UpdateModesRequest`] as introduced in proto 0.5.
+///
+/// Named on day one, unlike [`CREATE_MONITOR_REQUEST_SIZE_V3`] which had
+/// to be reconstructed retroactively: when a later minor appends fields,
+/// the driver keeps accepting exactly this size and zero-pads the tail.
+pub const UPDATE_MODES_REQUEST_SIZE_V5: usize = 80;
+
+/// `UPDATE_MODES` reply.
+///
+/// **`result == OK` means ACCEPTED FOR APPLICATION, not "the OS is now
+/// advertising these modes."** The driver completes this IRP before it
+/// touches IddCx (side effects never run on an IOCTL frame), so the reply
+/// structurally cannot carry the `IddCxMonitorUpdateModes` status. The
+/// OS-side outcome arrives later as ETW plus the monitor's sticky
+/// [`err::UPDATE_FAILED`] in `GET_STATUS`.
+///
+/// This struct can never grow: the driver writes replies all-or-nothing
+/// and hosts reject a reply whose length differs from what they expect,
+/// so a bigger `UpdateModesReply` would break every already-shipped 0.5
+/// host with an I/O error rather than degrading. Future fields must come
+/// out of `reserved`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpdateModesReply {
+    pub session_id: u64,
+    /// `err::OK` or a negative `err::*` code.
+    pub result: i32,
+    /// Modes IN FORCE after the merge: on success the post-merge count
+    /// (which is < the requested total when the list was already at
+    /// [`MAX_MODES_PER_MONITOR`]), and on any error the UNCHANGED current
+    /// count — 0 only when the session does not exist.
+    pub mode_count: u32,
+    /// Must be 0. The only place this reply may ever grow into.
+    pub reserved: [u32; 6],
 }
 
 #[repr(C)]
@@ -792,6 +916,16 @@ mod layout_tests {
     const_assert_eq!(size_of::<CreateMonitorReply>(), 160);
     const_assert_eq!(align_of::<CreateMonitorReply>(), 8);
 
+    // 0.5: 8 + 4 + 4 + 4*12 + 4*4 = 80. Locked on introduction so the
+    // next growth is a mechanical append + a new SIZE_V<n> constant.
+    const_assert_eq!(size_of::<UpdateModesRequest>(), 80);
+    const_assert_eq!(align_of::<UpdateModesRequest>(), 8);
+    const_assert_eq!(UPDATE_MODES_REQUEST_SIZE_V5, size_of::<UpdateModesRequest>());
+    // Replies never grow (see UpdateModesReply docs): if this assertion
+    // ever needs changing, the change is a MAJOR-version event.
+    const_assert_eq!(size_of::<UpdateModesReply>(), 40);
+    const_assert_eq!(align_of::<UpdateModesReply>(), 8);
+
     const_assert_eq!(size_of::<DestroyMonitorRequest>(), 8);
     const_assert_eq!(size_of::<PingRequest>(), 8);
     const_assert_eq!(size_of::<SetRenderAdapterRequest>(), 8);
@@ -839,6 +973,7 @@ mod layout_tests {
     const_assert_eq!(ioctl::IOCTL_QUERY_LEASE, 0x0022_2018);
     const_assert_eq!(ioctl::IOCTL_SET_PERMANENT_POOL, 0x0022_201C);
     const_assert_eq!(ioctl::IOCTL_QUERY_PERMANENT_POOL, 0x0022_2020);
+    const_assert_eq!(ioctl::IOCTL_UPDATE_MODES, 0x0022_2024);
 }
 
 #[cfg(test)]
@@ -874,6 +1009,93 @@ mod tests {
         // Major mismatch: refuse both directions.
         assert!(!versions_compatible(1, 0, 0, 9));
         assert!(!versions_compatible(0, 9, 1, 0));
+    }
+
+    /// Build 17 / proto 0.5, both compatibility directions in one place.
+    /// The rule is asymmetric (`driver_minor >= host_ANNOUNCED_minor`), so
+    /// "it works both ways" has to be asserted, not assumed.
+    #[test]
+    fn proto_05_keeps_both_directions_working() {
+        // OLDER HOST vs BUILD-17 DRIVER. A 0.3 host (build 14 era) and a
+        // 0.4 host (build 15/16 era) both still handshake.
+        assert!(versions_compatible(PROTO_VERSION_MAJOR, 3, PROTO_VERSION_MAJOR, 5));
+        assert!(versions_compatible(PROTO_VERSION_MAJOR, 4, PROTO_VERSION_MAJOR, 5));
+
+        // BUILD-17 HOST vs OLDER DRIVER. This is the direction that would
+        // break if the required floor were raised with the minor: a
+        // 0.5-announcing host is REFUSED by every 0.3/0.4 driver in the
+        // field, and the refusal presents as NOT_HANDSHAKEN on every
+        // session IOCTL — a refused session, i.e. a constraint-1
+        // violation. Announcing the floor keeps it working.
+        assert!(!versions_compatible(PROTO_VERSION_MAJOR, 5, PROTO_VERSION_MAJOR, 4));
+        assert!(versions_compatible(
+            PROTO_VERSION_MAJOR,
+            PROTO_VERSION_MINOR_REQUIRED,
+            PROTO_VERSION_MAJOR,
+            4
+        ));
+        assert!(versions_compatible(
+            PROTO_VERSION_MAJOR,
+            PROTO_VERSION_MINOR_REQUIRED,
+            PROTO_VERSION_MAJOR,
+            3
+        ));
+        assert_eq!(PROTO_VERSION_MINOR_REQUIRED, 3, "the floor does NOT move with the minor");
+        assert_eq!(PROTO_VERSION_MINOR, 5);
+    }
+
+    /// The feature gate a host actually reads. Locked because a wrong bit
+    /// here is a capability check that silently lies.
+    #[test]
+    fn dynamic_modes_cap_is_a_fresh_bit() {
+        assert_eq!(caps::DYNAMIC_MODES, 1 << 9);
+        // Not the never-set REFRESH_DOUBLING bit, and not colliding with
+        // anything already defined.
+        for other in [
+            caps::HDR10,
+            caps::HDR12_BIT,
+            caps::SDR10_BIT,
+            caps::DIRTY_RECTS,
+            caps::REFRESH_DOUBLING,
+            caps::HW_CURSOR,
+            caps::GAMMA_RAMP,
+            caps::MULTI_MODE,
+            caps::PERMANENT_POOL,
+        ] {
+            assert_eq!(caps::DYNAMIC_MODES & other, 0);
+        }
+    }
+
+    /// The new opcode is APPENDED: the nine shipped IOCTL values must be
+    /// byte-identical to what alpha.1 shipped, or every field driver and
+    /// host disagree about what a code means.
+    #[test]
+    fn update_modes_opcode_is_appended_not_renumbered() {
+        assert_eq!(ioctl::FN_UPDATE_MODES, 0x809);
+        assert_eq!(ioctl::IOCTL_UPDATE_MODES, 0x0022_2024);
+        let shipped = [
+            ioctl::IOCTL_HANDSHAKE,
+            ioctl::IOCTL_CREATE_MONITOR,
+            ioctl::IOCTL_DESTROY_MONITOR,
+            ioctl::IOCTL_PING,
+            ioctl::IOCTL_GET_STATUS,
+            ioctl::IOCTL_SET_RENDER_ADAPTER,
+            ioctl::IOCTL_QUERY_LEASE,
+            ioctl::IOCTL_SET_PERMANENT_POOL,
+            ioctl::IOCTL_QUERY_PERMANENT_POOL,
+        ];
+        assert_eq!(
+            shipped,
+            [
+                0x0022_2000, 0x0022_2004, 0x0022_2008, 0x0022_200C, 0x0022_2010, 0x0022_2014,
+                0x0022_2018, 0x0022_201C, 0x0022_2020
+            ]
+        );
+        assert!(!shipped.contains(&ioctl::IOCTL_UPDATE_MODES));
+        // And the appended error code did not renumber an existing one.
+        assert_eq!(err::UPDATE_FAILED, -13);
+        assert_eq!(err::BAD_POOL, -12);
+        assert_eq!(err::NOT_HANDSHAKEN, -10);
     }
 
     #[test]

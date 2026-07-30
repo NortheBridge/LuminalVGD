@@ -35,13 +35,16 @@ use luminal_vgd_core::modes::Mode;
 /// shared cursor section (the OS stops composing it into frames);
 /// GAMMA_RAMP = the SetGammaRamp DDI is registered and acknowledged
 /// (pixels stay pass-through — capture on physical displays is pre-LUT
-/// too, so the stream parity is identical).
+/// too, so the stream parity is identical); DYNAMIC_MODES = build 17's
+/// `UPDATE_MODES` opcode is implemented, so a live monitor's advertised
+/// list can grow without a destroy/create cycle.
 pub(crate) const SHELL_CAPS: u32 = luminal_driver_proto::caps::MULTI_MODE
     | luminal_driver_proto::caps::PERMANENT_POOL
     | luminal_driver_proto::caps::HDR10
     | luminal_driver_proto::caps::SDR10_BIT
     | luminal_driver_proto::caps::HW_CURSOR
-    | luminal_driver_proto::caps::GAMMA_RAMP;
+    | luminal_driver_proto::caps::GAMMA_RAMP
+    | luminal_driver_proto::caps::DYNAMIC_MODES;
 
 /// Monotonic build stamp reported in HANDSHAKE/GET_STATUS. Release
 /// builds stamp it via the LUMINAL_VGD_BUILD environment variable
@@ -60,7 +63,7 @@ pub(crate) const DRIVER_BUILD: u32 = match option_env!("LUMINAL_VGD_BUILD") {
         }
         n
     }
-    None => 16,
+    None => 17,
 };
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
@@ -90,7 +93,26 @@ pub(crate) struct MonitorRt {
     /// The exact EDID served to the OS. Boxed so the pointer handed to
     /// IddCxMonitorCreate stays stable while the map rehashes.
     pub edid: Box<[u8; 256]>,
+    /// The advertised mode list. Mutable since build 17 (`UPDATE_MODES`),
+    /// but ONLY through `monitors::update_modes`, and only ever by
+    /// APPENDING — see its docs for why `modes[0]` is effectively frozen
+    /// for the life of the monitor object.
     pub modes: Vec<Mode>,
+    /// How many leading entries of `modes` were present when this monitor
+    /// object was created, i.e. the ones the EDID handed to
+    /// `IddCxMonitorCreate` can be said to describe. Entries at or after
+    /// this index were added later by `UPDATE_MODES` and are reported to
+    /// the OS as `IDDCX_MONITOR_MODE_ORIGIN_DRIVER` ("not a direct
+    /// resolution of processing the monitor description, but separate
+    /// knowledge the driver has") instead of `..._MONITORDESCRIPTOR`.
+    ///
+    /// This is not bookkeeping for its own sake: the 256-byte EDID is
+    /// frozen at `IddCxMonitorCreate` and cannot be reissued on a live
+    /// monitor, so claiming a dynamically added mode came out of the
+    /// monitor descriptor is a false statement to the OS — and one it may
+    /// act on, since it validates descriptor-origin modes against the
+    /// description it holds.
+    pub static_mode_count: usize,
     /// Plug identity, kept so a TDR duck-out can re-arrive the same
     /// monitor (same container GUID via display_id, same connector)
     /// without a round trip through the host.
@@ -257,6 +279,10 @@ pub(crate) struct DuckedMonitor {
     pub connector_index: u32,
     pub adapter_luid: u64,
     pub edid: Box<[u8; 256]>,
+    /// The advertised list at park time. An `UPDATE_MODES` that lands
+    /// while a session is parked patches THIS copy (there is no monitor
+    /// object to push at), or the re-arrival would silently restore the
+    /// pre-update list.
     pub modes: Vec<Mode>,
     pub ring: std::sync::Arc<swapchain::RingHandle>,
 }

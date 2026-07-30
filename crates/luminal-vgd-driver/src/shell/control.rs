@@ -27,7 +27,7 @@ use std::sync::mpsc;
 use super::PROVIDER;
 use super::{dxgi, monitors, OsHandle, Shell};
 use crate::dispatch::{
-    dispatch, Effect, HandleCtx, Status, TDR_DUCK_DEVICE, TDR_DUCK_DISPLAY,
+    dispatch, DispatchResult, Effect, HandleCtx, Status, TDR_DUCK_DEVICE, TDR_DUCK_DISPLAY,
 };
 use luminal_driver_proto::ioctl;
 
@@ -1462,6 +1462,14 @@ fn apply_now(effects: Vec<Effect>) {
                 edid,
             ),
             Effect::UnplugMonitor { session_id } => monitors::unplug(session_id),
+            // Build 17: the ONLY caller of IddCxMonitorUpdateModes2, and
+            // it is here for the same reason plug/unplug are — the OS
+            // re-enters the mode DDIs synchronously, so this may never run
+            // on an IOCTL or callback frame, and never under a lock those
+            // DDIs take.
+            Effect::UpdateModes { session_id, modes } => {
+                monitors::update_modes(session_id, modes)
+            }
             Effect::PersistState(blob) => unsafe { write_persisted(&blob) },
         }
     }
@@ -1475,7 +1483,73 @@ fn requires_adapter(code: u32) -> bool {
         ioctl::IOCTL_CREATE_MONITOR
             | ioctl::IOCTL_DESTROY_MONITOR
             | ioctl::IOCTL_SET_PERMANENT_POOL
+            // Build 17: dispatch would happily merge the list, but the
+            // resulting Effect targets an IddCx monitor that cannot exist
+            // before the adapter does.
+            | ioctl::IOCTL_UPDATE_MODES
     )
+}
+
+/// Build-17 ETW for dispatch-level `UPDATE_MODES` outcomes (constraint 4:
+/// every deny/fail path emits stage + code).
+///
+/// Nothing at the dispatch layer traces anything today — the only
+/// IOCTL-layer events are the authorization gate's — so without this the
+/// new opcode's refusals (`NOT_HANDSHAKEN`, `BAD_MODE`, `NO_SUCH_SESSION`,
+/// a short buffer) would be completely invisible in a capture, which is
+/// exactly how the build-8 ACL outage stayed unexplained for three builds.
+///
+/// # Safety
+/// `out_ptr`/`out_got` must be the output buffer just handed to
+/// `dispatch`, still valid (the request has not been completed yet).
+unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out_got: usize) {
+    const UPD_DISPATCH_STAGE_BUFFER: u32 = 6;
+    const UPD_DISPATCH_STAGE_VALIDATE: u32 = 7;
+    match result.status {
+        Status::Ok => {
+            let n = core::mem::size_of::<luminal_driver_proto::UpdateModesReply>();
+            if out_ptr.is_null() || out_got < n {
+                return;
+            }
+            let reply = core::ptr::read_unaligned(
+                out_ptr.cast::<luminal_driver_proto::UpdateModesReply>(),
+            );
+            if reply.result == luminal_driver_proto::err::OK {
+                // Accepted. `queued` distinguishes a real change from an
+                // idempotent resend of an already-advertised list, which
+                // deliberately produces no effect and no OS call.
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "UpdateModesAccepted",
+                    level(Informational),
+                    u64("session", &reply.session_id),
+                    u32("modes", &reply.mode_count),
+                    u32("queued", &u32::from(!result.effects.is_empty()))
+                );
+            } else {
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "UpdateModesDenied",
+                    level(Warning),
+                    u64("session", &reply.session_id),
+                    u32("stage", &UPD_DISPATCH_STAGE_VALIDATE),
+                    i32("code", &reply.result),
+                    u32("modes", &reply.mode_count)
+                );
+            }
+        }
+        Status::BadBuffer | Status::UnknownCode => {
+            tracelogging::write_event!(
+                PROVIDER,
+                "UpdateModesDenied",
+                level(Warning),
+                u64("session", &0u64),
+                u32("stage", &UPD_DISPATCH_STAGE_BUFFER),
+                i32("code", &luminal_driver_proto::err::INTERNAL),
+                u32("modes", &0u32)
+            );
+        }
+    }
 }
 
 pub unsafe extern "C" fn evt_ioctl(
@@ -1606,6 +1680,11 @@ pub unsafe extern "C" fn evt_ioctl(
         let mut dev = shell.dev.lock().unwrap();
         dispatch(&mut dev, handle, shell.now_ms(), code, input, output)
     };
+
+    if code == ioctl::IOCTL_UPDATE_MODES {
+        // Before completion, while the output buffer is still ours.
+        trace_update_modes_result(&result, out_ptr, out_got);
+    }
 
     let (status, info): (NTSTATUS, usize) = match result.status {
         Status::Ok => (STATUS_SUCCESS, result.bytes_written),

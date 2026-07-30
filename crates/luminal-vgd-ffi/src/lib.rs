@@ -37,9 +37,14 @@ pub const VGD_ERR_IO: i32 = -1000;
 pub const VGD_CAP_HDR10: u32 = 1;
 pub const VGD_CAP_SDR10_BIT: u32 = 4;
 pub const VGD_CAP_HW_CURSOR: u32 = 32;
+/// The driver implements [`vgd_update_modes`] (proto 0.5, driver build
+/// 17+). Absent ⇒ a monitor's mode list is fixed at create time and the
+/// caller must advertise everything it may need up front.
+pub const VGD_CAP_DYNAMIC_MODES: u32 = 512;
 const _: () = assert!(VGD_CAP_HDR10 == luminal_driver_proto::caps::HDR10);
 const _: () = assert!(VGD_CAP_SDR10_BIT == luminal_driver_proto::caps::SDR10_BIT);
 const _: () = assert!(VGD_CAP_HW_CURSOR == luminal_driver_proto::caps::HW_CURSOR);
+const _: () = assert!(VGD_CAP_DYNAMIC_MODES == luminal_driver_proto::caps::DYNAMIC_MODES);
 
 /// `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).
 pub const VGD_CURSOR_KIND_ALPHA: u32 = 1;
@@ -253,6 +258,97 @@ pub unsafe extern "C" fn vgd_create_monitor(
                     result: reply.result,
                     ring_slots: reply.ring_slots,
                     connector_index: reply.connector_index,
+                };
+                0
+            }
+            Err(e) => {
+                record_os_error(&e);
+                VGD_ERR_IO
+            }
+        }
+    })
+}
+
+/// Parameters for [`vgd_update_modes`] (mirrors proto
+/// `UpdateModesRequest`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VgdUpdateModesRequest {
+    pub session_id: u64,
+    /// Reserved; pass 0.
+    pub flags: u32,
+    /// Valid entries in `modes` (1..=4).
+    pub mode_count: u32,
+    pub modes: [VgdModeSpec; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VgdUpdateModesReply {
+    pub session_id: u64,
+    /// `0` (accepted) or a negative proto `err::*` code.
+    pub result: i32,
+    /// Modes in force after the merge.
+    pub mode_count: u32,
+}
+
+/// Grow a LIVE monitor's advertised mode list — no destroy/create cycle,
+/// so no `DBT_DEVNODES_CHANGED` broadcast and no monitor churn (proto
+/// 0.5, driver build 17+).
+///
+/// The motivating case: a client is already streaming a display created
+/// at its base refresh rate, and only then launches a frame-generation
+/// title. Calling this with `{base, doubled}` makes the doubled rate
+/// selectable on the existing display.
+///
+/// # Contract the caller must honor
+///
+/// - **Gate on `VgdCaps.caps & VGD_CAP_DYNAMIC_MODES`.** Against an older
+///   driver the opcode is unknown and this returns [`VGD_ERR_IO`]; that
+///   is safe (never a false success) but it is a wasted round trip, and
+///   the log line the caller writes should name the driver's version.
+/// - **Additive only.** The driver unions the request into the current
+///   list and NEVER removes a mode; `modes[0]` of the created monitor
+///   stays preferred. Passing a shorter list does not shrink anything.
+/// - **Degrade, never refuse.** Treat both `VGD_ERR_IO` and any negative
+///   `result` as "the mode list is unchanged, carry on with the session".
+///   A failed update is never a reason to tear a stream down.
+/// - **`result == 0` means ACCEPTED, not applied.** The driver completes
+///   the request before it calls the OS. The applied/failed outcome shows
+///   up in ETW and as the monitor's sticky `last_error` in the status
+///   reply.
+#[no_mangle]
+pub unsafe extern "C" fn vgd_update_modes(
+    dev: *mut VgdDeviceHandle,
+    req: *const VgdUpdateModesRequest,
+    out: *mut VgdUpdateModesReply,
+) -> i32 {
+    if dev.is_null() || req.is_null() || out.is_null() {
+        return VGD_ERR_IO;
+    }
+    guarded(VGD_ERR_IO, || {
+        let r = &*req;
+        let mut modes = [ModeSpec::default(); MAX_MODES_PER_MONITOR as usize];
+        for (dst, src) in modes.iter_mut().zip(r.modes.iter()) {
+            *dst = ModeSpec {
+                width: src.width,
+                height: src.height,
+                refresh_millihz: src.refresh_millihz,
+            };
+        }
+        let proto_req = luminal_driver_proto::UpdateModesRequest {
+            session_id: r.session_id,
+            flags: r.flags,
+            mode_count: r.mode_count,
+            modes,
+            reserved: [0; 4],
+        };
+        match (*dev).0.update_modes(&proto_req) {
+            Ok(reply) => {
+                *out = VgdUpdateModesReply {
+                    session_id: reply.session_id,
+                    result: reply.result,
+                    mode_count: reply.mode_count,
                 };
                 0
             }

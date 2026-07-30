@@ -32,6 +32,13 @@
 #define VGD_CAP_HW_CURSOR 32
 
 /**
+ * The driver implements [`vgd_update_modes`] (proto 0.5, driver build
+ * 17+). Absent ⇒ a monitor's mode list is fixed at create time and the
+ * caller must advertise everything it may need up front.
+ */
+#define VGD_CAP_DYNAMIC_MODES 512
+
+/**
  * `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).
  */
 #define VGD_CURSOR_KIND_ALPHA 1
@@ -108,6 +115,35 @@ typedef struct VgdCreateReply {
   uint32_t ring_slots;
   uint32_t connector_index;
 } VgdCreateReply;
+
+/**
+ * Parameters for [`vgd_update_modes`] (mirrors proto
+ * `UpdateModesRequest`).
+ */
+typedef struct VgdUpdateModesRequest {
+  uint64_t session_id;
+  /**
+   * Reserved; pass 0.
+   */
+  uint32_t flags;
+  /**
+   * Valid entries in `modes` (1..=4).
+   */
+  uint32_t mode_count;
+  struct VgdModeSpec modes[4];
+} VgdUpdateModesRequest;
+
+typedef struct VgdUpdateModesReply {
+  uint64_t session_id;
+  /**
+   * `0` (accepted) or a negative proto `err::*` code.
+   */
+  int32_t result;
+  /**
+   * Modes in force after the merge.
+   */
+  uint32_t mode_count;
+} VgdUpdateModesReply;
 
 /**
  * Snapshot of the ring header for health/fallback decisions.
@@ -202,6 +238,37 @@ int32_t vgd_handshake(struct VgdDeviceHandle *dev, struct VgdCaps *out);
 int32_t vgd_create_monitor(struct VgdDeviceHandle *dev,
                            const struct VgdCreateRequest *req,
                            struct VgdCreateReply *out);
+
+/**
+ * Grow a LIVE monitor's advertised mode list — no destroy/create cycle,
+ * so no `DBT_DEVNODES_CHANGED` broadcast and no monitor churn (proto
+ * 0.5, driver build 17+).
+ *
+ * The motivating case: a client is already streaming a display created
+ * at its base refresh rate, and only then launches a frame-generation
+ * title. Calling this with `{base, doubled}` makes the doubled rate
+ * selectable on the existing display.
+ *
+ * # Contract the caller must honor
+ *
+ * - **Gate on `VgdCaps.caps & VGD_CAP_DYNAMIC_MODES`.** Against an older
+ *   driver the opcode is unknown and this returns [`VGD_ERR_IO`]; that
+ *   is safe (never a false success) but it is a wasted round trip, and
+ *   the log line the caller writes should name the driver's version.
+ * - **Additive only.** The driver unions the request into the current
+ *   list and NEVER removes a mode; `modes[0]` of the created monitor
+ *   stays preferred. Passing a shorter list does not shrink anything.
+ * - **Degrade, never refuse.** Treat both `VGD_ERR_IO` and any negative
+ *   `result` as "the mode list is unchanged, carry on with the session".
+ *   A failed update is never a reason to tear a stream down.
+ * - **`result == 0` means ACCEPTED, not applied.** The driver completes
+ *   the request before it calls the OS. The applied/failed outcome shows
+ *   up in ETW and as the monitor's sticky `last_error` in the status
+ *   reply.
+ */
+int32_t vgd_update_modes(struct VgdDeviceHandle *dev,
+                         const struct VgdUpdateModesRequest *req,
+                         struct VgdUpdateModesReply *out);
 
 int32_t vgd_destroy_monitor(struct VgdDeviceHandle *dev, uint64_t session_id);
 

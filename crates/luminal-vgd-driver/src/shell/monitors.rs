@@ -93,12 +93,19 @@ pub fn plug(
         let ring = std::sync::Arc::new(super::swapchain::RingHandle::new(
             super::swapchain::FrameRing::new(session_id, ring_slots),
         ));
+        // Every mode this monitor object is created with counts as
+        // descriptor-origin: the EDID handed to IddCxMonitorCreate above
+        // was generated from this very list (its preferred detailed timing
+        // is modes[0]). Only modes appended LATER, to a monitor whose EDID
+        // can no longer be reissued, are ORIGIN_DRIVER.
+        let static_mode_count = modes.len();
         let displaced = shell.monitors.lock().unwrap().insert(
             session_id,
             MonitorRt {
                 monitor: OsHandle(monitor.cast()),
                 edid,
                 modes,
+                static_mode_count,
                 display_id,
                 connector_index,
                 adapter_luid,
@@ -368,12 +375,17 @@ pub fn replug_ducked() {
             // Reinstate the runtime with the ORIGINAL ring Arc: sequences
             // and the generation continue, and the next assign retires
             // textures exactly like any reassignment.
+            // A fresh monitor object: its whole list is create-time again
+            // (same reasoning as plug — the EDID it was just created with
+            // is the one this list was generated from).
+            let static_mode_count = d.modes.len();
             let displaced = shell.monitors.lock().unwrap().insert(
                 d.session_id,
                 super::MonitorRt {
                     monitor: super::OsHandle(monitor.cast()),
                     edid: d.edid,
                     modes: d.modes,
+                    static_mode_count,
                     display_id: d.display_id,
                     connector_index: d.connector_index,
                     adapter_luid: d.adapter_luid,
@@ -421,8 +433,251 @@ pub fn replug_ducked() {
     }
 }
 
+/// A snapshot of one monitor's advertised list, taken under the monitors
+/// lock and handed to a DDI handler by value. `static_count` is the split
+/// between create-time modes and modes appended later by `UPDATE_MODES`
+/// (see `MonitorRt::static_mode_count`).
+struct ModeSnapshot {
+    modes: Vec<Mode>,
+    static_count: usize,
+}
+
+impl ModeSnapshot {
+    fn len(&self) -> usize {
+        self.modes.len()
+    }
+
+    /// Truthful origin for the mode at `index`. Create-time modes are
+    /// what the EDID handed to `IddCxMonitorCreate` describes; anything
+    /// appended afterwards demonstrably is not, because that EDID cannot
+    /// be reissued on a live monitor.
+    fn origin(&self, index: usize) -> ffi::IDDCX_MONITOR_MODE_ORIGIN {
+        if index < self.static_count {
+            ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
+        } else {
+            ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_DRIVER
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// UPDATE_MODES (build 17): change the advertised list of a LIVE monitor.
+// ---------------------------------------------------------------------
+
+/// Stages for the `UpdateModes*` ETW events (constraint 4: every deny/fail
+/// path carries stage + code). Numbering is append-only, like STAGE_* in
+/// control.rs.
+const UPD_STAGE_NO_MONITOR: u32 = 0; // session has no live or parked monitor
+const UPD_STAGE_EMPTY: u32 = 1; // empty list — the DDI forbids count 0
+const UPD_STAGE_PARKED: u32 = 2; // applied to a TDR-parked spec, no OS call
+const UPD_STAGE_DUCK_PENDING: u32 = 3; // stored, OS push skipped (duck in flight)
+const UPD_STAGE_OS_CALL: u32 = 4; // IddCxMonitorUpdateModes2 returned failure
+const UPD_STAGE_ROLLBACK_RACED: u32 = 5; // monitor changed under a failed push
+const UPD_STAGE_NO_ADAPTER: u32 = 8; // adapter torn down before the push (6/7 are control.rs's)
+
+/// Apply a validated, already-merged mode list to a live monitor.
+///
+/// Runs ONLY on the effects worker (via `Effect::UpdateModes`), because
+/// `IddCxMonitorUpdateModes2` makes the OS re-enter our mode DDIs
+/// synchronously on the calling thread.
+///
+/// # The lock protocol, which is the whole of the danger here
+///
+/// `evt_query_target_modes2`, `evt_parse_monitor_description2` and
+/// `evt_assign` all take `shell.monitors`, and `std::sync::Mutex` is not
+/// reentrant. Calling IddCx while holding that lock self-deadlocks the
+/// effects worker the instant the OS re-enters — and a wedged effects
+/// worker silently stalls every later plug, unplug, persist and TDR
+/// effect. So: take the lock, publish the new list, copy out the handle,
+/// build the target-mode array, DROP the guard, and only then call.
+///
+/// Publishing BEFORE the call (not after) is likewise deliberate: the
+/// re-entrant query has to see the new list, or the OS is told about
+/// modes the driver then denies it.
+///
+/// # Failure is always "keep the current modes"
+///
+/// Constraint 1: an update that the OS refuses degrades to the previous
+/// list. It never departs the monitor, never touches the ring, and never
+/// fails the session. The rollback is best-effort by nature — the OS may
+/// already have consumed the new list in a re-entrant query before
+/// returning failure — so the trace records what happened rather than
+/// pretending the two views are atomic.
+pub fn update_modes(session_id: u64, modes: Vec<Mode>) {
+    let shell = Shell::get();
+
+    // The DDI documents TargetModeCount as "cannot be zero". The merge
+    // cannot produce an empty list, so this is a guard against a future
+    // caller, not a live case — but it must never reach the OS.
+    if modes.is_empty() {
+        tracelogging::write_event!(
+            PROVIDER,
+            "UpdateModesFailed",
+            level(Warning),
+            u64("session", &session_id),
+            u32("stage", &UPD_STAGE_EMPTY),
+            i32("code", &luminal_driver_proto::err::BAD_MODE)
+        );
+        return;
+    }
+
+    // A session parked by a TDR duck-out has no monitor object to push
+    // at — it was departed, and the replug creates a NEW one. Patch the
+    // parked spec so the re-arrival advertises the new list; without this
+    // the update would be silently undone by the recovery.
+    {
+        let mut ducked = shell.ducked.lock().unwrap();
+        if let Some(d) = ducked.iter_mut().find(|d| d.session_id == session_id) {
+            d.modes = modes;
+            drop(ducked);
+            tracelogging::write_event!(
+                PROVIDER,
+                "UpdateModesDeferred",
+                level(Informational),
+                u64("session", &session_id),
+                u32("stage", &UPD_STAGE_PARKED)
+            );
+            return;
+        }
+    }
+
+    // --- Under the lock: publish, snapshot, build. No IddCx calls. ---
+    let (monitor, previous, previous_static, target_modes) = {
+        let mut monitors = shell.monitors.lock().unwrap();
+        let Some(rt) = monitors.get_mut(&session_id) else {
+            tracelogging::write_event!(
+                PROVIDER,
+                "UpdateModesFailed",
+                level(Warning),
+                u64("session", &session_id),
+                u32("stage", &UPD_STAGE_NO_MONITOR),
+                i32("code", &luminal_driver_proto::err::NO_SUCH_SESSION)
+            );
+            return;
+        };
+        let monitor = rt.monitor;
+        let previous = core::mem::replace(&mut rt.modes, modes);
+        let previous_static = rt.static_mode_count;
+        // static_mode_count deliberately unchanged: the appended entries
+        // are NOT described by the EDID this monitor object was created
+        // with, and that EDID cannot be reissued.
+        let mut target_modes: Vec<ffi::IDDCX_TARGET_MODE2> =
+            vec![unsafe { zeroed() }; rt.modes.len()];
+        for (slot, mode) in target_modes.iter_mut().zip(rt.modes.iter()) {
+            fill_target_mode2(slot, mode);
+        }
+        (monitor, previous, previous_static, target_modes)
+    };
+    let count = target_modes.len() as u32;
+    let dynamic = (count as usize).saturating_sub(previous_static) as u32;
+
+    // A duck is in flight: the monitor is arrived but its transport is
+    // REBUILDING and the recovery poller is judging whether the OS
+    // re-assigns on its own. Do not hand that decision a mode-list change
+    // mid-flight — the new list is already stored, so the OS picks it up
+    // at the next parse/query the recovery drives anyway.
+    if shell.tdr_duck_pending.load(std::sync::atomic::Ordering::SeqCst) {
+        tracelogging::write_event!(
+            PROVIDER,
+            "UpdateModesDeferred",
+            level(Informational),
+            u64("session", &session_id),
+            u32("stage", &UPD_STAGE_DUCK_PENDING),
+            u32("modes", &count)
+        );
+        return;
+    }
+
+    // Last check before touching the OS: a final device exit (D3Final)
+    // clears the adapter, and the OS destroys its child monitor objects
+    // with it. Every monitor LIFECYCLE call is serialized with this one on
+    // the effects worker — plug, unplug, duck and replug all run here — so
+    // the handle cannot be departed underneath us; the power callback is
+    // the one path that is NOT on this thread. `plug` accepts the same
+    // exposure with a single entry check (a documented, accepted residual
+    // risk); doing it immediately before the call leaves only lock-free
+    // work in the window.
+    if shell.adapter().is_none() {
+        tracelogging::write_event!(
+            PROVIDER,
+            "UpdateModesDeferred",
+            level(Warning),
+            u64("session", &session_id),
+            u32("stage", &UPD_STAGE_NO_ADAPTER),
+            u32("modes", &count)
+        );
+        return;
+    }
+
+    // --- No locks held. The OS may re-enter our DDIs inside this call. ---
+    let status = unsafe {
+        let mut in_args: ffi::IDARG_IN_UPDATEMODES2 = zeroed();
+        // OTHER is the honest reason: the enum's other values are power /
+        // bandwidth / product-configuration constraints, and "the client
+        // enabled frame generation" is none of those.
+        in_args.Reason = ffi::IDDCX_UPDATE_REASON_IDDCX_UPDATE_REASON_OTHER;
+        in_args.TargetModeCount = count;
+        in_args.pTargetModes = target_modes.as_ptr().cast_mut();
+        bindings::monitor_update_modes2(monitor.0.cast(), &in_args)
+    };
+    // `target_modes` stays alive until here by construction — the OS only
+    // borrows it for the duration of the call.
+
+    if status == STATUS_SUCCESS {
+        tracelogging::write_event!(
+            PROVIDER,
+            "UpdateModesApplied",
+            level(Informational),
+            u64("session", &session_id),
+            u32("modes", &count),
+            u32("dynamic", &dynamic),
+            i32("status", &status)
+        );
+        return;
+    }
+
+    // --- Failure: restore the previous list. ---
+    // Re-verify identity first (the AssignRacedUnplug pattern): between
+    // dropping the guard and here, the session can have been destroyed,
+    // reaped, ducked, or replugged onto a NEW monitor object — and
+    // writing a stale list onto a fresh monitor would be worse than the
+    // failure being rolled back.
+    let mut rolled_back = false;
+    let mut raced = false;
+    {
+        let mut monitors = shell.monitors.lock().unwrap();
+        match monitors.get_mut(&session_id) {
+            Some(rt) if rt.monitor == monitor => {
+                rt.modes = previous;
+                rt.static_mode_count = previous_static;
+                rolled_back = true;
+            }
+            _ => raced = true,
+        }
+    }
+    tracelogging::write_event!(
+        PROVIDER,
+        "UpdateModesFailed",
+        level(Warning),
+        u64("session", &session_id),
+        u32("stage", &if raced { UPD_STAGE_ROLLBACK_RACED } else { UPD_STAGE_OS_CALL }),
+        i32("code", &status),
+        u32("modes", &count),
+        u32("rolled_back", &u32::from(rolled_back))
+    );
+
+    // Surface it to the host without inventing a new channel: the sticky
+    // per-monitor last_error is already in every GET_STATUS reply. Taken
+    // AFTER the IddCx call returned and with no other lock held — the
+    // device lock is held for the whole of every dispatch(), so it must
+    // never be on the far side of an OS call.
+    if let Some(m) = shell.dev.lock().unwrap().table.get_mut(session_id) {
+        m.last_error = luminal_driver_proto::err::UPDATE_FAILED;
+    }
+}
+
 /// Find the session whose EDID identity octets match `desc` bytes 8..16.
-fn session_modes_for_edid(data: &[u8]) -> Option<Vec<Mode>> {
+fn session_modes_for_edid(data: &[u8]) -> Option<ModeSnapshot> {
     if data.len() < 128 {
         return None;
     }
@@ -431,16 +686,34 @@ fn session_modes_for_edid(data: &[u8]) -> Option<Vec<Mode>> {
     monitors
         .values()
         .find(|rt| rt.edid[8..16] == data[8..16])
-        .map(|rt| rt.modes.clone())
+        .map(|rt| ModeSnapshot { modes: rt.modes.clone(), static_count: rt.static_mode_count })
 }
 
-fn modes_for_monitor_object(monitor: ffi::IDDCX_MONITOR) -> Option<Vec<Mode>> {
+fn modes_for_monitor_object(monitor: ffi::IDDCX_MONITOR) -> Option<ModeSnapshot> {
     let shell = Shell::get();
     let monitors = shell.monitors.lock().unwrap();
     monitors
         .values()
         .find(|rt| rt.monitor == OsHandle(monitor.cast()))
-        .map(|rt| rt.modes.clone())
+        .map(|rt| ModeSnapshot { modes: rt.modes.clone(), static_count: rt.static_mode_count })
+}
+
+/// Fill one `IDDCX_TARGET_MODE2` slot from a mode.
+///
+/// THE single definition, shared by `evt_query_target_modes2` (the OS
+/// asking) and `update_modes` (the driver pushing). Build 17 added the
+/// second caller; keeping one function is what makes it impossible for
+/// the pushed list and the queried list to describe the same mode
+/// differently — a divergence the OS would resolve by simply not
+/// activating the mode, with nothing anywhere saying why.
+fn fill_target_mode2(slot: &mut ffi::IDDCX_TARGET_MODE2, mode: &Mode) {
+    slot.Size = size_of::<ffi::IDDCX_TARGET_MODE2>() as u32;
+    slot.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, 1);
+    // Zero, matching MaxDisplayPipelineRate = 0: bandwidth management
+    // unused. A nonzero requirement against a zero adapter budget makes
+    // every mode unactivatable (Extend reverts, Scale/Res grayed).
+    slot.RequiredBandwidth = 0;
+    slot.BitsPerComponent = wire_bpc_for(mode);
 }
 
 /// Build the DISPLAYCONFIG signal block for one mode. Zero-blanking
@@ -482,20 +755,24 @@ pub unsafe extern "C" fn evt_parse_monitor_description(
         return STATUS_INVALID_PARAMETER;
     }
     let data = core::slice::from_raw_parts(desc.pData.cast::<u8>(), desc.DataSize as usize);
-    let Some(modes) = session_modes_for_edid(data) else {
+    let Some(snapshot) = session_modes_for_edid(data) else {
         return STATUS_INVALID_PARAMETER;
     };
 
-    out.MonitorModeBufferOutputCount = modes.len() as u32;
+    out.MonitorModeBufferOutputCount = snapshot.len() as u32;
+    // modes[0] is preferred, and `UPDATE_MODES` can only APPEND — so this
+    // index keeps naming the same mode for the life of the monitor, which
+    // is what lets it stay consistent with the frozen EDID's preferred
+    // detailed timing.
     out.PreferredMonitorModeIdx = 0;
     if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = modes.len().min(inp.MonitorModeBufferInputCount as usize);
+    let fill = snapshot.len().min(inp.MonitorModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pMonitorModes, fill);
-    for (slot, mode) in slots.iter_mut().zip(modes.iter()) {
+    for (i, (slot, mode)) in slots.iter_mut().zip(snapshot.modes.iter()).enumerate() {
         slot.Size = size_of::<ffi::IDDCX_MONITOR_MODE>() as u32;
-        slot.Origin = ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+        slot.Origin = snapshot.origin(i);
         slot.MonitorVideoSignalInfo = signal_info(mode, 0);
     }
     out.MonitorModeBufferOutputCount = fill as u32;
@@ -522,17 +799,17 @@ pub unsafe extern "C" fn evt_query_target_modes(
 ) -> NTSTATUS {
     let inp = &*in_args;
     let out = &mut *out_args;
-    let Some(modes) = modes_for_monitor_object(monitor) else {
+    let Some(snapshot) = modes_for_monitor_object(monitor) else {
         return STATUS_INVALID_PARAMETER;
     };
 
-    out.TargetModeBufferOutputCount = modes.len() as u32;
+    out.TargetModeBufferOutputCount = snapshot.len() as u32;
     if inp.TargetModeBufferInputCount == 0 || inp.pTargetModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = modes.len().min(inp.TargetModeBufferInputCount as usize);
+    let fill = snapshot.len().min(inp.TargetModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pTargetModes, fill);
-    for (slot, mode) in slots.iter_mut().zip(modes.iter()) {
+    for (slot, mode) in slots.iter_mut().zip(snapshot.modes.iter()) {
         slot.Size = size_of::<ffi::IDDCX_TARGET_MODE>() as u32;
         slot.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, 1);
         // Zero, matching MaxDisplayPipelineRate = 0: bandwidth management
@@ -609,7 +886,7 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         return STATUS_INVALID_PARAMETER;
     }
     let data = core::slice::from_raw_parts(desc.pData.cast::<u8>(), desc.DataSize as usize);
-    let Some(modes) = session_modes_for_edid(data) else {
+    let Some(snapshot) = session_modes_for_edid(data) else {
         // The OS is asking about an EDID no live session owns — activation
         // cannot proceed for that monitor. Cold-boot instrumentation
         // (2026-07-25): the build-12 activation failure needed exactly
@@ -621,24 +898,31 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         );
         return STATUS_INVALID_PARAMETER;
     };
+    // `dynamic` is the build-17 question this event exists to answer: if
+    // the OS never re-parses after an IddCxMonitorUpdateModes2, a
+    // dynamically added mode can never survive the OS's monitor∩target
+    // intersection, and a trace showing ParseDescription2 with dynamic=0
+    // after an UpdateModesApplied says so in one line.
+    let dynamic = (snapshot.len() - snapshot.static_count) as u32;
     tracelogging::write_event!(
         PROVIDER,
         "ParseDescription2",
         level(Informational),
-        u32("modes", &(modes.len() as u32)),
+        u32("modes", &(snapshot.len() as u32)),
+        u32("dynamic", &dynamic),
         u32("buffer", &inp.MonitorModeBufferInputCount)
     );
 
-    out.MonitorModeBufferOutputCount = modes.len() as u32;
+    out.MonitorModeBufferOutputCount = snapshot.len() as u32;
     out.PreferredMonitorModeIdx = 0;
     if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = modes.len().min(inp.MonitorModeBufferInputCount as usize);
+    let fill = snapshot.len().min(inp.MonitorModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pMonitorModes, fill);
-    for (slot, mode) in slots.iter_mut().zip(modes.iter()) {
+    for (i, (slot, mode)) in slots.iter_mut().zip(snapshot.modes.iter()).enumerate() {
         slot.Size = size_of::<ffi::IDDCX_MONITOR_MODE2>() as u32;
-        slot.Origin = ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+        slot.Origin = snapshot.origin(i);
         slot.MonitorVideoSignalInfo = signal_info(mode, 0);
         slot.BitsPerComponent = wire_bpc_for(mode);
     }
@@ -653,7 +937,7 @@ pub unsafe extern "C" fn evt_query_target_modes2(
 ) -> NTSTATUS {
     let inp = &*in_args;
     let out = &mut *out_args;
-    let Some(modes) = modes_for_monitor_object(monitor) else {
+    let Some(snapshot) = modes_for_monitor_object(monitor) else {
         tracelogging::write_event!(
             PROVIDER,
             "QueryTargetModes2NoSession",
@@ -662,28 +946,24 @@ pub unsafe extern "C" fn evt_query_target_modes2(
         );
         return STATUS_INVALID_PARAMETER;
     };
+    let dynamic = (snapshot.len() - snapshot.static_count) as u32;
     tracelogging::write_event!(
         PROVIDER,
         "QueryTargetModes2",
         level(Informational),
-        u32("modes", &(modes.len() as u32)),
+        u32("modes", &(snapshot.len() as u32)),
+        u32("dynamic", &dynamic),
         u32("buffer", &inp.TargetModeBufferInputCount)
     );
 
-    out.TargetModeBufferOutputCount = modes.len() as u32;
+    out.TargetModeBufferOutputCount = snapshot.len() as u32;
     if inp.TargetModeBufferInputCount == 0 || inp.pTargetModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = modes.len().min(inp.TargetModeBufferInputCount as usize);
+    let fill = snapshot.len().min(inp.TargetModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pTargetModes, fill);
-    for (slot, mode) in slots.iter_mut().zip(modes.iter()) {
-        slot.Size = size_of::<ffi::IDDCX_TARGET_MODE2>() as u32;
-        slot.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, 1);
-        // Zero, matching MaxDisplayPipelineRate = 0: bandwidth management
-        // unused. A nonzero requirement against a zero adapter budget makes
-        // every mode unactivatable (Extend reverts, Scale/Res grayed).
-        slot.RequiredBandwidth = 0;
-        slot.BitsPerComponent = wire_bpc_for(mode);
+    for (slot, mode) in slots.iter_mut().zip(snapshot.modes.iter()) {
+        fill_target_mode2(slot, mode);
     }
     out.TargetModeBufferOutputCount = fill as u32;
     STATUS_SUCCESS

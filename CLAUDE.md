@@ -897,3 +897,121 @@ without reinstalling. Validation must run through the SYSTEM service path,
 not an elevated probe (Insider-29617 caveat above), and the gate is verified
 by reading back the devnode's Device Parameters key. Note build 16 stacks on
 ground where the 13/14/15 field checklists are still pending.
+
+### Build 17 — dynamic mode lists (2026-07-30, branch `feat/dynamic-modes-build17`; UNSIGNED, UNINSTALLED, UNVALIDATED)
+
+Branched from `feat/duck-the-device-build16` @ 7a3f696, so build 16 rides
+along. **A monitor's advertised mode list can now GROW without a
+DESTROY+CREATE cycle** — proto 0.5 `UPDATE_MODES` (`FN 0x809`,
+`IOCTL 0x0022_2024`) bound to `IddCxMonitorUpdateModes2`. The motivating
+case has no create-time answer: a client streams "Desktop" over Moonlight,
+the display exists at the base rate, and only THEN a frame-generation title
+launches wanting a doubled rate that was never advertised. The only prior
+remedy was a monitor cycle, which broadcasts `DBT_DEVNODES_CHANGED` (kills
+GTA V Enhanced via its own uncatchable `0xC000041D` handler) and which
+amplified the 2026-07-30 wedge.
+
+Verified before writing any code (do not re-derive): `IddCxMonitorUpdateModes`
+= table index 6, `IddCxMonitorUpdateModes2` = 34, `IddFunctionTableNumEntries`
+= 36 for 1.10 — in the eWDK header the build compiles against
+(`10.0.28000.0/um/iddcx/1.10/IddCxFuncEnum.h:230,258`) AND in our generated
+bindings. Both were already emitted by bindgen; only the wrappers were
+missing.
+
+- **Additive-merge is the safety property, not a convenience** (`Mode::merge_additive`,
+  core/modes.rs). Entries are only APPENDED, never removed or reordered.
+  Therefore: `modes[0]` never moves, so the EDID's preferred detailed timing
+  — frozen at `IddCxMonitorCreate`, not reissuable on a live monitor — keeps
+  describing the mode we still call preferred; and the mode the OS has
+  COMMITTED can never disappear, which is what stops an update forcing a
+  modeset mid-stream. The driver cannot identify the committed mode
+  (`evt_commit_modes2` stores nothing), so "never drop anything" is the only
+  available guarantee. Shrinking a live list is deliberately not expressible.
+- **Appended modes are `ORIGIN_DRIVER`, not `ORIGIN_MONITORDESCRIPTOR`**
+  (`MonitorRt.static_mode_count` splits the list). They demonstrably did not
+  come from the frozen EDID, and the OS validates descriptor-origin modes
+  against the description it holds — claiming otherwise is a false statement
+  it may act on. Create-time modes keep MONITORDESCRIPTOR exactly as shipped.
+- **The lock protocol is the whole of the danger.** `IddCxMonitorUpdateModes2`
+  makes the OS re-enter `QueryTargetModes2` / `ParseDescription2` /
+  `AssignSwapChain` SYNCHRONOUSLY on the calling thread, and all of those take
+  `shell.monitors`; `std::sync::Mutex` is not reentrant. `monitors::update_modes`
+  takes the lock, publishes the new list (the re-entrant query MUST see it),
+  copies the handle, builds the `IDDCX_TARGET_MODE2` array, DROPS the guard,
+  then calls. Only the effects worker may call it (`Effect::UpdateModes` →
+  `apply_now`) — never an IOCTL or callback frame (§3.3 rule 3; CLAUDE.md:316,548).
+  `fill_target_mode2` is now the single fill used by both the push and
+  `evt_query_target_modes2`, so pushed and queried lists cannot diverge.
+- **Failure degrades to "keep the current modes"** (constraint 1): the previous
+  Vec is restored after re-verifying session id AND monitor handle still match
+  (the `AssignRacedUnplug` pattern), never a departure, never a refused session.
+  The rollback is best-effort by nature — the OS may already have consumed the
+  new list in a re-entrant query — so the trace records what happened instead of
+  pretending it is atomic. `err::UPDATE_FAILED` (-13) lands in the monitor's
+  sticky `GET_STATUS` last error.
+- **Three places the list lives, all covered.** `MonitorRt.modes` (live),
+  `core::session::Monitor.modes` (durable — what every replug-from-DeviceState
+  plugs with; without it a device re-add / D3Final re-bring-up / pool restore
+  silently reverts), and `DuckedMonitor.modes` (parked under the legacy TDR
+  gate — an update landing while parked patches the parked spec instead of
+  calling IddCx, since the re-arrival creates a NEW monitor object).
+- **Deferrals rather than refusals**: a duck in flight (`tdr_duck_pending`) or a
+  cleared adapter stores the list and skips the OS push — traced — so the
+  recovery's own re-negotiation picks it up. Build 16's regression test
+  (`tdr::tests::recovered_ring_settles_even_though_its_worker_pins_the_mutex`)
+  stays green; nothing was added between the poller and the ring.
+- **Versioning, both directions.** PROTO_VERSION_MINOR 4→5;
+  `PROTO_VERSION_MINOR_REQUIRED` stays **3** — raising it would make a build-17
+  host fail the handshake against every alpha.2/alpha.4 driver in the field,
+  presenting as `NOT_HANDSHAKEN` on every session IOCTL, i.e. a refused
+  session. Detection is `caps::DYNAMIC_MODES` (1 << 9 — NOT the never-set
+  `REFRESH_DOUBLING` bit), which already travels in the handshake, GET_STATUS
+  and `VgdCaps.caps`. Reply structs can never grow (all-or-nothing writes on
+  one side, exact-length checks on the other), hence `UpdateModesReply.reserved[6]`;
+  requests grow by appending, hence `UPDATE_MODES_REQUEST_SIZE_V5` named on day one.
+- **`result == OK` means ACCEPTED, not applied.** The IRP completes before the
+  effects run, so the reply structurally cannot carry the IddCx status. Do not
+  let host code (or docs) claim otherwise.
+- ETW (existing provider): `UpdateModesAccepted`, `UpdateModesDenied(stage,code)`,
+  `UpdateModesApplied(modes,dynamic,status)`, `UpdateModesDeferred(stage)`,
+  `UpdateModesFailed(stage,code,rolled_back)`, plus a `dynamic` field added to
+  `ParseDescription2` / `QueryTargetModes2`. Note this is the FIRST ETW at the
+  dispatch layer at all — nothing there traced anything before, which is how
+  the build-8 ACL outage stayed unexplained for three builds.
+- Found and fixed while testing: the UPDATE_MODES arm validated the OUTPUT
+  buffer only at reply-write time, so a short output buffer mutated the session
+  table while the effect was dropped with `BadBuffer` — permanently diverging
+  the durable list from the advertised one. The arm now checks the output size
+  before touching the table. (CREATE_MONITOR has the same shape; harmless there
+  — the session just exists un-plugged and the watchdog reaps it — and left
+  alone deliberately.)
+
+**THE OPEN QUESTION, and it can invalidate the feature.** `IDARG_IN_UPDATEMODES2`
+carries TARGET modes only. `IddCx.h:258-264` says the OS skips
+`ParseMonitorDescription2` ONLY for remote drivers setting
+`REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE` — which a console-session driver
+(entry.rs sets only CAN_PROCESS_FP16) is not and cannot be. So the presented
+list stays monitor∩target, and an ADDED mode surfaces only if the OS
+re-solicits the parse DDI after the update. Our parse/query handlers read the
+live list, so a re-parse is sufficient — but NOTHING in the 1.10 headers says
+whether one happens, and no entry point in the whole 36-entry table updates a
+monitor description. Equally undocumented: whether an update broadcasts a
+devnode change (the header says only "An OS callback function the driver calls
+to update the mode list"). **Do not assert either way in code or docs until
+measured.** One traced install answers both: `vgd-probe 2560x1440@120 --hold 30
+--add-mode 2560x1440@240 --add-after 10` with a logman session on the provider
+GUID — look for `UpdateModesApplied`, then whether `ParseDescription2` /
+`QueryTargetModes2` reappear with `dynamic=1`, whether the added rate shows up
+in Display Settings, and whether any devnode-change follows. If the OS does not
+re-parse, dynamic ADD is not achievable through this DDI for a console-session
+driver and the approach has to change before more is built on it. Everything
+shipped here is still correct and safe in that case — it just would not surface
+a new mode.
+
+Host-side work remaining (LuminalShine, NOT done here): the pinned submodule
+`src/drivers/luminal-display` is at da0349b = build 15 / proto 0.4, so it cannot
+even see build 16 — any host work needs that pointer advanced first. Then the
+call site at `virtual_display_vgd.cpp:361` (which today can only advertise the
+base rate at CREATE time, and only if framegen is already known active) gains an
+`UPDATE_MODES` path gated on `VGD_CAP_DYNAMIC_MODES`, degrading silently in the
+style of the existing `proto_minor < 4` nits log.

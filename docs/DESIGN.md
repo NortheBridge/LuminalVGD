@@ -104,6 +104,7 @@ Device interface GUID (new, LuminalVGD-owned): `LUMINAL_VGD_INTERFACE_GUID`.
 | `QUERY_LEASE { session_id }` | identity, connector, remaining lease time |
 | `SET_RENDER_ADAPTER { luid }` | device-wide preference for unset-adapter creates |
 | `SET_PERMANENT_POOL` / `QUERY_PERMANENT_POOL` | always-on display pool (see §3.2.2) |
+| `UPDATE_MODES { session_id, modes[≤4] }` | grow a LIVE monitor's mode list (see §3.2.5); `caps::DYNAMIC_MODES` |
 | `GET_STATUS` | monitor list, ring health, last error — for diagnostics |
 
 SudoVDA behaviors preserved: max-monitors cap (default 10), PING-fed
@@ -153,6 +154,67 @@ detailed timing, and real physical dimensions (mm, from the create request
 — drives correct DPI scaling); the CTA-861 extension carries HDR static
 metadata (PQ EOTF, ST 2086 luminance) and BT.2020 colorimetry, which is
 what makes the Windows HDR toggle dependable on a virtual display.
+
+#### 3.2.5 Dynamic mode lists (`caps::DYNAMIC_MODES`, proto 0.5, build 17)
+
+Before build 17 a monitor's advertised mode list was fixed at
+`CREATE_MONITOR`: the only way to change it was `DESTROY_MONITOR` +
+`CREATE_MONITOR`, i.e. a monitor cycle — which broadcasts
+`DBT_DEVNODES_CHANGED` (the documented GTA V Enhanced killer, an
+uncatchable `0xC000041D` in its own handler) and which amplified the
+2026-07-30 machine-wide wedge. The motivating case has no create-time
+answer at all: a client streams "Desktop" over Moonlight, the display is
+created at the base refresh rate, and only *then* does the user launch a
+frame-generation title whose doubled rate was never advertised.
+
+`UPDATE_MODES` binds `IddCxMonitorUpdateModes2` (function-table index 34;
+the v1 entry at index 6 is bound for symmetry but never called — it cannot
+carry `BitsPerComponent`, which our per-mode wire depth needs).
+
+The semantics are **additive-merge**, and every clause is a safety
+property rather than a convenience:
+
+- The request is unioned into the current list; entries are only ever
+  APPENDED, never removed or reordered, capped at `MAX_MODES_PER_MONITOR`.
+- `modes[0]` therefore never changes, so the EDID's preferred detailed
+  timing — frozen at `IddCxMonitorCreate` and not reissuable on a live
+  monitor — keeps describing the mode the driver still calls preferred,
+  and `PreferredMonitorModeIdx = 0` keeps its meaning.
+- The mode the OS has *committed* can never disappear. The driver cannot
+  identify it (`EvtIddCxMonitorCommitModes2` stores nothing), so "never
+  drop anything" is the only way to guarantee an update cannot invalidate
+  the active mode and force a modeset mid-stream.
+- Appended modes are reported as `IDDCX_MONITOR_MODE_ORIGIN_DRIVER`, not
+  `..._MONITORDESCRIPTOR`: they demonstrably did not come from the frozen
+  EDID, and the OS validates descriptor-origin modes against the
+  description it holds.
+
+Application rules (DESIGN.md §3.3): the IOCTL only merges and validates,
+then queues an `Effect::UpdateModes`; the OS call happens on the effects
+worker with **no lock held**, because `IddCxMonitorUpdateModes2` makes the
+OS re-enter `EvtIddCxMonitorQueryTargetModes2` /
+`EvtIddCxParseMonitorDescription2` synchronously on the calling thread and
+`std::sync::Mutex` is not reentrant. The new list is published into the
+monitor runtime *before* the call (the re-entrant query must see it) and
+restored on failure. A failed update degrades to "keep the current modes"
+— never a departure, never a refused session — and surfaces as
+`err::UPDATE_FAILED` in the monitor's sticky `GET_STATUS` last error plus
+an ETW event carrying stage and status.
+
+**Open empirical question (build 17's first traced install must answer
+it).** `IDARG_IN_UPDATEMODES2` carries TARGET modes only. The OS skips
+`EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION2` only for remote drivers that set
+`IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE`, which we
+are not and cannot be — so the presented list stays the intersection of
+the monitor-mode list with the target-mode list, and an ADDED mode
+surfaces only if the OS re-solicits the parse DDI after the update. No
+IddCx 1.10 entry point updates a monitor description (verified against the
+whole 36-entry table). Our parse/query handlers already read the live
+list, so a re-parse is sufficient; nothing in the headers says whether one
+happens. The `ParseDescription2` / `QueryTargetModes2` ETW events carry a
+`dynamic` count for exactly this, and `vgd-probe --add-mode` exercises it
+standalone. Likewise undocumented: whether an update broadcasts a devnode
+change. Do not assert either way in code or docs until measured.
 
 ### 3.3 Recovery-first driver design (the WUDFHost-hang killer)
 

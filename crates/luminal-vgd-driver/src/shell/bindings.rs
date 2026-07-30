@@ -75,6 +75,53 @@ pub unsafe fn monitor_departure(monitor: IDDCX_MONITOR) -> NTSTATUS {
     iddcx_call!(_IDDFUNCENUM_IddCxMonitorDepartureTableIndex as PFN_IDDCXMONITORDEPARTURE, monitor)
 }
 
+/// Push a new TARGET-mode list for a monitor that is already ARRIVED
+/// (build 17, proto `UPDATE_MODES`). Table index 6 — a 1.0-era entry
+/// present in every IddCx version, so unlike the *2 variants there is no
+/// availability question at all.
+///
+/// Bound for symmetry with the query DDIs (both variants are registered),
+/// but the driver CALLS ONLY [`monitor_update_modes2`]: the v1
+/// `IDDCX_TARGET_MODE` has no `BitsPerComponent`, and our wire depth is
+/// per-mode (`monitors::wire_bpc_for`), so a v1 push would silently drop
+/// the 10/12-bit and HDR wire information `evt_query_target_modes2`
+/// reports for the very same modes. Calling both would push the list
+/// twice.
+pub unsafe fn monitor_update_modes(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_UPDATEMODES,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorUpdateModesTableIndex as PFN_IDDCXMONITORUPDATEMODES,
+        monitor,
+        in_args
+    )
+}
+
+/// v1.10 variant, table index 34 — THE entry build 17 calls. Carries
+/// `IDDCX_TARGET_MODE2` (with `BitsPerComponent`), matching what
+/// `evt_query_target_modes2` reports.
+///
+/// Safe to call unconditionally: IddMinimumVersionRequired = 10 means the
+/// OS only loads us with a ≥1.10 function table (index 34 is inside the
+/// 1.10 table of 36 entries). Note the C header wraps THIS entry — but
+/// not index 6 — in `IDD_IS_FUNCTION_AVAILABLE`, whose else-branch calls
+/// `WdfDriverErrorReportApiMissing` with `isFatal = TRUE`. Our macro
+/// indexes the table directly and never reaches that branch, exactly like
+/// `swapchain_release_and_acquire_buffer2` and
+/// `monitor_query_hardware_cursor3`; the min-version declaration is what
+/// makes that legal, so do not "fix" this into a guarded call.
+pub unsafe fn monitor_update_modes2(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_UPDATEMODES2,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorUpdateModes2TableIndex as PFN_IDDCXMONITORUPDATEMODES2,
+        monitor,
+        in_args
+    )
+}
+
 pub unsafe fn swapchain_set_device(
     swapchain: IDDCX_SWAPCHAIN,
     in_args: *const IDARG_IN_SWAPCHAINSETDEVICE,
