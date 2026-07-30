@@ -8,8 +8,9 @@
 //! │ shell (Windows + eWDK only — phase 2)                        │
 //! │  WDF/IddCx callbacks, D3D ring, swapchain worker threads     │
 //! ├──────────────────────────────────────────────────────────────┤
-//! │ dispatch (this crate, portable, tested)                      │
-//! │  IOCTL byte parsing → session logic → reply bytes + effects  │
+//! │ dispatch + tdr (this crate, portable, tested)                │
+//! │  IOCTL byte parsing → session logic → reply bytes + effects; │
+//! │  the lock-free TDR recovery discriminator (tdr::RingLive)    │
 //! ├──────────────────────────────────────────────────────────────┤
 //! │ luminal-vgd-core (portable, tested)                          │
 //! │  session table, watchdog, modes, adapters, EDID, ring policy │
@@ -41,6 +42,7 @@
 //! | watchdog WDF timer (1 s)                | [`dispatch::watchdog_tick`] → unplug reaped monitors |
 
 pub mod dispatch;
+pub mod tdr;
 
 #[cfg(all(target_os = "windows", feature = "shell"))]
 pub mod shell;

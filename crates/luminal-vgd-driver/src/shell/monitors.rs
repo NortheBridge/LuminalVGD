@@ -90,7 +90,7 @@ pub fn plug(
         // yet), before the monitor arrives. Plug runs on the effects
         // worker shortly after the CREATE_MONITOR reply completes; the
         // host's ring open already retries on its own timeout budget.
-        let ring = std::sync::Arc::new(std::sync::Mutex::new(
+        let ring = std::sync::Arc::new(super::swapchain::RingHandle::new(
             super::swapchain::FrameRing::new(session_id, ring_slots),
         ));
         let displaced = shell.monitors.lock().unwrap().insert(
@@ -213,10 +213,33 @@ pub fn unplug(session_id: u64) {
 /// self-drained here — otherwise entries pushed after the teardown's
 /// drain would leak and later replug as ghost monitors.
 pub fn duck_all(expected_epoch: u64) -> usize {
+    duck_selected(expected_epoch, None)
+}
+
+/// Depart ONLY the named sessions (build 16's escalation arms).
+///
+/// `run_tdr_device_duck` scopes a device duck to the adapter LUID that
+/// actually reported removal, precisely so a monitor rendering on a healthy
+/// second GPU is not dragged into another adapter's reset — but the
+/// escalation arms then called `duck_all` and departed everything anyway,
+/// throwing that scoping away at the exact moment it mattered. The device
+/// duck's arms use this instead; the legacy (build-14/15) duck keeps
+/// `duck_all`, whose semantics are "every monitor, unconditionally".
+pub fn duck_sessions(expected_epoch: u64, sessions: &[u64]) -> usize {
+    duck_selected(expected_epoch, Some(sessions))
+}
+
+fn duck_selected(expected_epoch: u64, only: Option<&[u64]>) -> usize {
     let shell = super::Shell::get();
     let drained: Vec<(u64, super::MonitorRt)> = {
         let mut monitors = shell.monitors.lock().unwrap();
-        monitors.drain().collect()
+        match only {
+            None => monitors.drain().collect(),
+            Some(sessions) => sessions
+                .iter()
+                .filter_map(|sid| monitors.remove_entry(sid))
+                .collect(),
+        }
     };
     let mut parked = 0usize;
     for (session_id, mut rt) in drained {
@@ -226,10 +249,15 @@ pub fn duck_all(expected_epoch: u64) -> usize {
         if let Some(cursor) = rt.cursor.as_mut() {
             cursor.stop();
         }
-        // Single bounded attempt: a detached worker may pin the ring
-        // mutex, and unlike mark_ring_dead there is no urgency to win —
-        // the host's stale-heartbeat detection covers an unmarked ring.
-        if let Ok(ring) = rt.ring.try_lock() {
+        // Mirror unconditionally (one store, cannot fail), then a single
+        // bounded attempt at the shared section: a detached worker may pin
+        // the ring mutex, and unlike mark_ring_dead there is no urgency to
+        // win — the host's stale-heartbeat detection covers an unmarked
+        // ring, and the TDR poller reads the mirror.
+        rt.ring
+            .live
+            .publish_state(luminal_driver_proto::ring_state::REBUILDING);
+        if let Ok(ring) = rt.ring.ring.try_lock() {
             if let Some(s) = &ring.section {
                 s.set_state(luminal_driver_proto::ring_state::REBUILDING);
             }

@@ -104,10 +104,12 @@ pub(crate) struct MonitorRt {
     /// wedged.
     pub adapter_luid: u64,
     pub worker: Option<swapchain::Worker>,
-    /// The transport ring (section + policy + textures). Lives here, not
-    /// in the worker, so sequences and the generation persist across
-    /// swap-chain reassignments; the active worker drives it exclusively.
-    pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
+    /// The transport ring (section + policy + textures) plus its lock-free
+    /// liveness mirror. Lives here, not in the worker, so sequences and the
+    /// generation persist across swap-chain reassignments; the active
+    /// worker drives it exclusively — and pins its mutex for its whole
+    /// life, which is why `RingHandle.live` exists beside it.
+    pub ring: std::sync::Arc<swapchain::RingHandle>,
     /// Hardware-cursor worker + section (None when spawn failed — the OS
     /// then composes the cursor into frames, the pre-cursor behavior).
     /// The worker owns every cursor IddCx call, including the
@@ -131,7 +133,14 @@ impl MonitorRt {
 /// Bounded DEAD-marking for a bare ring Arc (see MonitorRt::mark_ring_dead
 /// for the rationale) — also used for parked (ducked) monitors, which
 /// hold their ring outside a MonitorRt.
-pub(crate) fn mark_ring_dead_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) {
+pub(crate) fn mark_ring_dead_arc(handle: &std::sync::Arc<swapchain::RingHandle>) {
+    // The lock-free mirror is set FIRST and unconditionally. It costs one
+    // store, it cannot fail, and it means a lost try_lock below no longer
+    // loses the fact that this ring is dead — the TDR poller reads the
+    // mirror, so a dead-but-unmarkable ring now settles instead of being
+    // watched (and eventually requalified) forever.
+    handle.live.publish_state(luminal_driver_proto::ring_state::DEAD);
+    let ring = &handle.ring;
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
         match ring.try_lock() {
@@ -173,8 +182,14 @@ pub(crate) fn mark_ring_dead_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRin
 /// ring mutex for its lifetime); losing it is survivable — the host's
 /// stale-heartbeat detection covers an unmarked ring exactly as it did
 /// before build 16.
-pub(crate) fn mark_ring_rebuilding_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) {
-    let ring = match ring.try_lock() {
+pub(crate) fn mark_ring_rebuilding_arc(handle: &std::sync::Arc<swapchain::RingHandle>) {
+    // Mirror first, unconditionally — see mark_ring_dead_arc. This is what
+    // makes the arm work at all when the losing site is exactly the one
+    // that cannot take the lock: a duck armed against a ring whose mirror
+    // still said ACTIVE would settle on the poller's first tick and do
+    // nothing.
+    handle.live.publish_state(luminal_driver_proto::ring_state::REBUILDING);
+    let ring = match handle.ring.try_lock() {
         Ok(ring) => ring,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(TryLockError::WouldBlock) => {
@@ -187,62 +202,49 @@ pub(crate) fn mark_ring_rebuilding_arc(ring: &std::sync::Arc<Mutex<swapchain::Fr
     }
 }
 
-/// What one TDR device-duck poller tick found for a ring.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RingTick {
-    /// Still REBUILDING — no frame worker owns this ring, and the
-    /// heartbeat was refreshed so the host reads "coming back" rather than
-    /// "driver gone".
-    Rebuilding,
-    /// ACTIVE (a frame worker is publishing again) or DEAD (the session is
-    /// finished): either way the poller has nothing left to keep alive.
-    Settled,
-    /// The ring mutex was unavailable — a deadline-detached worker pins it
-    /// for its lifetime. Counted as NOT settled: the transport state is
-    /// unknown, and concluding "recovered" from an unreadable ring is the
-    /// one mistake that would strand the display with nothing watching it.
-    Blocked,
-}
+pub(crate) use crate::tdr::RingTick;
 
-/// One TDR device-duck poller tick against a bare ring Arc: read the
-/// transport state and, while it is still REBUILDING, keep the shared
-/// header's `driver_heartbeat_qpc` advancing.
+/// One TDR device-duck poller tick against a ring handle: decide whether
+/// the transport came back and, while it has not, keep the shared header's
+/// `driver_heartbeat_qpc` advancing.
 ///
-/// Build 16 needs the heartbeat because keeping the monitor arrived across
+/// **The discriminator is `handle.live`, and it is read with NO LOCK.**
+/// That ordering is the whole point. `frame_loop` pins the FrameRing mutex
+/// for the entire life of a worker, so a recovered, actively-publishing
+/// ring can never grant a `try_lock` — build 16's first cut asked the mutex
+/// first, mapped `WouldBlock` to "not recovered", and thereby made a
+/// genuine recovery indistinguishable from a dead GPU: the zero-modeset
+/// good exit became unreachable, and ~10 s later the requalify arm departed
+/// a display that had already healed. See `crate::tdr` for the full
+/// mechanism.
+///
+/// The lock is still taken, but ONLY to refresh the heartbeat of a ring the
+/// mirror has already told us is still REBUILDING. Losing it there is no
+/// longer a recovery decision — just a lost heartbeat, which the host's
+/// stale-heartbeat handling has always covered.
+///
+/// Build 16 needs that heartbeat because keeping the monitor arrived across
 /// a GPU reset leaves the ring worker-less, and every other `heartbeat()`
 /// call site lives inside `frame_loop` — without it the host declares the
 /// driver stale after `RING_HEARTBEAT_STALE_MS` (2 s) even though the
 /// display path is alive and recovering. Pure shared-memory access: no D3D
 /// device, no IddCx call, nothing that can fail against a wedged GPU.
-///
-/// It needs the STATE because the state is the only honest answer to "did
-/// the transport actually come back". Only `frame_loop` sets ACTIVE, and
-/// only after `IddCxSwapChainSetDevice` succeeded on a freshly created
-/// device — so a replacement worker that died in `create_device_on_luid`
-/// (the GPU is still gone) leaves the ring REBUILDING and the poller
-/// correctly keeps watching. Counting swapchain ASSIGNMENTS instead would
-/// call that case recovered and walk away.
-///
-/// A ring with no section (creation failed at plug; the host is on WGC)
-/// counts as settled — there is no transport to restore.
-///
-/// `try_lock`, never `lock`: a deadline-detached worker pins the ring
-/// mutex for its whole lifetime (see [`mark_ring_dead_arc`]) and this runs
-/// on a poller clock that must keep ticking.
-pub(crate) fn ring_tick_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) -> RingTick {
-    let ring = match ring.try_lock() {
+pub(crate) fn ring_tick_arc(handle: &std::sync::Arc<swapchain::RingHandle>) -> RingTick {
+    // LOCK-FREE FIRST — and if it says settled, the mutex is never touched.
+    if handle.live.settled() {
+        return crate::tdr::ring_tick(&handle.live, true);
+    }
+    let ring = match handle.ring.try_lock() {
         Ok(ring) => ring,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(TryLockError::WouldBlock) => return RingTick::Blocked,
+        // A deadline-detached worker pins the mutex for its lifetime; a
+        // LIVE one was already judged settled above.
+        Err(TryLockError::WouldBlock) => return crate::tdr::ring_tick(&handle.live, false),
     };
-    let Some(section) = &ring.section else {
-        return RingTick::Settled;
-    };
-    if section.state() != luminal_driver_proto::ring_state::REBUILDING {
-        return RingTick::Settled;
+    if let Some(section) = &ring.section {
+        section.heartbeat();
     }
-    section.heartbeat();
-    RingTick::Rebuilding
+    crate::tdr::ring_tick(&handle.live, true)
 }
 
 /// A monitor parked during a GPU reset: departed from the OS so TDR
@@ -256,7 +258,7 @@ pub(crate) struct DuckedMonitor {
     pub adapter_luid: u64,
     pub edid: Box<[u8; 256]>,
     pub modes: Vec<Mode>,
-    pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
+    pub ring: std::sync::Arc<swapchain::RingHandle>,
 }
 
 pub(crate) struct Shell {

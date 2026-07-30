@@ -781,6 +781,45 @@ monitor arrival.
   `IddCxSwapChainSetDevice` succeeded on a freshly created device, so
   "state != REBUILDING" is the one signal that means the transport really
   came back.
+- **…but WHERE that state is read decides whether build 16 works at all,
+  and the first cut got it wrong (fixed on this branch, 2026-07-30).** The
+  state was read through a `try_lock` on the FrameRing mutex — and
+  `frame_loop` PINS that mutex for the entire life of the worker (the
+  `let ring = &mut *ring` after the lock is a reborrow, not a drop; it is
+  the same invariant that forces `mark_ring_dead_arc` to be a bounded
+  try-lock poll). So a ring that had FULLY RECOVERED — new worker, SetDevice
+  succeeded, frames publishing — returned `WouldBlock`, which the poller
+  counted as pending: the zero-modeset good exit was UNREACHABLE, the
+  requalify arm departed the only active display ~10 s into a recovery that
+  had already happened, and `TdrDeviceHeartbeatBlocked` fired during healthy
+  operation. As written it was WORSE than build 15 — it converted
+  self-healing recoveries into forced departures. **Rule: any recovery
+  signal a poller reads must be publishable and readable WITHOUT the lock
+  the thing being watched owns.** The fix is `crate::tdr::RingLive` (a
+  portable, unit-tested `AtomicU32` ring-state mirror + `worker_live` flag +
+  `live_generation` counter) living in `swapchain::RingHandle` BESIDE the
+  `Mutex<FrameRing>`; `frame_loop` publishes at exactly two points (go-live,
+  right where the shared section goes ACTIVE after SetDevice succeeded — not
+  earlier, or a worker that then blocks on the ring lock would advertise a
+  transport that never starts — and exit, via an RAII `LiveMark` so every
+  return path and unwind is covered). `ring_tick_arc` consults the mirror
+  FIRST and takes the mutex only to refresh the heartbeat of a ring already
+  known to be down, so a lost lock is a lost heartbeat, never a recovery
+  verdict. `RingSection::state()` was deleted to keep the old (unreadable)
+  reader from coming back. Regression test:
+  `tdr::tests::recovered_ring_settles_even_though_its_worker_pins_the_mutex`.
+- **Nothing in device-duck mode may depart a display without re-reading the
+  mirror immediately first.** The requalify and deadline arms cross the
+  effects queue, and the OS can re-assign a swapchain in that gap;
+  `run_tdr_requalify` now skips entirely (`TdrDeviceRequalifySkipped`,
+  counts as a recovery, consumes no cycle) when nothing is still REBUILDING,
+  and both arms depart only the still-unrecovered members of the duck's
+  LUID-scoped session set via `monitors::duck_sessions` — build 16 called
+  `duck_all` there and threw the per-LUID scoping away at the one moment it
+  mattered. The poller's good exit also re-checks AFTER clearing
+  `tdr_duck_pending` and re-arms (`TdrDeviceDuckRearmed`) if a worker failed
+  inside the clear window, whose `queue_tdr_duck` CAS would otherwise have
+  been dropped.
 - **`SwapChainDeviceCreateFailed` had no duck wiring at all** and is how a
   GPU death presents when it happens between an unassign and the next
   assign: there is no device yet, so `maybe_queue_tdr_duck` (which
@@ -830,7 +869,15 @@ monitor arrival.
   Note `TdrDeviceReassigned` carries `gpu_confirmed`: whether our own probe
   ever saw the GPU answer, as opposed to the ring merely going ACTIVE
   first — without it, a genuine recovery and a re-assign-into-a-dead-GPU
-  read identically in a capture.
+  read identically in a capture. Added with the lock-free discriminator
+  fix: `TdrDeviceRequalifySkipped(covered,publishing)` — the requalify arm
+  declining to depart a display that came back, i.e. the acceptance bar
+  being met the quiet way — and `TdrDeviceDuckRearmed(session)`; plus
+  `TdrDeviceReassigned.live_gens` (go-live transitions, so "a worker really
+  came back" is distinguishable from "these rings were never in trouble"),
+  `TdrDeviceDuckStart.hresult` / `TdrLegacyDuck.hresult` (the arming
+  HRESULT, 0 = poller re-arm), and `kept` counts on `TdrDeviceRequalify` /
+  `TdrDeviceDuckGaveUp`.
   Settle these names BEFORE signing — task #58's
   autologger keys on them.
 - The dev-fallback `DRIVER_BUILD` was STALE at 14 (build 15 shipped stamped

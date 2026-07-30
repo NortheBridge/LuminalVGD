@@ -176,16 +176,14 @@ impl RingSection {
         self.state_atomic().store(state, Ordering::Release);
     }
 
-    /// Current `ring_state::*`. The TDR device-duck poller reads this to
-    /// decide whether the transport genuinely came back: only `frame_loop`
-    /// sets ACTIVE, and only after `IddCxSwapChainSetDevice` succeeded on a
-    /// freshly created D3D device. That makes it the one signal that
-    /// distinguishes "the OS re-assigned a swapchain AND it worked" from
-    /// "the OS re-assigned but the replacement worker died creating its
-    /// device because the GPU is still gone".
-    pub fn state(&self) -> u32 {
-        self.state_atomic().load(Ordering::Acquire)
-    }
+    // NOTE: there is deliberately no `state()` reader here. Build 16 had
+    // one, and the TDR device-duck poller used it as its recovery
+    // discriminator — but this section is only reachable through the
+    // FrameRing mutex, which `frame_loop` pins for the entire life of a
+    // worker, so a recovered ring was unreadable by construction and every
+    // genuine recovery read as "still down". The state the poller reads now
+    // lives in `tdr::RingLive`, beside that mutex rather than behind it;
+    // `set_state` above and `RingLive::publish_state` are written in pairs.
 
     pub fn set_generation(&self, generation: u32) {
         unsafe {

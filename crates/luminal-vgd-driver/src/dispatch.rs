@@ -245,6 +245,23 @@ impl DeviceState {
         self.adapters = adapters;
     }
 
+    /// The TDR response policy in force ([`TDR_DUCK_DEVICE`] or
+    /// [`TDR_DUCK_DISPLAY`]).
+    ///
+    /// The shell mirrors this into `Shell::tdr_duck_mode` (an atomic) at
+    /// device add, because the TDR path must never take the device lock —
+    /// but it reads it FROM HERE, so the config field is the single
+    /// source of truth rather than a value that merely happens to be
+    /// carried alongside one. Build 16 shipped it write-only: the field
+    /// was stored into `DriverConfig` and then never read by anything,
+    /// while the shell mirrored a separate local. A later edit that fixed
+    /// the config and forgot the local (or vice versa) would have silently
+    /// shipped the wrong TDR policy — the one defect class the
+    /// `TdrDuckConfig` event exists to make visible.
+    pub fn tdr_duck_mode(&self) -> u32 {
+        self.cfg.tdr_duck_mode
+    }
+
     /// Reconcile portable state with a full runtime teardown (final
     /// device exit, or a discarded stale bring-up): every monitor's
     /// runtime is gone, so drop every table session — lease-disabled
@@ -1044,5 +1061,30 @@ mod tests {
         // the gate is a closed set of exactly these two.
         assert_eq!(TDR_DUCK_DEVICE, 0);
         assert_eq!(TDR_DUCK_DISPLAY, 1);
+    }
+
+    /// The gate has to survive the trip the driver actually takes it on:
+    /// registry read → `DriverConfig` → `DeviceState::new` → the value the
+    /// shell mirrors into its lock-free atomic at device add. Build 16
+    /// stored the field and never read it back — the shell mirrored a
+    /// separate local — so nothing anywhere proved the configured policy
+    /// was the policy that ran. `shell::entry::device_add` now reads it
+    /// through this accessor.
+    #[test]
+    fn tdr_duck_gate_survives_device_state_construction() {
+        for mode in [TDR_DUCK_DEVICE, TDR_DUCK_DISPLAY] {
+            let dev = DeviceState::new(
+                DriverConfig { tdr_duck_mode: mode, ..DriverConfig::default() },
+                None,
+            );
+            assert_eq!(dev.tdr_duck_mode(), mode);
+        }
+        // Restoring persisted state must not disturb the gate: the blob
+        // carries identity reservations and the pool, never policy.
+        let dev = DeviceState::new(
+            DriverConfig { tdr_duck_mode: TDR_DUCK_DISPLAY, ..DriverConfig::default() },
+            Some(&[0u8; 8]),
+        );
+        assert_eq!(dev.tdr_duck_mode(), TDR_DUCK_DISPLAY);
     }
 }

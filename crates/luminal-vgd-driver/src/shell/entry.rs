@@ -151,8 +151,17 @@ unsafe extern "C" fn evt_device_add(
     // Mirror the gate for lock-free reads on the TDR path, then announce
     // it: a field trace must say which policy this binary is running
     // WITHOUT needing a repro to find out.
-    shell.set_tdr_duck_mode(tdr_duck_mode);
-    control::trace_tdr_duck_config(tdr_duck_mode, tdr_gate_source);
+    //
+    // Read back out of DeviceState rather than reusing the local: that
+    // makes DriverConfig::tdr_duck_mode the single source of truth for
+    // what the driver actually runs, instead of a field written once and
+    // never read while the shell mirrors a parallel copy. (Shell::init is
+    // a get_or_init, so a same-process device re-add keeps the FIRST
+    // DeviceState — this read reports what is really in force, which is
+    // the value the trace below must carry.)
+    let effective_mode = shell.dev.lock().unwrap().tdr_duck_mode();
+    shell.set_tdr_duck_mode(effective_mode);
+    control::trace_tdr_duck_config(effective_mode, tdr_gate_source);
 
     // 1 s periodic watchdog (feeds dispatch::watchdog_tick).
     let mut tc: WDF_TIMER_CONFIG = zeroed();
