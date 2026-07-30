@@ -103,13 +103,6 @@ pub(crate) struct MonitorRt {
     /// false-positive off a healthy iGPU while the render dGPU is still
     /// wedged.
     pub adapter_luid: u64,
-    /// Bumped by every `EvtIddCxMonitorAssignSwapChain`. The TDR
-    /// device-duck poller snapshots it and declares the transport restored
-    /// only when it CHANGES — `worker.is_some()` cannot be used for that:
-    /// `rt.worker` is cleared only by unassign/teardown, so the corpse of
-    /// the very worker that ducked is still sitting there and would read
-    /// as "already recovered" on the poller's first tick.
-    pub assign_seq: u64,
     pub worker: Option<swapchain::Worker>,
     /// The transport ring (section + policy + textures). Lives here, not
     /// in the worker, so sequences and the generation persist across
@@ -170,31 +163,86 @@ pub(crate) fn mark_ring_dead_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRin
     }
 }
 
-/// Single-attempt heartbeat for a bare ring Arc: keeps the shared header's
-/// `driver_heartbeat_qpc` advancing while NO frame worker owns the ring.
+/// Bounded REBUILDING mark for a bare ring Arc — the transport-side half
+/// of arming a TDR device-duck from a site that never owned a locked ring
+/// (`frame_loop`'s device-create failure). Without it a duck armed there
+/// would find the ring still ACTIVE and the poller would settle instantly,
+/// making the whole duck a no-op.
 ///
-/// Build 16 needs this because keeping the monitor arrived across a GPU
-/// reset leaves the ring worker-less, and every other `heartbeat()` call
-/// site lives inside `frame_loop` — without it the host declares the
-/// driver stale after `RING_HEARTBEAT_STALE_MS` (2 s) even though the
-/// display path is alive and recovering. Pure shared-memory write: no D3D
-/// device, no IddCx call, nothing that can fail against a wedged GPU.
-///
-/// `try_lock`, never `lock`: a deadline-detached worker pins the ring
-/// mutex for its whole lifetime (see [`mark_ring_dead_arc`]) and this runs
-/// on a poller clock that must keep ticking. Returns false when the lock
-/// was unavailable — the host then sees exactly the stale heartbeat it
-/// would have seen before this existed, never a wedge.
-pub(crate) fn ring_heartbeat_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) -> bool {
+/// Single bounded attempt for the usual reason (a detached worker pins the
+/// ring mutex for its lifetime); losing it is survivable — the host's
+/// stale-heartbeat detection covers an unmarked ring exactly as it did
+/// before build 16.
+pub(crate) fn mark_ring_rebuilding_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) {
     let ring = match ring.try_lock() {
         Ok(ring) => ring,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(TryLockError::WouldBlock) => return false,
+        Err(TryLockError::WouldBlock) => {
+            tracelogging::write_event!(PROVIDER, "RingRebuildMarkTimeout", level(Warning));
+            return;
+        }
     };
     if let Some(section) = &ring.section {
-        section.heartbeat();
+        section.set_state(luminal_driver_proto::ring_state::REBUILDING);
     }
-    true
+}
+
+/// What one TDR device-duck poller tick found for a ring.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RingTick {
+    /// Still REBUILDING — no frame worker owns this ring, and the
+    /// heartbeat was refreshed so the host reads "coming back" rather than
+    /// "driver gone".
+    Rebuilding,
+    /// ACTIVE (a frame worker is publishing again) or DEAD (the session is
+    /// finished): either way the poller has nothing left to keep alive.
+    Settled,
+    /// The ring mutex was unavailable — a deadline-detached worker pins it
+    /// for its lifetime. Counted as NOT settled: the transport state is
+    /// unknown, and concluding "recovered" from an unreadable ring is the
+    /// one mistake that would strand the display with nothing watching it.
+    Blocked,
+}
+
+/// One TDR device-duck poller tick against a bare ring Arc: read the
+/// transport state and, while it is still REBUILDING, keep the shared
+/// header's `driver_heartbeat_qpc` advancing.
+///
+/// Build 16 needs the heartbeat because keeping the monitor arrived across
+/// a GPU reset leaves the ring worker-less, and every other `heartbeat()`
+/// call site lives inside `frame_loop` — without it the host declares the
+/// driver stale after `RING_HEARTBEAT_STALE_MS` (2 s) even though the
+/// display path is alive and recovering. Pure shared-memory access: no D3D
+/// device, no IddCx call, nothing that can fail against a wedged GPU.
+///
+/// It needs the STATE because the state is the only honest answer to "did
+/// the transport actually come back". Only `frame_loop` sets ACTIVE, and
+/// only after `IddCxSwapChainSetDevice` succeeded on a freshly created
+/// device — so a replacement worker that died in `create_device_on_luid`
+/// (the GPU is still gone) leaves the ring REBUILDING and the poller
+/// correctly keeps watching. Counting swapchain ASSIGNMENTS instead would
+/// call that case recovered and walk away.
+///
+/// A ring with no section (creation failed at plug; the host is on WGC)
+/// counts as settled — there is no transport to restore.
+///
+/// `try_lock`, never `lock`: a deadline-detached worker pins the ring
+/// mutex for its whole lifetime (see [`mark_ring_dead_arc`]) and this runs
+/// on a poller clock that must keep ticking.
+pub(crate) fn ring_tick_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) -> RingTick {
+    let ring = match ring.try_lock() {
+        Ok(ring) => ring,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return RingTick::Blocked,
+    };
+    let Some(section) = &ring.section else {
+        return RingTick::Settled;
+    };
+    if section.state() != luminal_driver_proto::ring_state::REBUILDING {
+        return RingTick::Settled;
+    }
+    section.heartbeat();
+    RingTick::Rebuilding
 }
 
 /// A monitor parked during a GPU reset: departed from the OS so TDR

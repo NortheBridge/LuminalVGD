@@ -906,6 +906,24 @@ fn finish_device_duck() {
         .store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// A poller exit arm could not reach the effects worker (process teardown,
+/// or it never spawned). Constraint 4: an arm that silently does nothing is
+/// indistinguishable in a trace from an arm that was never taken, and this
+/// one decides whether the display is ever departed — the single most
+/// consequential question in a build-16 capture.
+///
+/// There is deliberately NO inline fallback: an IddCx call from a poller
+/// thread is exactly what §3.3 forbids. The monitor stays ARRIVED, which is
+/// the safe residue in this mode.
+fn trace_device_task_queue_failed(task: &str) {
+    tracelogging::write_event!(
+        PROVIDER,
+        "TdrDeviceTaskQueueFailed",
+        level(Error),
+        str8("task", task)
+    );
+}
+
 /// The GATED FALLBACK departure — build 14/15's behaviour, reached only
 /// when the device-duck cannot be sustained (the long deadline expired, or
 /// the poller could not be spawned). Departs every monitor and drains the
@@ -948,8 +966,8 @@ fn run_tdr_device_duck(epoch: u64, session_id: u64) {
 
     // Scope the duck to the adapter that actually reported removal: a
     // monitor rendering on a HEALTHY second adapter must not be dragged
-    // into another GPU's reset. Snapshot each covered monitor's
-    // `assign_seq` — the poller's only "the OS re-assigned" discriminator.
+    // into another GPU's reset. The poller judges each covered session by
+    // its RING STATE, so nothing else needs snapshotting here.
     let (luid, sessions) = {
         let monitors = shell.monitors.lock().unwrap();
         // If the failing session is GONE, duck nothing: falling back to
@@ -959,10 +977,10 @@ fn run_tdr_device_duck(epoch: u64, session_id: u64) {
         // before departing displays that were never in trouble.
         match monitors.get(&session_id).map(|rt| rt.adapter_luid) {
             Some(luid) => {
-                let sessions: Vec<(u64, u64)> = monitors
+                let sessions: Vec<u64> = monitors
                     .iter()
                     .filter(|(_, rt)| rt.adapter_luid == luid)
-                    .map(|(sid, rt)| (*sid, rt.assign_seq))
+                    .map(|(sid, _)| *sid)
                     .collect();
                 (luid, sessions)
             }
@@ -1009,7 +1027,7 @@ fn run_tdr_device_duck(epoch: u64, session_id: u64) {
 /// it runs on a callback frame (§3.3): own thread, 250 ms tick, D3D probes
 /// on THROWAWAY 15 s-deadline threads that are detached if they hang
 /// inside a wedged OS call.
-fn device_duck_poller(epoch: u64, luid: u64, sessions: Vec<(u64, u64)>) {
+fn device_duck_poller(epoch: u64, luid: u64, sessions: Vec<u64>) {
     let shell = Shell::get();
     let started = std::time::Instant::now();
     let deadline = started + TDR_RECOVERY_BUDGET;
@@ -1034,25 +1052,19 @@ fn device_duck_poller(epoch: u64, luid: u64, sessions: Vec<(u64, u64)>) {
             return;
         }
 
-        // Which covered sessions still exist, and which are still without a
-        // NEW swapchain? Comparing `assign_seq` against the duck-time
-        // snapshot is exact: `rt.worker` still holds the corpse of the
-        // worker that ducked, so `worker.is_some()` would read as
-        // "recovered" on the very first tick.
-        let (live, orphan_rings) = {
+        // Snapshot the covered sessions' ring Arcs, then release the
+        // monitors lock BEFORE touching any ring: `duck_all` takes
+        // monitors→ring, so doing the same here keeps that order, and the
+        // per-ring try_locks must not run under a lock IddCx callbacks
+        // also take.
+        let rings: Vec<std::sync::Arc<std::sync::Mutex<super::swapchain::FrameRing>>> = {
             let monitors = shell.monitors.lock().unwrap();
-            let mut live = 0usize;
-            let mut orphan_rings = Vec::new();
-            for (sid, seq) in &sessions {
-                let Some(rt) = monitors.get(sid) else { continue };
-                live += 1;
-                if rt.assign_seq == *seq {
-                    orphan_rings.push(rt.ring.clone());
-                }
-            }
-            (live, orphan_rings)
+            sessions
+                .iter()
+                .filter_map(|sid| monitors.get(sid).map(|rt| rt.ring.clone()))
+                .collect()
         };
-        if live == 0 {
+        if rings.is_empty() {
             tracelogging::write_event!(
                 PROVIDER,
                 "TdrDeviceDuckSessionsGone",
@@ -1062,44 +1074,62 @@ fn device_duck_poller(epoch: u64, luid: u64, sessions: Vec<(u64, u64)>) {
             finish_device_duck();
             return;
         }
-        if orphan_rings.is_empty() {
-            // THE GOOD EXIT: the OS drove its own unassign→assign and every
-            // covered session has a fresh swapchain. The transport is back
-            // with ZERO modesets from us and the display never left — which
-            // is the entire point of build 16.
+        // One tick per covered ring: refresh the heartbeat of everything
+        // still REBUILDING, and count what has settled. The RING STATE is
+        // the discriminator, not swapchain assignments — only `frame_loop`
+        // sets ACTIVE, and only after IddCxSwapChainSetDevice succeeded on
+        // a freshly created device. A replacement worker that died in
+        // create_device_on_luid (GPU still gone) therefore leaves the ring
+        // REBUILDING and this poller correctly keeps watching, where
+        // counting assignments would have called it recovered and walked
+        // away with the deadline arm unreachable.
+        let mut pending = 0usize;
+        for ring in &rings {
+            match super::ring_tick_arc(ring) {
+                super::RingTick::Settled => {}
+                super::RingTick::Rebuilding => {
+                    pending += 1;
+                    heartbeats += 1;
+                }
+                super::RingTick::Blocked => {
+                    pending += 1;
+                    if !heartbeat_blocked_traced {
+                        // A deadline-detached worker is pinning the ring
+                        // mutex. Traced once per duck; the host's
+                        // stale-heartbeat handling covers it exactly as it
+                        // did before build 16.
+                        heartbeat_blocked_traced = true;
+                        tracelogging::write_event!(
+                            PROVIDER,
+                            "TdrDeviceHeartbeatBlocked",
+                            level(Warning)
+                        );
+                    }
+                }
+            }
+        }
+        if pending == 0 {
+            // THE GOOD EXIT: every covered ring is publishing again (or is
+            // finished). The OS drove its own unassign→assign, the
+            // transport is back with ZERO modesets from us, and the display
+            // never left — which is the entire point of build 16.
             tracelogging::write_event!(
                 PROVIDER,
                 "TdrDeviceReassigned",
                 level(Informational),
                 u64("elapsed_ms", &(started.elapsed().as_millis() as u64)),
-                u64("heartbeats", &heartbeats)
+                u64("heartbeats", &heartbeats),
+                // Keeps this event honest: says whether our own probe ever
+                // confirmed the GPU answering again, or whether the ring
+                // simply went ACTIVE first. "Did it really come back?" is
+                // the whole question a build-16 capture is taken to answer.
+                u32("gpu_confirmed", &(recovered_at.is_some() as u32))
             );
             shell
                 .tdr_last_recovery_ms
                 .store(shell.now_ms().max(1), std::sync::atomic::Ordering::SeqCst);
             finish_device_duck();
             return;
-        }
-
-        // Keep the worker-less rings' heartbeat advancing so the host reads
-        // "rebuilding", not "driver gone", for the whole outage. Heartbeat
-        // ONLY — never set_state: a worker that just started may have set
-        // ACTIVE, and stomping it back to REBUILDING would strand a
-        // publishing ring in the wrong state.
-        for ring in &orphan_rings {
-            if super::ring_heartbeat_arc(ring) {
-                heartbeats += 1;
-            } else if !heartbeat_blocked_traced {
-                // A deadline-detached worker is pinning the ring mutex.
-                // Traced once per duck; the host's stale-heartbeat handling
-                // covers it exactly as it did before build 16.
-                heartbeat_blocked_traced = true;
-                tracelogging::write_event!(
-                    PROVIDER,
-                    "TdrDeviceHeartbeatBlocked",
-                    level(Warning)
-                );
-            }
         }
 
         if last_probe_step.elapsed() >= TDR_RECOVERY_PROBE_EVERY {
@@ -1155,6 +1185,11 @@ fn device_duck_poller(epoch: u64, luid: u64, sessions: Vec<(u64, u64)>) {
                 u64("elapsed_ms", &(started.elapsed().as_millis() as u64))
             );
             if send_task(EffectsTask::TdrRequalify { epoch }).is_some() {
+                // Effects worker gone (D3Final, or it never spawned). The
+                // monitor stays ARRIVED — the safe residue in this mode, and
+                // deliberately NOT an inline departure: an IddCx call from a
+                // poller thread is exactly what §3.3 forbids.
+                trace_device_task_queue_failed("requalify");
                 finish_device_duck();
             }
             return;
@@ -1166,6 +1201,7 @@ fn device_duck_poller(epoch: u64, luid: u64, sessions: Vec<(u64, u64)>) {
             // the effects worker (departure is an IddCx call and must be
             // ordered with every other side effect).
             if send_task(EffectsTask::TdrDeadlineDepart { epoch }).is_some() {
+                trace_device_task_queue_failed("deadline depart");
                 finish_device_duck();
             }
             return;

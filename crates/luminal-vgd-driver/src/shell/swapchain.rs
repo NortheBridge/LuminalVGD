@@ -195,10 +195,6 @@ pub unsafe extern "C" fn evt_assign(
         // The assign's RenderAdapterLuid is the authoritative render
         // adapter for this monitor; the TDR recovery poller probes it.
         rt.adapter_luid = luid;
-        // Monotonic per-monitor swapchain-assignment counter: the TDR
-        // device-duck poller's ONLY discriminator for "the OS re-assigned
-        // a swapchain after the GPU reset" (see MonitorRt::assign_seq).
-        rt.assign_seq = rt.assign_seq.wrapping_add(1);
         let old = rt.worker.replace(Worker { stop: stop.clone(), join: None });
         (session_id, rt.ring.clone(), old)
     };
@@ -349,6 +345,37 @@ fn frame_loop(
                 u64("session", &session_id),
                 i32("hresult", &code)
             );
+            // BUILD-16 RE-ARM. Device creation failing is how a GPU death
+            // presents when it happens between an unassign and the next
+            // assign: there is no device yet, so `maybe_queue_tdr_duck`
+            // (which interrogates one with GetDeviceRemovedReason) can
+            // never be reached from here, and before build 16 this site
+            // armed nothing at all. In device-duck mode that would leave
+            // the ring unwatched — heartbeat frozen, and the bounded
+            // 10-minute deadline arm never reachable.
+            //
+            // The REBUILDING mark is load-bearing, not cosmetic: the
+            // recovery poller decides "did the transport come back" from
+            // the ring state, so a duck armed here against a still-ACTIVE
+            // ring would settle on its first tick and do nothing.
+            //
+            // Re-arming is idempotent: `queue_tdr_duck`'s one-in-flight CAS
+            // collapses a storm of failing workers into a single duck, and
+            // while a poller is already watching this is a cheap no-op. The
+            // cadence is the OS's reassign rate, not a spin.
+            //
+            // Gated to device-duck mode on purpose: builds 14/15 never
+            // ducked from this site, and the legacy gate exists to restore
+            // their behaviour faithfully, not an improved version of it.
+            // The stop check keeps a routine teardown (the OS's ~10 ms
+            // unassign landing inside a slow create) from reading as a GPU
+            // reset.
+            if !stop.load(Ordering::SeqCst)
+                && Shell::get().tdr_duck_mode() == crate::dispatch::TDR_DUCK_DEVICE
+            {
+                super::mark_ring_rebuilding_arc(&ring);
+                super::control::queue_tdr_duck(session_id);
+            }
             return;
         }
     };

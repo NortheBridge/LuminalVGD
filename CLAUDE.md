@@ -768,10 +768,26 @@ monitor arrival.
   depart+re-arrive against a HEALTHY stack; 10-min budget expired →
   `TdrDeadlineDepart`, the legacy departure as fallback. Nothing waits
   unbounded and nothing runs on a callback frame.
-- **`MonitorRt::assign_seq`** is the poller's "did the OS re-assign"
-  discriminator. `worker.is_some()` CANNOT be used: `rt.worker` is cleared
+- **The RING STATE is the recovery discriminator** (`ring_tick_arc`), and
+  getting this wrong is the subtle way build 16 fails. Two rejected
+  candidates: `worker.is_some()` is useless because `rt.worker` is cleared
   only by unassign/teardown, so the corpse of the very worker that ducked
-  would read as "already recovered" on the poller's first tick.
+  reads as "recovered" on the first tick; and counting swapchain
+  ASSIGNMENTS is worse than useless, because the OS keeps
+  unassigning/reassigning while the GPU is down and each replacement worker
+  dies in `create_device_on_luid` — the poller would call that recovered,
+  exit, and leave the ring unwatched with the bounded deadline arm
+  unreachable. Only `frame_loop` sets ACTIVE, and only after
+  `IddCxSwapChainSetDevice` succeeded on a freshly created device, so
+  "state != REBUILDING" is the one signal that means the transport really
+  came back.
+- **`SwapChainDeviceCreateFailed` had no duck wiring at all** and is how a
+  GPU death presents when it happens between an unassign and the next
+  assign: there is no device yet, so `maybe_queue_tdr_duck` (which
+  interrogates one) is unreachable from there. That site now marks the ring
+  REBUILDING and arms a duck, gated to device-duck mode. The REBUILDING
+  mark is load-bearing, not cosmetic — a duck armed against a still-ACTIVE
+  ring settles on its first tick and does nothing.
 - **The re-arm at `frame_loop`'s `create_device_on_luid` failure is what
   closes the loop**, and it is the one site build 14/15 never needed. While
   the GPU is down the OS keeps unassigning/reassigning; each replacement
@@ -818,7 +834,11 @@ monitor arrival.
   arm that could not reach the effects worker — it leaves the monitor
   ARRIVED and deliberately does NOT depart inline, because an IddCx call
   from a poller thread is exactly what §3.3 forbids; silent, it would be
-  indistinguishable from an arm never taken).
+  indistinguishable from an arm never taken), and `RingRebuildMarkTimeout`.
+  Note `TdrDeviceReassigned` carries `gpu_confirmed`: whether our own probe
+  ever saw the GPU answer, as opposed to the ring merely going ACTIVE
+  first — without it, a genuine recovery and a re-assign-into-a-dead-GPU
+  read identically in a capture.
   Settle these names BEFORE signing — task #58's
   autologger keys on them.
 - The dev-fallback `DRIVER_BUILD` was STALE at 14 (build 15 shipped stamped
