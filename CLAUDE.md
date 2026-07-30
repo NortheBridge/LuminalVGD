@@ -772,6 +772,21 @@ monitor arrival.
   discriminator. `worker.is_some()` CANNOT be used: `rt.worker` is cleared
   only by unassign/teardown, so the corpse of the very worker that ducked
   would read as "already recovered" on the poller's first tick.
+- **The re-arm at `frame_loop`'s `create_device_on_luid` failure is what
+  closes the loop**, and it is the one site build 14/15 never needed. While
+  the GPU is down the OS keeps unassigning/reassigning; each replacement
+  worker dies THERE, before it owns a device, so `maybe_queue_tdr_duck`
+  (which interrogates one) is unreachable. Without the re-arm the poller
+  sees `assign_seq` move, declares the transport restored, exits, and
+  nothing watches the ring again — the heartbeat freezes and the bounded
+  deadline arm becomes unreachable, so "duck the device" would quietly
+  degrade into "do nothing, forever". `queue_tdr_duck`'s one-in-flight CAS
+  makes the re-arm idempotent (a storm of failing workers collapses to one
+  duck) and the cadence is the OS's reassign rate, not a spin. Gated to
+  device-duck mode: the legacy gate must restore builds 14/15 faithfully,
+  not an improved version of them. `TdrDeviceReassigned` therefore carries
+  `gpu_confirmed` — the OS can re-assign while the GPU is still dead, and
+  without that field a trace cannot tell that case from a real recovery.
 - **Device-ducked monitors stay in `shell.monitors` and OUT of
   `shell.ducked`.** That invariant is load-bearing: `unplug`'s ducked fast
   path, `plug`'s parked-twin purge and the D3Final drain all assume "in
@@ -799,7 +814,12 @@ monitor arrival.
   `TdrDeviceRequalify`, `TdrRequalifyCapped`, `TdrRequalifyStale`,
   `TdrDeviceDuckSessionsGone`, `TdrDevicePollerStale`,
   `TdrDevicePollerSpawnFailed`, `TdrDeviceDuckGaveUp(reason)`,
-  `TdrDeadlineDepartStale`. Settle these names BEFORE signing — task #58's
+  `TdrDeadlineDepartStale`, `TdrDeviceTaskQueueFailed(task)` (a poller exit
+  arm that could not reach the effects worker — it leaves the monitor
+  ARRIVED and deliberately does NOT depart inline, because an IddCx call
+  from a poller thread is exactly what §3.3 forbids; silent, it would be
+  indistinguishable from an arm never taken).
+  Settle these names BEFORE signing — task #58's
   autologger keys on them.
 - The dev-fallback `DRIVER_BUILD` was STALE at 14 (build 15 shipped stamped
   by env only), so unstamped dev builds self-reported alpha.4 in ETW and the
