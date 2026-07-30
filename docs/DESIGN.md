@@ -166,6 +166,31 @@ release + Insider builds. Design rules:
    tear down the D3D device and ring, re-create on the same adapter LUID,
    bump a `ring_generation` counter in shared memory so the host knows to
    re-map. Monitors stay attached; the stream resumes after one keyframe.
+
+   *Build 16 note — "duck the device, not the display".* Builds 14/15
+   deviated from this rule: they DEPARTED every monitor on device removal,
+   to keep a failing OS TDR recovery from waiting on the indirect display
+   path. The 2026-07-30 incident showed the cost — under
+   `virtual_display_layout=exclusive` the departure took the active display
+   count to zero, dwm.exe declared a black screen 131 ms later,
+   `QueryDisplayConfig` went to zero paths and then `ERROR_NOT_SUPPORTED`
+   permanently, and Windows never logged an Event 4101 (so the OS recovery
+   cycle the departure existed to unblock never even ran). Build 16
+   restores the rule as written: the D3D device and swapchain go, the ring
+   goes REBUILDING with a device-independent heartbeat, and **the IddCx
+   monitor stays ARRIVED** so Windows keeps a display path to compose onto.
+   Departure is now the gated FALLBACK, taken only when (a) the GPU answers
+   again but the OS never re-assigns a swapchain — one requalify
+   depart+re-arrive against a *healthy* stack — or (b) the 10-minute
+   recovery budget expires. The builds-14/15 behaviour stays selectable via
+   the `LuminalVgdTdrDuckMode` REG_DWORD (see §6).
+
+   Contract basis for keeping the monitor arrived: IddCx already drives
+   monitors into "arrived with no swapchain and no device" as routine
+   operation — `EvtIddCxMonitorUnassignSwapChain` leaves the monitor
+   arrived, and the OS unassigns ~10 ms after every activation. Nothing in
+   IddCx ties a D3D device to monitor arrival; `IddCxSwapChainSetDevice`
+   scopes the device to the *swapchain*.
 3. **IddCx callback hygiene:** callbacks return promptly; all D3D work on
    driver-owned worker threads; no locks held across IddCx calls.
 4. **Watchdog self-report:** driver exposes `GET_STATUS` heartbeats so the
@@ -211,6 +236,16 @@ follow the recovery ladder instead.
 
 - INF: `luminalvgd.inf`, hardware ID `root\luminal_vgd`, device description
   "Luminal Video Graphics Display", provider "NortheBridge Foundation".
+- **Registry knobs** (devnode `Device Parameters` key, i.e.
+  `HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY\000x\Device Parameters`
+  — survives package updates, cleared only by `pnputil /remove-device`):
+  - `LuminalVgdTdrDuckMode` (REG_DWORD): `0`/absent = duck the device, keep
+    the display (§3.3 rule 2, the default); `1` = legacy builds-14/15
+    display duck-out. Read at device add, so `pnputil /restart-device`
+    applies it — no reinstall. Deliberately NOT seeded by the INF's AddReg:
+    HKR there rewrites on every package update and would silently stamp an
+    operator's override back to the default mid-upgrade.
+  - `LuminalVgdState` (REG_BINARY): identity reservations + permanent pool.
 - OV certificate signing: sign driver DLL + catalog (`inf2cat` → `signtool
   /fd sha256 /tr <RFC3161> /td sha256`); installer seeds
   **LocalMachine\TrustedPublisher only** (OV already chains to a trusted

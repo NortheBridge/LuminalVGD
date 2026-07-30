@@ -60,7 +60,7 @@ pub(crate) const DRIVER_BUILD: u32 = match option_env!("LUMINAL_VGD_BUILD") {
         }
         n
     }
-    None => 14,
+    None => 16,
 };
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
@@ -103,6 +103,13 @@ pub(crate) struct MonitorRt {
     /// false-positive off a healthy iGPU while the render dGPU is still
     /// wedged.
     pub adapter_luid: u64,
+    /// Bumped by every `EvtIddCxMonitorAssignSwapChain`. The TDR
+    /// device-duck poller snapshots it and declares the transport restored
+    /// only when it CHANGES — `worker.is_some()` cannot be used for that:
+    /// `rt.worker` is cleared only by unassign/teardown, so the corpse of
+    /// the very worker that ducked is still sitting there and would read
+    /// as "already recovered" on the poller's first tick.
+    pub assign_seq: u64,
     pub worker: Option<swapchain::Worker>,
     /// The transport ring (section + policy + textures). Lives here, not
     /// in the worker, so sequences and the generation persist across
@@ -163,6 +170,33 @@ pub(crate) fn mark_ring_dead_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRin
     }
 }
 
+/// Single-attempt heartbeat for a bare ring Arc: keeps the shared header's
+/// `driver_heartbeat_qpc` advancing while NO frame worker owns the ring.
+///
+/// Build 16 needs this because keeping the monitor arrived across a GPU
+/// reset leaves the ring worker-less, and every other `heartbeat()` call
+/// site lives inside `frame_loop` — without it the host declares the
+/// driver stale after `RING_HEARTBEAT_STALE_MS` (2 s) even though the
+/// display path is alive and recovering. Pure shared-memory write: no D3D
+/// device, no IddCx call, nothing that can fail against a wedged GPU.
+///
+/// `try_lock`, never `lock`: a deadline-detached worker pins the ring
+/// mutex for its whole lifetime (see [`mark_ring_dead_arc`]) and this runs
+/// on a poller clock that must keep ticking. Returns false when the lock
+/// was unavailable — the host then sees exactly the stale heartbeat it
+/// would have seen before this existed, never a wedge.
+pub(crate) fn ring_heartbeat_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) -> bool {
+    let ring = match ring.try_lock() {
+        Ok(ring) => ring,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return false,
+    };
+    if let Some(section) = &ring.section {
+        section.heartbeat();
+    }
+    true
+}
+
 /// A monitor parked during a GPU reset: departed from the OS so TDR
 /// recovery never waits on the indirect display, with everything needed
 /// to re-arrive it kept alive (the ring Arc preserves sequences and the
@@ -189,10 +223,17 @@ pub(crate) struct Shell {
     /// stack recovers (TDR duck-out; control.rs). Purged when the same
     /// session is destroyed or re-plugged while parked.
     pub ducked: Mutex<Vec<DuckedMonitor>>,
+    /// TDR response policy: `dispatch::TDR_DUCK_DEVICE` (default) or
+    /// `TDR_DUCK_DISPLAY` (legacy). Mirrored out of `DriverConfig` at
+    /// device add so the frame worker and the effects worker can read it
+    /// lock-free — reading it through `Shell::dev` would put the device
+    /// lock (held for the whole of every `dispatch()`) on the one path
+    /// that must never wedge.
+    pub tdr_duck_mode: std::sync::atomic::AtomicU32,
     /// One duck-out in flight at a time: set (CAS) when a frame worker
     /// observes device removal, cleared when the replug (or give-up)
     /// completes. Keeps N workers failing off one GPU reset from queueing
-    /// N duck tasks.
+    /// N duck tasks. Shared by both duck styles.
     pub tdr_duck_pending: std::sync::atomic::AtomicBool,
     /// Duck cycles in the current INCIDENT. A wedge where device creation
     /// succeeds but activation still fails would otherwise flap
@@ -241,6 +282,9 @@ impl Shell {
             handles: Mutex::new(HashMap::new()),
             monitors: Mutex::new(HashMap::new()),
             ducked: Mutex::new(Vec::new()),
+            tdr_duck_mode: std::sync::atomic::AtomicU32::new(
+                crate::dispatch::TDR_DUCK_DEVICE,
+            ),
             tdr_duck_pending: std::sync::atomic::AtomicBool::new(false),
             tdr_duck_cycles: std::sync::atomic::AtomicU32::new(0),
             tdr_last_recovery_ms: std::sync::atomic::AtomicU64::new(0),
@@ -289,6 +333,20 @@ impl Shell {
         slot.handle = None;
         slot.epoch += 1;
         self.tdr_duck_cycles.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The TDR response policy in force (`dispatch::TDR_DUCK_*`). Read on
+    /// the frame-worker failure path and by the effects worker.
+    pub fn tdr_duck_mode(&self) -> u32 {
+        self.tdr_duck_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mirror the registry-read gate into the shell at device add. Set
+    /// AFTER `init` rather than inside it: `init` is a `get_or_init`, so a
+    /// same-process device re-add would otherwise keep the first device's
+    /// value forever.
+    pub fn set_tdr_duck_mode(&self, mode: u32) {
+        self.tdr_duck_mode.store(mode, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn wdf_device(&self) -> Option<OsHandle> {

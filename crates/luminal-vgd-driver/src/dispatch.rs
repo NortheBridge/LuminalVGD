@@ -29,9 +29,32 @@ use luminal_vgd_core::permanent;
 use luminal_vgd_core::persist::{self, PersistedState};
 use luminal_vgd_core::session::{Monitor, SessionTable};
 
-/// Fixed driver-side configuration, read from the registry at device add
-/// (SudoVDA kept its knobs in the registry; we keep only the global caps
-/// there — per-monitor parameters travel in CREATE_MONITOR).
+/// TDR response policy: duck the DEVICE, keep the DISPLAY (build 16, the
+/// default). On `DXGI_ERROR_DEVICE_REMOVED` the D3D device and swapchain
+/// are torn down and the ring goes REBUILDING — but the IddCx monitor
+/// stays ARRIVED and the OS display path stays alive, exactly as
+/// DESIGN.md §3.3 rule 2 specifies ("Monitors stay attached"). Departure
+/// becomes the gated fallback: only after OS recovery genuinely completes
+/// (a requalify modeset against a healthy stack) or the long recovery
+/// deadline expires.
+pub const TDR_DUCK_DEVICE: u32 = 0;
+
+/// TDR response policy: duck the DISPLAY (builds 14/15 behaviour, now
+/// opt-in). Departs every monitor the instant a frame worker sees device
+/// removal. Retained selectable because it is the only shipped-and-signed
+/// TDR behaviour to date — but it AMPLIFIED the 2026-07-30 incident:
+/// under `virtual_display_layout=exclusive` the departure took the active
+/// display count to zero, DWM declared a black screen 131 ms later, and
+/// the departure's `DBT_DEVNODES_CHANGED` broadcast is the documented
+/// GTA V killer. Select with the `LuminalVgdTdrDuckMode` REG_DWORD under
+/// the devnode's `Device Parameters` key (no reinstall; restart the
+/// device to apply).
+pub const TDR_DUCK_DISPLAY: u32 = 1;
+
+/// Fixed driver-side configuration. `caps`/`driver_build` are compiled in;
+/// `tdr_duck_mode` is the one knob read from the devnode registry at
+/// device add (SudoVDA kept its knobs in the registry; per-monitor
+/// parameters travel in CREATE_MONITOR instead).
 #[derive(Clone, Debug)]
 pub struct DriverConfig {
     pub caps: u32,
@@ -39,6 +62,8 @@ pub struct DriverConfig {
     pub max_monitors: u32,
     pub watchdog_secs: u32,
     pub ring_slots: u32,
+    /// [`TDR_DUCK_DEVICE`] (default) or [`TDR_DUCK_DISPLAY`].
+    pub tdr_duck_mode: u32,
 }
 
 /// Per-device state owned by the shell, mutated only through dispatch.
@@ -310,6 +335,10 @@ impl Default for DriverConfig {
             max_monitors: luminal_driver_proto::DEFAULT_MAX_MONITORS,
             watchdog_secs: luminal_driver_proto::DEFAULT_WATCHDOG_SECS,
             ring_slots: DEFAULT_RING_SLOTS,
+            // Build 16 default: keep the display, duck only the device.
+            // An absent registry value MUST mean this — see
+            // shell::control::read_tdr_duck_mode.
+            tdr_duck_mode: TDR_DUCK_DEVICE,
         }
     }
 }
@@ -1000,5 +1029,20 @@ mod tests {
         let mut h = HandleCtx::default();
         let r = dispatch(&mut d, &mut h, 0, ioctl::ctl_code(0x8FF), &[], &mut []);
         assert_eq!(r.status, Status::UnknownCode);
+    }
+
+    /// Build 16, constraint 1: the SHIPPED default must be "duck the
+    /// device, keep the display" (DESIGN.md §3.3 rule 2), and the legacy
+    /// build-14/15 display duck-out must remain SELECTABLE. A silent flip
+    /// of this default is a behaviour change nobody would see in a diff of
+    /// the shell — the 2026-07-30 incident is what it costs.
+    #[test]
+    fn tdr_duck_gate_defaults_to_device_duck_and_legacy_stays_selectable() {
+        assert_eq!(DriverConfig::default().tdr_duck_mode, TDR_DUCK_DEVICE);
+        assert_ne!(TDR_DUCK_DEVICE, TDR_DUCK_DISPLAY);
+        // The registry read clamps out-of-range values to the default, so
+        // the gate is a closed set of exactly these two.
+        assert_eq!(TDR_DUCK_DEVICE, 0);
+        assert_eq!(TDR_DUCK_DISPLAY, 1);
     }
 }

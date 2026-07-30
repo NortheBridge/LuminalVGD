@@ -709,3 +709,112 @@ TdrDuckStart(cycle)/TdrDuckDeparted/TdrReplugged/TdrDuckAbandoned(reason)/
 TdrRecoveryProbeHung/TdrDuckTornDownMidFlight; a TDR-injection or
 driver-verifier-forced device-removal pass would exercise the duck; a
 plain stream + reconnect must show ZERO Tdr* events.
+
+### Build 16 — duck the DEVICE, not the DISPLAY (2026-07-30, branch `feat/duck-the-device-build16`; UNSIGNED, UNINSTALLED, UNVALIDATED)
+
+**Build 14's duck-out is not the root cause, but it amplifies.** Verified
+2026-07-30 incident: corrected PCIe AER on the GPU root port (09:02:15.111)
+→ AcquireBuffer = DEVICE_REMOVED, GetDeviceRemovedReason = DEVICE_RESET
+(:18.337) → the Tier-1 duck-out departs the ONLY active display under
+`virtual_display_layout=exclusive`, taking the active display count to ZERO
+by our own design (:18.421) → dwm.exe reports a BLACK SCREEN 131 ms later
+and Windows writes a 0x1b8 live dump (:18.552) → QueryDisplayConfig
+SUCCEEDS but returns ZERO paths for 7.9 s, then returns ERROR_NOT_SUPPORTED
+and never recovers (:26.569) → dwm.exe is recreated and the replacement
+inherits the wedge instantly. Only a power cycle cleared it. **Windows
+logged NO Event 4101** — the OS never ran a TDR recovery cycle at all, so
+the thing the duck existed to get out of the way of never happened. The
+driver never un-ducked (no TdrReplugged/TdrDuckAbandoned for 7 min 3 s):
+per spec, TDR_MAX_DUCK_CYCLES=3 with a 10-min budget. Net: a recoverable
+device removal became a machine-wide zero-path black screen, and the
+departure's DBT_DEVNODES_CHANGED broadcast is the documented GTA V killer.
+
+Build 16 restores DESIGN.md §3.3 rule 2 ("Monitors stay attached"), which
+builds 14/15 had deviated from. On device removal the frame worker still
+tears down the D3D device, abandons the swapchain, retires textures
+(generation bump) and marks the ring REBUILDING — all of which already
+happened at swapchain.rs:454-459 — but **the IddCx monitor stays ARRIVED**,
+so Windows keeps a display path and no departure is broadcast. Contract
+basis (three independent proofs, all verified in-tree): `evt_unassign`
+already leaves monitors arrived with no swapchain, and the OS does exactly
+that ~10 ms after every activation; `frame_loop`'s failure exit has shipped
+since build 3 leaving the monitor arrived while dropping the device; IddCx
+binds the device to the SWAPCHAIN via `IddCxSwapChainSetDevice`, never to
+monitor arrival.
+
+- **Gate (constraint 1):** `DriverConfig::tdr_duck_mode` (dispatch.rs),
+  default `TDR_DUCK_DEVICE`=0. `LuminalVgdTdrDuckMode` REG_DWORD = 1 under
+  the devnode's `Device Parameters` key restores the build-14/15 display
+  duck-out via `pnputil /restart-device`, NO reinstall. Read at device add
+  (`control::read_tdr_duck_mode` — this registry read did not exist before;
+  DriverConfig's "read from the registry" doc comment described wiring that
+  was never built), mirrored into `Shell::tdr_duck_mode` (AtomicU32) so the
+  TDR path never takes the device lock. Absent ⇒ new behaviour;
+  out-of-range clamps to default; a read FAILURE is traced with a stage so
+  "never configured" and "unreadable" are distinguishable. Deliberately NOT
+  seeded by the INF: HKR AddReg rewrites on every package update and would
+  silently stomp an operator's override mid-upgrade.
+- **Branch point:** `control::queue_tdr_duck(session_id)` — one decision for
+  both frame-loop call sites (acquire failure and publish failure), so the
+  two modes can never diverge.
+- **New path:** `TdrDeviceDuck` adds no global state beyond the existing
+  one-in-flight latch and starts a 250 ms-tick poller thread
+  (`vgd-tdr-device`). It keeps worker-less rings' heartbeats alive
+  (`ring_heartbeat_arc`, single try_lock — a detached worker pins the ring
+  mutex), probes the render LUID on throwaway 15 s-deadline threads, and has
+  exactly three exits: the OS re-assigned a swapchain on its own (the good
+  one — ZERO modesets, display never left) → `TdrDeviceReassigned`; GPU
+  healthy but no re-assign within a 10 s grace → ONE `TdrRequalify`
+  depart+re-arrive against a HEALTHY stack; 10-min budget expired →
+  `TdrDeadlineDepart`, the legacy departure as fallback. Nothing waits
+  unbounded and nothing runs on a callback frame.
+- **`MonitorRt::assign_seq`** is the poller's "did the OS re-assign"
+  discriminator. `worker.is_some()` CANNOT be used: `rt.worker` is cleared
+  only by unassign/teardown, so the corpse of the very worker that ducked
+  would read as "already recovered" on the poller's first tick.
+- **Device-ducked monitors stay in `shell.monitors` and OUT of
+  `shell.ducked`.** That invariant is load-bearing: `unplug`'s ducked fast
+  path, `plug`'s parked-twin purge and the D3Final drain all assume "in
+  `ducked` ⇒ already departed", and a still-arrived entry there would leak
+  an arrived monitor on its connector. Keeping it meant none of those three
+  needed edits.
+- **Honest limitation — there is NO static last-good/black frame, and one is
+  not implementable here.** The ring textures were created on the removed
+  device and `retire_textures()` already dropped them;
+  `create_shared_textures` and `publish_frame` both require a live
+  `ID3D11Device`; no CPU-side copy of any frame exists anywhere in the
+  driver; and a WARP device's shared handles cannot be opened by the host's
+  hardware device. Build 16 ships "display path alive + ring REBUILDING +
+  fresh heartbeat" — which the host classifies as *coming back*, not *driver
+  gone* (`RING_HEARTBEAT_STALE_MS` = 2000, and before this change NOTHING
+  outside `frame_loop` ever called `heartbeat()`). A black-frame publisher is
+  a tracked follow-up, not part of this build.
+- **New ETW** (existing provider; every legacy Tdr* name kept so legacy-mode
+  traces stay comparable): `TdrDuckConfig(mode,source,build)` at device add —
+  THE event that makes "which policy is this signed binary running"
+  answerable from one trace — plus `TdrDuckConfigReadFailed(stage,code)`,
+  `TdrLegacyDuck`, `TdrDeviceDuckStart`, `TdrDeviceDuckStale`,
+  `TdrDeviceDuckNoMonitors`, `TdrDeviceReassigned`, `TdrDeviceRecovered`,
+  `TdrDeviceHeartbeatBlocked`, `TdrDeviceRequalifyQueued`,
+  `TdrDeviceRequalify`, `TdrRequalifyCapped`, `TdrRequalifyStale`,
+  `TdrDeviceDuckSessionsGone`, `TdrDevicePollerStale`,
+  `TdrDevicePollerSpawnFailed`, `TdrDeviceDuckGaveUp(reason)`,
+  `TdrDeadlineDepartStale`. Settle these names BEFORE signing — task #58's
+  autologger keys on them.
+- The dev-fallback `DRIVER_BUILD` was STALE at 14 (build 15 shipped stamped
+  by env only), so unstamped dev builds self-reported alpha.4 in ETW and the
+  handshake. Bumped to 16 in the same commit.
+
+Acceptance bar for this round: a forced device removal (driver-verifier /
+TDR injection) with a live session under `virtual_display_layout=exclusive`
+must show `TdrDeviceDuckStart`, ring REBUILDING, and **NO TdrDuckDeparted /
+NO MonitorDeparture**; QueryDisplayConfig must keep returning non-zero paths
+across the whole window; no dwm.exe black-screen report and no 0x1b8 live
+dump. Then the standing checklist: warm stream, COLD BOOT + stream,
+sleep/resume, update-over-running-service, `per_client` create/destroy during
+an active duck, and ZERO Tdr* events on a plain uneventful stream. Finally
+flip the registry gate to 1 and confirm the build-14 behaviour returns
+without reinstalling. Validation must run through the SYSTEM service path,
+not an elevated probe (Insider-29617 caveat above), and the gate is verified
+by reading back the devnode's Device Parameters key. Note build 16 stacks on
+ground where the 13/14/15 field checklists are still pending.

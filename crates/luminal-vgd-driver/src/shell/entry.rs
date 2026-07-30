@@ -137,13 +137,22 @@ unsafe extern "C" fn evt_device_add(
     // Portable state: config defaults + persisted blob (identity
     // reservations, permanent pool) from the device registry key.
     let persisted = control::read_persisted(device);
+    // Build-16 gate: TDR response policy from the devnode's Device
+    // Parameters key. Absent (the normal case) ⇒ TDR_DUCK_DEVICE.
+    let (tdr_duck_mode, tdr_gate_source) = control::read_tdr_duck_mode(device);
     let cfg = DriverConfig {
         caps: SHELL_CAPS,
         driver_build: DRIVER_BUILD,
+        tdr_duck_mode,
         ..DriverConfig::default()
     };
     let shell = Shell::init(DeviceState::new(cfg, persisted.as_deref()));
     shell.set_wdf_device(OsHandle(device.cast()));
+    // Mirror the gate for lock-free reads on the TDR path, then announce
+    // it: a field trace must say which policy this binary is running
+    // WITHOUT needing a repro to find out.
+    shell.set_tdr_duck_mode(tdr_duck_mode);
+    control::trace_tdr_duck_config(tdr_duck_mode, tdr_gate_source);
 
     // 1 s periodic watchdog (feeds dispatch::watchdog_tick).
     let mut tc: WDF_TIMER_CONFIG = zeroed();

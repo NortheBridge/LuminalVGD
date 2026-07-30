@@ -195,6 +195,10 @@ pub unsafe extern "C" fn evt_assign(
         // The assign's RenderAdapterLuid is the authoritative render
         // adapter for this monitor; the TDR recovery poller probes it.
         rt.adapter_luid = luid;
+        // Monotonic per-monitor swapchain-assignment counter: the TDR
+        // device-duck poller's ONLY discriminator for "the OS re-assigned
+        // a swapchain after the GPU reset" (see MonitorRt::assign_seq).
+        rt.assign_seq = rt.assign_seq.wrapping_add(1);
         let old = rt.worker.replace(Worker { stop: stop.clone(), join: None });
         (session_id, rt.ring.clone(), old)
     };
@@ -501,11 +505,17 @@ fn frame_loop(
 
 /// Distinguish "this swapchain is being replaced" (routine — the OS's
 /// ~10 ms unassign, mode switches) from "the GPU itself reset" and queue
-/// a TDR duck-out only for the latter. The discriminator is the D3D
-/// device: swapchain-level failures with a healthy device are handled by
-/// the OS's unassign→assign cycle; a removed device means every monitor
-/// on this adapter is about to fail the same way, and a failing OS TDR
-/// recovery must not be left waiting on our indirect display path.
+/// a TDR duck only for the latter. The discriminator is the D3D device:
+/// swapchain-level failures with a healthy device are handled by the OS's
+/// unassign→assign cycle; a removed device means every monitor on this
+/// adapter is about to fail the same way.
+///
+/// By the time this runs, the caller has ALREADY done everything build
+/// 16's "duck the device" means: the ring is REBUILDING, the textures are
+/// retired with a generation bump, the swapchain is abandoned, and `d3d`
+/// (the ID3D11Device/Context/IDXGIDevice triple) drops at the caller's
+/// `return`. What `control::queue_tdr_duck` then decides is only whether
+/// the DISPLAY goes too — see the build-16 gate there.
 fn maybe_queue_tdr_duck(session_id: u64, device: &ID3D11Device) {
     let removed = unsafe { device.GetDeviceRemovedReason() };
     if let Err(reason) = removed {
@@ -517,7 +527,7 @@ fn maybe_queue_tdr_duck(session_id: u64, device: &ID3D11Device) {
             u64("session", &session_id),
             i32("reason", &code)
         );
-        super::control::queue_tdr_duck();
+        super::control::queue_tdr_duck(session_id);
     }
 }
 
