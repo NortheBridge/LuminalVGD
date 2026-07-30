@@ -496,6 +496,26 @@ pub struct UpdateModesRequest {
 /// the driver keeps accepting exactly this size and zero-pads the tail.
 pub const UPDATE_MODES_REQUEST_SIZE_V5: usize = 80;
 
+/// Flags in [`UpdateModesReply::flags`] (`reserved[2]`).
+pub mod update_status {
+    /// The merged list is **not in force yet**: the driver queued an
+    /// `IddCxMonitorUpdateModes2` push that had not run when the reply was
+    /// written (it cannot have — the IRP completes first). Clear means the
+    /// modes reported are genuinely what the monitor advertises right now.
+    ///
+    /// A caller that needs certainty polls `GET_STATUS`: the push's
+    /// outcome shows up as the monitor's sticky [`err::UPDATE_FAILED`], and
+    /// a failed or deferred push leaves the previous list in force and the
+    /// request fully retryable — resending it really does push again.
+    pub const PENDING: u32 = 1 << 0;
+    /// Fewer modes were accepted than requested, because the list is at
+    /// [`super::MAX_MODES_PER_MONITOR`]. **This is partial success, not an
+    /// error**: every mode that fit was applied and nothing was removed.
+    /// Compare [`UpdateModesReply::accepted`] with
+    /// [`UpdateModesReply::requested`] for the counts.
+    pub const PARTIAL: u32 = 1 << 1;
+}
+
 /// `UPDATE_MODES` reply.
 ///
 /// **`result == OK` means ACCEPTED FOR APPLICATION, not "the OS is now
@@ -503,26 +523,84 @@ pub const UPDATE_MODES_REQUEST_SIZE_V5: usize = 80;
 /// touches IddCx (side effects never run on an IOCTL frame), so the reply
 /// structurally cannot carry the `IddCxMonitorUpdateModes` status. The
 /// OS-side outcome arrives later as ETW plus the monitor's sticky
-/// [`err::UPDATE_FAILED`] in `GET_STATUS`.
+/// [`err::UPDATE_FAILED`] in `GET_STATUS`. What the reply CAN say
+/// precisely is whether an application is still outstanding
+/// ([`update_status::PENDING`]) and how much of the request the driver
+/// took ([`accepted`](Self::accepted) vs [`requested`](Self::requested)) —
+/// so `result == OK` with neither flag set is the one shape that means
+/// "exactly what you asked for is advertised right now".
 ///
 /// This struct can never grow: the driver writes replies all-or-nothing
 /// and hosts reject a reply whose length differs from what they expect,
 /// so a bigger `UpdateModesReply` would break every already-shipped 0.5
 /// host with an I/O error rather than degrading. Future fields must come
-/// out of `reserved`.
+/// out of `reserved` — which is exactly where the three fields above
+/// live, filled in before 0.5 ever shipped and read through the accessors
+/// rather than by index.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UpdateModesReply {
     pub session_id: u64,
     /// `err::OK` or a negative `err::*` code.
     pub result: i32,
-    /// Modes IN FORCE after the merge: on success the post-merge count
-    /// (which is < the requested total when the list was already at
-    /// [`MAX_MODES_PER_MONITOR`]), and on any error the UNCHANGED current
-    /// count — 0 only when the session does not exist.
+    /// Modes the monitor will advertise once this request is applied: the
+    /// post-merge count (which is < the requested total when the list was
+    /// already at [`MAX_MODES_PER_MONITOR`]). On any error, and whenever
+    /// [`update_status::PENDING`] is clear, it is what is advertised NOW —
+    /// 0 only when the session does not exist.
     pub mode_count: u32,
-    /// Must be 0. The only place this reply may ever grow into.
+    /// `[0]` accepted, `[1]` requested, `[2]` flags, `[3..]` must be 0.
+    /// Read through [`accepted`](Self::accepted),
+    /// [`requested`](Self::requested) and [`flags`](Self::flags).
     pub reserved: [u32; 6],
+}
+
+impl UpdateModesReply {
+    const IDX_ACCEPTED: usize = 0;
+    const IDX_REQUESTED: usize = 1;
+    const IDX_FLAGS: usize = 2;
+
+    /// Requested modes the driver took: appended now or already
+    /// advertised. Never > [`requested`](Self::requested); less means the
+    /// rest did not fit under [`MAX_MODES_PER_MONITOR`].
+    pub fn accepted(&self) -> u32 {
+        self.reserved[Self::IDX_ACCEPTED]
+    }
+
+    /// Echo of the request's `mode_count`, so a caller can detect partial
+    /// application by comparison alone, without knowing the driver's cap.
+    pub fn requested(&self) -> u32 {
+        self.reserved[Self::IDX_REQUESTED]
+    }
+
+    /// [`update_status`] bits.
+    pub fn flags(&self) -> u32 {
+        self.reserved[Self::IDX_FLAGS]
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.flags() & update_status::PENDING != 0
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.flags() & update_status::PARTIAL != 0
+    }
+
+    /// True only when every requested mode is advertised by the monitor
+    /// **right now** — accepted in full, with no push still outstanding.
+    /// The one predicate a host should use before telling a client a mode
+    /// is available.
+    pub fn fully_in_force(&self) -> bool {
+        self.result == err::OK && !self.is_pending() && !self.is_partial()
+    }
+
+    /// Set the build-17 detail fields. Kept beside the accessors so the
+    /// reserved-word layout has exactly one definition.
+    pub fn set_detail(&mut self, accepted: u32, requested: u32, flags: u32) {
+        self.reserved[Self::IDX_ACCEPTED] = accepted;
+        self.reserved[Self::IDX_REQUESTED] = requested;
+        self.reserved[Self::IDX_FLAGS] = flags;
+    }
 }
 
 #[repr(C)]
@@ -1096,6 +1174,42 @@ mod tests {
         assert_eq!(err::UPDATE_FAILED, -13);
         assert_eq!(err::BAD_POOL, -12);
         assert_eq!(err::NOT_HANDSHAKEN, -10);
+    }
+
+    /// The detail fields live INSIDE the reserved words — the reply may
+    /// never grow (both sides length-check it), so "report more" has to
+    /// mean "report into the space already there".
+    #[test]
+    fn update_modes_reply_detail_fits_in_the_reserved_words() {
+        assert_eq!(core::mem::size_of::<UpdateModesReply>(), 40, "the reply never grows");
+        let mut reply = UpdateModesReply {
+            session_id: 1,
+            result: err::OK,
+            mode_count: 4,
+            reserved: [0; 6],
+        };
+        // Plain OK with nothing outstanding is the ONLY shape that means
+        // "what you asked for is advertised right now".
+        reply.set_detail(2, 2, 0);
+        assert!(reply.fully_in_force());
+        assert_eq!((reply.accepted(), reply.requested(), reply.flags()), (2, 2, 0));
+
+        // Queued but not applied yet: OK, and NOT in force.
+        reply.set_detail(2, 2, update_status::PENDING);
+        assert!(reply.is_pending());
+        assert!(!reply.fully_in_force());
+
+        // Partial application: real success for what fit, and the counts
+        // say so without the caller knowing the cap.
+        reply.set_detail(1, 3, update_status::PARTIAL);
+        assert!(reply.is_partial());
+        assert!(!reply.fully_in_force());
+        assert_eq!(reply.result, err::OK, "partial is success-with-detail, not an error");
+        assert!(reply.accepted() < reply.requested());
+
+        // The tail is still untouched growth budget.
+        assert_eq!(reply.reserved[3..], [0, 0, 0]);
+        assert_eq!(update_status::PENDING & update_status::PARTIAL, 0);
     }
 
     #[test]

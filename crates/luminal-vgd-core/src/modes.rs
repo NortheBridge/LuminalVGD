@@ -147,23 +147,63 @@ impl Mode {
     /// - Duplicates collapse, so a host that resends its full desired list
     ///   every time is idempotent rather than cap-exhausting.
     ///
-    /// Returns `(merged, added_count)`. `added_count == 0` means the
-    /// update is a no-op and the caller should not disturb the OS at all.
-    pub fn merge_additive(current: &[Mode], added: &[Mode]) -> (Vec<Mode>, usize) {
+    /// Returns a [`Merge`]. `appended == 0` means the update is a no-op and
+    /// the caller should not disturb the OS at all; `dropped > 0` means the
+    /// request did not fit and the caller MUST say so (see [`Merge`]).
+    pub fn merge_additive(current: &[Mode], added: &[Mode]) -> Merge {
         let mut out = current.to_vec();
         let mut appended = 0usize;
+        let mut accepted = 0usize;
+        let mut dropped = 0usize;
         for mode in added {
-            if out.len() >= MAX_MODES_PER_MONITOR as usize {
-                break;
-            }
+            // Already advertised: accepted, nothing to append. Checked
+            // BEFORE the cap so a request that is a subset of a full list
+            // reports "all accepted" rather than "all dropped" — a resend
+            // of an in-force list is idempotent success, not truncation.
             if out.contains(mode) {
+                accepted += 1;
+                continue;
+            }
+            if out.len() >= MAX_MODES_PER_MONITOR as usize {
+                // No room. Keep going rather than breaking: a later entry
+                // may already be advertised, and reporting it as dropped
+                // would understate what the caller actually got.
+                dropped += 1;
                 continue;
             }
             out.push(*mode);
             appended += 1;
+            accepted += 1;
         }
-        (out, appended)
+        Merge { merged: out, appended, accepted, dropped }
     }
+}
+
+/// The outcome of [`Mode::merge_additive`].
+///
+/// `accepted` / `dropped` exist because the cap is silent otherwise: the
+/// merge keeps every mode that fits (never displacing anything already
+/// advertised, per the append-only rule above) and simply has nowhere to
+/// put the rest. A caller that only looked at `merged` would report plain
+/// success for a request it did not fully honor, and the host would go on
+/// believing it can select a mode that will never be offered.
+///
+/// `accepted + dropped == added.len()` always: every requested entry is
+/// either advertised by `merged` (appended now or already present) or was
+/// refused for want of room, never both and never neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Merge {
+    /// The post-merge list, preferred first. `merged[0] == current[0]`.
+    pub merged: Vec<Mode>,
+    /// Entries actually appended (0 = nothing changed).
+    pub appended: usize,
+    /// Requested entries that `merged` advertises — appended now or
+    /// already present.
+    pub accepted: usize,
+    /// Requested entries that did not fit under [`MAX_MODES_PER_MONITOR`].
+    /// `dropped > 0` is PARTIAL application: real success for the modes
+    /// that fit, and a fact the caller has to pass on.
+    pub dropped: usize,
 }
 
 #[cfg(test)]
@@ -281,11 +321,11 @@ mod tests {
     #[test]
     fn additive_merge_adds_the_framegen_rate_without_disturbing_the_live_one() {
         let live = vec![m(120_000)];
-        let (merged, added) = Mode::merge_additive(&live, &[m(240_000)]);
-        assert_eq!(added, 1);
-        assert_eq!(merged, vec![m(120_000), m(240_000)]);
+        let r = Mode::merge_additive(&live, &[m(240_000)]);
+        assert_eq!((r.appended, r.accepted, r.dropped), (1, 1, 0));
+        assert_eq!(r.merged, vec![m(120_000), m(240_000)]);
         // Preferred timing untouched: the EDID still describes modes[0].
-        assert_eq!(merged[0], live[0]);
+        assert_eq!(r.merged[0], live[0]);
     }
 
     #[test]
@@ -293,29 +333,62 @@ mod tests {
         let live = vec![m(120_000), m(240_000)];
         // A host asking for ONLY the doubled rate cannot drop the base
         // rate — the OS may have it committed right now.
-        let (merged, added) = Mode::merge_additive(&live, &[m(240_000)]);
-        assert_eq!((merged.as_slice(), added), (live.as_slice(), 0));
+        let r = Mode::merge_additive(&live, &[m(240_000)]);
+        assert_eq!((r.merged.as_slice(), r.appended), (live.as_slice(), 0));
+        assert_eq!((r.accepted, r.dropped), (1, 0), "already advertised == accepted");
         // Nor can it promote a later mode to preferred.
-        let (merged, added) = Mode::merge_additive(&live, &[m(240_000), m(60_000)]);
-        assert_eq!(merged, vec![m(120_000), m(240_000), m(60_000)]);
-        assert_eq!(added, 1);
-        assert_eq!(merged[0], live[0]);
+        let r = Mode::merge_additive(&live, &[m(240_000), m(60_000)]);
+        assert_eq!(r.merged, vec![m(120_000), m(240_000), m(60_000)]);
+        assert_eq!((r.appended, r.accepted, r.dropped), (1, 2, 0));
+        assert_eq!(r.merged[0], live[0]);
     }
 
     #[test]
     fn additive_merge_is_idempotent_and_capped() {
         let live = vec![m(120_000)];
         let want = [m(120_000), m(240_000)];
-        let (once, added_once) = Mode::merge_additive(&live, &want);
-        let (twice, added_twice) = Mode::merge_additive(&once, &want);
-        assert_eq!(once, twice, "resending the same desired list changes nothing");
-        assert_eq!((added_once, added_twice), (1, 0));
+        let once = Mode::merge_additive(&live, &want);
+        let twice = Mode::merge_additive(&once.merged, &want);
+        assert_eq!(once.merged, twice.merged, "resending the same desired list changes nothing");
+        assert_eq!((once.appended, twice.appended), (1, 0));
+        assert_eq!((once.accepted, twice.accepted), (2, 2));
 
         // At the cap, extra entries are dropped rather than displacing
         // anything already advertised.
         let full = vec![m(60_000), m(90_000), m(120_000), m(240_000)];
         assert_eq!(full.len(), MAX_MODES_PER_MONITOR as usize);
-        let (merged, added) = Mode::merge_additive(&full, &[m(30_000)]);
-        assert_eq!((merged, added), (full, 0));
+        let r = Mode::merge_additive(&full, &[m(30_000)]);
+        assert_eq!((r.merged, r.appended), (full, 0));
+    }
+
+    /// FINDING 2 — the cap must not be silent. A request that does not fit
+    /// is PARTIAL application: the modes that fit are really applied (they
+    /// must not be thrown away), and the ones that did not have to be
+    /// counted, or the caller reports plain success for a mode the monitor
+    /// will never offer.
+    #[test]
+    fn additive_merge_counts_what_it_could_not_fit() {
+        // Room for exactly one more, three asked for.
+        let live = vec![m(60_000), m(90_000), m(120_000)];
+        let r = Mode::merge_additive(&live, &[m(144_000), m(240_000), m(360_000)]);
+        assert_eq!(r.merged.len(), MAX_MODES_PER_MONITOR as usize);
+        assert_eq!(r.appended, 1, "the one that fits is kept, not discarded");
+        assert_eq!((r.accepted, r.dropped), (1, 2));
+        assert_eq!(r.merged[..3], live[..], "nothing already advertised was displaced");
+        assert_eq!(r.merged[3], m(144_000), "request order preserved");
+
+        // A full list plus a request that is partly already advertised:
+        // the present entries count as accepted, only the new ones are
+        // dropped. (Break-on-cap would have miscounted the tail here.)
+        let full = vec![m(60_000), m(90_000), m(120_000), m(240_000)];
+        let r = Mode::merge_additive(&full, &[m(30_000), m(120_000)]);
+        assert_eq!((r.appended, r.accepted, r.dropped), (0, 1, 1));
+        assert_eq!(r.merged, full);
+
+        // The invariant every caller relies on to report honestly.
+        for req in [vec![m(30_000)], vec![m(30_000), m(45_000)], vec![m(120_000)]] {
+            let r = Mode::merge_additive(&full, &req);
+            assert_eq!(r.accepted + r.dropped, req.len());
+        }
     }
 }

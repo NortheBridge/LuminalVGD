@@ -17,10 +17,11 @@
 //! core, and replies are fully written before success is returned.
 
 use luminal_driver_proto::{
-    err, ioctl, names, versions_compatible, CreateMonitorReply, CreateMonitorRequest,
-    DestroyMonitorRequest, HandshakeRequest, PermanentPoolConfig, PingRequest,
-    QueryLeaseReply, QueryLeaseRequest, SetRenderAdapterRequest, UpdateModesReply,
-    UpdateModesRequest, ABI_MAX_RING_SLOTS, DEFAULT_RING_SLOTS, MAX_MODES_PER_MONITOR,
+    err, ioctl, names, update_status, versions_compatible, CreateMonitorReply,
+    CreateMonitorRequest, DestroyMonitorRequest, HandshakeRequest, PermanentPoolConfig,
+    PingRequest, QueryLeaseReply, QueryLeaseRequest, SetRenderAdapterRequest,
+    UpdateModesReply, UpdateModesRequest, ABI_MAX_RING_SLOTS, DEFAULT_RING_SLOTS,
+    MAX_MODES_PER_MONITOR,
 };
 use luminal_vgd_core::adapter::AdapterInfo;
 use luminal_vgd_core::edid::{self, EdidParams};
@@ -125,7 +126,18 @@ pub enum Effect {
     /// OS answers by re-entering our mode DDIs synchronously, and that
     /// may only ever happen on the effects worker with no lock held
     /// (DESIGN.md §3.3 rule 3).
-    UpdateModes { session_id: u64, modes: Vec<Mode> },
+    ///
+    /// **The shell owes the table an answer.** The list is pending, not
+    /// committed: whoever applies this effect MUST call
+    /// `SessionTable::settle_modes(session_id, update_seq, …)` exactly
+    /// once, with `Applied` only if `IddCxMonitorUpdateModes2` returned
+    /// success. Without that call the durable list never changes and the
+    /// host's next request re-pushes — safe, but a leak of intent; with a
+    /// wrong `Applied` the durable state resumes lying, which is the
+    /// defect this ordering exists to kill. `update_seq` is table-wide
+    /// and monotonic, so a settle for a superseded or destroyed update
+    /// no-ops instead of committing.
+    UpdateModes { session_id: u64, update_seq: u64, modes: Vec<Mode> },
     /// Store this blob under the device registry key; hand it back to
     /// `DeviceState::new` on next start (identity retention + pool).
     PersistState(Vec<u8>),
@@ -519,6 +531,11 @@ pub fn dispatch(
                 .map(|m| m.modes.len() as u32)
                 .unwrap_or(0);
             reply.mode_count = current;
+            // Requested count is echoed on every outcome, including
+            // refusals: `accepted < requested` is the caller's partial-
+            // application test, and it must not read as "0 of 0" when the
+            // request never got as far as the merge.
+            reply.set_detail(0, req.mode_count, 0);
             if !handle.handshaken {
                 reply.result = err::NOT_HANDSHAKEN;
             } else if req.mode_count == 0
@@ -537,22 +554,46 @@ pub fn dispatch(
                 // caps bit instead.
                 let specs = &req.modes[..req.mode_count as usize];
                 match dev.table.update_modes(req.session_id, specs, dev.cfg.caps) {
-                    Ok((modes, added)) => {
-                        reply.mode_count = modes.len() as u32;
-                        // added == 0 ⇒ the list is already a superset of
-                        // the request. Report success and emit NO effect:
-                        // pushing an unchanged list at the OS is a modeset
-                        // risk taken for nothing.
-                        if added > 0 {
+                    Ok(update) => {
+                        reply.mode_count = update.merged.len() as u32;
+                        let mut flags = 0u32;
+                        // PARTIAL: the merge kept everything that fits and
+                        // had nowhere to put the rest. Reporting plain OK
+                        // here told a caller it could select a mode the
+                        // monitor will never offer — so say it, and say it
+                        // without failing the request or throwing away the
+                        // modes that DID fit (constraint 1).
+                        if update.dropped > 0 {
+                            flags |= update_status::PARTIAL;
+                        }
+                        // PENDING: the merged list is NOT in force yet.
+                        // The durable list is committed only when the
+                        // shell reports the OS push succeeded
+                        // (`SessionTable::settle_modes`), which cannot
+                        // have happened before this IRP completes.
+                        if update.pending {
+                            flags |= update_status::PENDING;
+                        }
+                        reply.set_detail(update.accepted as u32, req.mode_count, flags);
+                        // `queued` is Some only when THIS request added
+                        // something that has to reach the OS. A request
+                        // that adds nothing emits no effect: pushing an
+                        // unchanged list is a modeset risk taken for
+                        // nothing — but note that after a failed or
+                        // deferred push the pending list is discarded, so
+                        // an identical retry lands here with something to
+                        // add and does re-push. That is the whole fix.
+                        if let Some(update_seq) = update.queued {
                             effects.push(Effect::UpdateModes {
                                 session_id: req.session_id,
-                                modes,
+                                update_seq,
+                                modes: update.merged,
                             });
                         }
                         // No PersistState: the blob carries identity
                         // reservations and the pool config only — never
                         // mode lists — so there is nothing new to write.
-                        // The merged list still survives an in-process
+                        // The applied list still survives an in-process
                         // replug because it lives in the session table,
                         // which is what `plug_effect` reads.
                     }
@@ -707,6 +748,7 @@ mod tests {
         UpdateModesReply, UpdateModesRequest, LEASE_TIMEOUT_USE_DEFAULT, PROTO_VERSION_MAJOR,
         PROTO_VERSION_MINOR,
     };
+    use luminal_vgd_core::session::ModeUpdateResult;
 
     const CAPS: u32 =
         caps::HDR10 | caps::SDR10_BIT | caps::DIRTY_RECTS | caps::MULTI_MODE | caps::PERMANENT_POOL;
@@ -1179,6 +1221,17 @@ mod tests {
         (from_bytes(&out), r.effects)
     }
 
+    /// Take an `Effect::UpdateModes` out of a dispatch result: its
+    /// `update_seq` (what the shell must settle) and the list it pushes.
+    fn queued_update(effects: &[Effect]) -> Option<(u64, Vec<Mode>)> {
+        effects.iter().find_map(|e| match e {
+            Effect::UpdateModes { update_seq, modes, .. } => {
+                Some((*update_seq, modes.clone()))
+            }
+            _ => None,
+        })
+    }
+
     /// The build-17 milestone in one test: a monitor created at the base
     /// rate (the Moonlight "Desktop" stream) gains the
     /// frame-generation-doubled rate on a LIVE session — one UpdateModes
@@ -1196,25 +1249,219 @@ mod tests {
         assert_eq!(reply.result, err::OK);
         assert_eq!(reply.session_id, 0xD4);
         assert_eq!(reply.mode_count, 2);
+        assert_eq!((reply.accepted(), reply.requested()), (2, 2));
+        assert!(reply.is_pending(), "queued at the OS, not in force yet");
+        assert!(!reply.is_partial());
+        assert!(!reply.fully_in_force());
 
         assert_eq!(effects.len(), 1, "no plug, no unplug, no persist");
+        let (seq, modes) = queued_update(&effects).expect("one push queued");
         match &effects[0] {
-            Effect::UpdateModes { session_id, modes } => {
-                assert_eq!(*session_id, 0xD4);
-                assert_eq!(modes.len(), 2);
-                assert_eq!(modes[0].refresh_millihz, 120_000, "preferred mode preserved");
-                assert_eq!(modes[1].refresh_millihz, 240_000);
-            }
+            Effect::UpdateModes { session_id, .. } => assert_eq!(*session_id, 0xD4),
             other => panic!("unexpected effect {other:?}"),
         }
-        // Durable copy updated, so a replug-from-DeviceState carries it.
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].refresh_millihz, 120_000, "preferred mode preserved");
+        assert_eq!(modes[1].refresh_millihz, 240_000);
+
+        // Not durable yet: the IRP completed before the OS was told
+        // anything, so a replug-from-DeviceState right now must still
+        // carry the created list.
+        assert_eq!(d.table.get(0xD4).unwrap().modes.len(), 1);
+
+        // The shell reports the push succeeded — NOW it is durable.
+        assert!(d.table.settle_modes(0xD4, seq, ModeUpdateResult::Applied));
         assert_eq!(d.table.get(0xD4).unwrap().modes.len(), 2);
 
-        // Resending the same desired list is a no-op: no effect at all, so
-        // the OS is never asked to renegotiate for nothing.
+        // Resending a list that is genuinely in force is a no-op: no
+        // effect at all, so the OS is never asked to renegotiate for
+        // nothing — and the reply says so without the PENDING flag.
         let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xD4, &[base, doubled]));
         assert_eq!((reply.result, reply.mode_count), (err::OK, 2));
         assert!(effects.is_empty());
+        assert!(reply.fully_in_force(), "in force, in full, right now");
+    }
+
+    /// FINDINGS 1/3/4 (the one defect from three angles): a push the OS
+    /// REFUSED must leave the durable list where it was, and the
+    /// identical retry must produce a real second push.
+    ///
+    /// Against the pre-fix code this test fails twice over: the durable
+    /// list was committed at IOCTL time, so the assertion right after the
+    /// failed settle finds 2 modes; and the retry merges to "nothing to
+    /// add", emits no effect, and reports plain OK — a silent no-op the
+    /// caller cannot recover from, reporting success while the monitor
+    /// advertises the old list.
+    #[test]
+    fn a_retry_after_a_failed_push_really_pushes_again() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &create_req(7));
+        let doubled = ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 };
+
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[doubled]));
+        assert!(reply.is_pending());
+        let (seq, _) = queued_update(&effects).expect("first request queues a push");
+
+        // The OS refused it (monitors::update_modes rolled the runtime
+        // list back and settles NotApplied).
+        assert!(d.table.settle_modes(7, seq, ModeUpdateResult::NotApplied));
+        assert_eq!(
+            d.table.get(7).unwrap().modes.len(),
+            1,
+            "the durable list must not claim a mode the OS refused"
+        );
+        assert_eq!(
+            d.table.get(7).unwrap().last_error,
+            err::UPDATE_FAILED,
+            "and GET_STATUS says so"
+        );
+
+        // THE FIX: the identical retry pushes again.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[doubled]));
+        assert_eq!(reply.result, err::OK);
+        let (retry_seq, retry_modes) =
+            queued_update(&effects).expect("an identical retry must re-push, not no-op");
+        assert_ne!(retry_seq, seq, "a NEW push, not a replay of the settled one");
+        assert_eq!(retry_modes.len(), 2);
+        assert!(
+            reply.is_pending(),
+            "and it must NOT read as in force while the modes are absent"
+        );
+        assert!(!reply.fully_in_force());
+        assert_eq!(d.table.get(7).unwrap().modes.len(), 1, "still not in force");
+
+        // Second time lucky.
+        assert!(d.table.settle_modes(7, retry_seq, ModeUpdateResult::Applied));
+        assert_eq!(d.table.get(7).unwrap().modes.len(), 2);
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[doubled]));
+        assert!(effects.is_empty());
+        assert!(reply.fully_in_force());
+    }
+
+    /// The same property for a DEFERRED push — the shell made no OS call
+    /// at all (a TDR duck in flight, or the adapter torn down under a
+    /// D3Final). A deferral is not an application: it settles NotApplied,
+    /// so the durable list is untouched and the retry genuinely re-pushes
+    /// once the deferring condition clears. Pre-fix, the durable list was
+    /// already committed and the retry was a no-op reporting OK — the
+    /// worst version of the bug, because a deferral is the case a host is
+    /// most likely to hit and most likely to retry.
+    #[test]
+    fn a_retry_after_a_deferred_push_really_pushes_again() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &create_req(8));
+        let doubled = ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 };
+        let before = d.table.get(8).unwrap().modes.clone();
+
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(8, &[doubled]));
+        assert!(reply.is_pending());
+        let (seq, _) = queued_update(&effects).expect("first request queues a push");
+
+        // Deferred: stored nowhere, pushed nowhere, retryable.
+        assert!(d.table.settle_modes(8, seq, ModeUpdateResult::NotApplied));
+        assert_eq!(d.table.get(8).unwrap().modes, before, "modes unchanged, carry on");
+        assert_eq!(d.table.get(8).unwrap().last_error, err::UPDATE_FAILED);
+
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(8, &[doubled]));
+        let (retry_seq, _) =
+            queued_update(&effects).expect("a retry after a deferral must re-push");
+        assert_ne!(retry_seq, seq);
+        assert!(reply.is_pending() && !reply.fully_in_force());
+        assert!(d.table.settle_modes(8, retry_seq, ModeUpdateResult::Applied));
+        assert_eq!(d.table.get(8).unwrap().modes.len(), 2);
+    }
+
+    /// While a push is outstanding, a second request stacks onto the
+    /// PENDING list rather than the in-force one, so nothing the first
+    /// request added is silently discarded — and every reply keeps saying
+    /// PENDING until something actually lands.
+    #[test]
+    fn a_second_request_while_a_push_is_outstanding_is_additive_and_still_pending() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &create_req(12));
+        let a = ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 };
+        let b = ModeSpec { width: 1920, height: 1080, refresh_millihz: 60_000 };
+
+        let (_, first) = do_update(&mut d, &mut h, &update_req(12, &[a]));
+        let (first_seq, _) = queued_update(&first).unwrap();
+        let (reply, second) = do_update(&mut d, &mut h, &update_req(12, &[b]));
+        let (second_seq, second_modes) = queued_update(&second).unwrap();
+        assert_eq!(second_modes.len(), 3, "stacked on the pending list");
+        assert!(reply.is_pending());
+
+        // The superseded push settles nothing; the newer one carries both.
+        assert!(!d.table.settle_modes(12, first_seq, ModeUpdateResult::Applied));
+        assert_eq!(d.table.get(12).unwrap().modes.len(), 1);
+        assert!(d.table.settle_modes(12, second_seq, ModeUpdateResult::Applied));
+        assert_eq!(d.table.get(12).unwrap().modes.len(), 3);
+
+        // Resending EITHER list now is a no-op that reads as in force.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(12, &[a, b]));
+        assert!(effects.is_empty());
+        assert!(reply.fully_in_force());
+    }
+
+    /// FINDING 2: a request that does not fit under MAX_MODES_PER_MONITOR
+    /// is PARTIAL application — the modes that fit are applied and kept,
+    /// and the reply says how much of the request was taken. Pre-fix this
+    /// returned plain OK, so a host was told it could select a mode the
+    /// monitor would never offer. Constraint 1 holds throughout: never an
+    /// error, never a dropped session, never a discarded mode that fit.
+    #[test]
+    fn an_over_cap_request_reports_partial_application_not_plain_ok() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        // Create with three of the four slots used.
+        let mut req = create_req(0x5A);
+        req.mode_count = 3;
+        req.modes[1] = ModeSpec { width: 2560, height: 1440, refresh_millihz: 60_000 };
+        req.modes[2] = ModeSpec { width: 2560, height: 1440, refresh_millihz: 90_000 };
+        do_create(&mut d, &mut h, &req);
+
+        // Ask for three more: exactly one can fit.
+        let want = [
+            ModeSpec { width: 2560, height: 1440, refresh_millihz: 144_000 },
+            ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 },
+            ModeSpec { width: 1920, height: 1080, refresh_millihz: 60_000 },
+        ];
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0x5A, &want));
+        assert_eq!(reply.result, err::OK, "partial success is success, not an error");
+        assert!(reply.is_partial(), "and it must not read as a clean OK");
+        assert_eq!((reply.accepted(), reply.requested()), (1, 3));
+        assert_eq!(reply.mode_count, MAX_MODES_PER_MONITOR);
+        assert!(!reply.fully_in_force());
+
+        // The mode that fit is really applied — partial must not mean
+        // "throw the request away".
+        let (seq, modes) = queued_update(&effects).expect("the one that fits is pushed");
+        assert_eq!(modes.len(), MAX_MODES_PER_MONITOR as usize);
+        assert_eq!(modes[3].refresh_millihz, 144_000, "request order preserved");
+        assert!(d.table.settle_modes(0x5A, seq, ModeUpdateResult::Applied));
+        let live = &d.table.get(0x5A).unwrap().modes;
+        assert_eq!(live.len(), MAX_MODES_PER_MONITOR as usize);
+        assert_eq!(live[0].refresh_millihz, 120_000, "modes[0] never moves");
+
+        // Now the list is full: an all-dropped request is still OK, still
+        // reports PARTIAL, and still changes nothing.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0x5A, &want[1..]));
+        assert_eq!(reply.result, err::OK);
+        assert!(reply.is_partial() && !reply.is_pending());
+        assert_eq!((reply.accepted(), reply.requested()), (0, 2));
+        assert!(effects.is_empty(), "nothing to push");
+        assert_eq!(d.table.get(0x5A).unwrap().modes.len(), MAX_MODES_PER_MONITOR as usize);
+
+        // A resend of what IS advertised is not partial: already-present
+        // entries count as accepted.
+        let (reply, _) = do_update(&mut d, &mut h, &update_req(0x5A, &[want[0]]));
+        assert!(reply.fully_in_force());
+        assert_eq!((reply.accepted(), reply.requested()), (1, 1));
     }
 
     /// Constraint 1: every refusal is a REPLY code with the current mode
@@ -1234,6 +1481,10 @@ mod tests {
         assert_eq!(reply.result, err::NOT_HANDSHAKEN);
         assert_eq!(reply.mode_count, 1, "modes in force still reported");
         assert!(effects.is_empty());
+        // A refusal takes nothing and queues nothing, and says both.
+        assert_eq!((reply.accepted(), reply.requested()), (0, 1));
+        assert_eq!(reply.flags(), 0);
+        assert!(!reply.fully_in_force(), "a refusal is never 'in force'");
 
         // Unknown session: 0 modes in force is the one case that means
         // "there is nothing there".

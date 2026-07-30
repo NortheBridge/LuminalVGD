@@ -13,6 +13,7 @@ use super::bindings::{self, ffi};
 use super::PROVIDER;
 use super::{MonitorRt, OsHandle, Shell};
 use luminal_vgd_core::modes::Mode;
+use luminal_vgd_core::session::ModeUpdateResult;
 
 /// Deterministic container GUID for a display identity: same display_id
 /// → same GUID across reconnects and reboots (identity retention).
@@ -475,11 +476,36 @@ const UPD_STAGE_OS_CALL: u32 = 4; // IddCxMonitorUpdateModes2 returned failure
 const UPD_STAGE_ROLLBACK_RACED: u32 = 5; // monitor changed under a failed push
 const UPD_STAGE_NO_ADAPTER: u32 = 8; // adapter torn down before the push (6/7 are control.rs's)
 
+/// What the OS push did with a pending mode list. Every variant is
+/// reported to `SessionTable::settle_modes`, and only `Applied` commits.
+enum UpdatePush {
+    /// `IddCxMonitorUpdateModes2` returned success: the list is in force.
+    Applied { count: u32, dynamic: u32 },
+    /// No OS call was made and nothing was left changed. RETRYABLE — the
+    /// host's next identical request merges and pushes for real.
+    Deferred { stage: u32, count: u32 },
+    /// The OS refused, or there was nothing to push at.
+    Failed { stage: u32, code: i32, count: u32, rolled_back: bool },
+}
+
 /// Apply a validated, already-merged mode list to a live monitor.
 ///
 /// Runs ONLY on the effects worker (via `Effect::UpdateModes`), because
 /// `IddCxMonitorUpdateModes2` makes the OS re-enter our mode DDIs
 /// synchronously on the calling thread.
+///
+/// # The commit ordering (build 17 fix)
+///
+/// `update_seq` names the update the session table is holding PENDING.
+/// This function owes it exactly one `settle_modes`, and passes
+/// `Applied` only when the OS really took the list. Nothing else in the
+/// driver commits a mode list. The original build-17 ordering committed
+/// the durable list at IOCTL time, before the push — so a refused or
+/// deferred push left durable state asserting modes the monitor did not
+/// advertise, and the identical retry merged to "nothing to add",
+/// emitted no effect, and returned OK forever. Now a push that did not
+/// take leaves every copy on the pre-update list and the retry pushes
+/// again.
 ///
 /// # The lock protocol, which is the whole of the danger here
 ///
@@ -503,59 +529,146 @@ const UPD_STAGE_NO_ADAPTER: u32 = 8; // adapter torn down before the push (6/7 a
 /// already have consumed the new list in a re-entrant query before
 /// returning failure — so the trace records what happened rather than
 /// pretending the two views are atomic.
-pub fn update_modes(session_id: u64, modes: Vec<Mode>) {
+pub fn update_modes(session_id: u64, update_seq: u64, modes: Vec<Mode>) {
     let shell = Shell::get();
+    let push = push_modes(shell, session_id, modes);
 
-    // The DDI documents TargetModeCount as "cannot be zero". The merge
-    // cannot produce an empty list, so this is a guard against a future
-    // caller, not a live case — but it must never reach the OS.
-    if modes.is_empty() {
-        tracelogging::write_event!(
-            PROVIDER,
-            "UpdateModesFailed",
-            level(Warning),
-            u64("session", &session_id),
-            u32("stage", &UPD_STAGE_EMPTY),
-            i32("code", &luminal_driver_proto::err::BAD_MODE)
-        );
-        return;
-    }
-
-    // A session parked by a TDR duck-out has no monitor object to push
-    // at — it was departed, and the replug creates a NEW one. Patch the
-    // parked spec so the re-arrival advertises the new list; without this
-    // the update would be silently undone by the recovery.
-    {
-        let mut ducked = shell.ducked.lock().unwrap();
-        if let Some(d) = ducked.iter_mut().find(|d| d.session_id == session_id) {
-            d.modes = modes;
-            drop(ducked);
+    // Constraint 5: every deny/fail path carries stage + code.
+    match push {
+        UpdatePush::Applied { count, dynamic } => {
+            tracelogging::write_event!(
+                PROVIDER,
+                "UpdateModesApplied",
+                level(Informational),
+                u64("session", &session_id),
+                u32("modes", &count),
+                u32("dynamic", &dynamic),
+                i32("status", &STATUS_SUCCESS)
+            );
+        }
+        UpdatePush::Deferred { stage, count } => {
             tracelogging::write_event!(
                 PROVIDER,
                 "UpdateModesDeferred",
                 level(Informational),
                 u64("session", &session_id),
-                u32("stage", &UPD_STAGE_PARKED)
+                u32("stage", &stage),
+                u32("modes", &count),
+                // The half of a deferral that used to be missing: the host
+                // is being told, through GET_STATUS, that the modes are NOT
+                // in force and the request is worth sending again.
+                u32("retryable", &1u32)
             );
-            return;
         }
-    }
-
-    // --- Under the lock: publish, snapshot, build. No IddCx calls. ---
-    let (monitor, previous, previous_static, target_modes) = {
-        let mut monitors = shell.monitors.lock().unwrap();
-        let Some(rt) = monitors.get_mut(&session_id) else {
+        UpdatePush::Failed { stage, code, count, rolled_back } => {
             tracelogging::write_event!(
                 PROVIDER,
                 "UpdateModesFailed",
                 level(Warning),
                 u64("session", &session_id),
-                u32("stage", &UPD_STAGE_NO_MONITOR),
-                i32("code", &luminal_driver_proto::err::NO_SUCH_SESSION)
+                u32("stage", &stage),
+                i32("code", &code),
+                u32("modes", &count),
+                u32("rolled_back", &u32::from(rolled_back))
             );
-            return;
+        }
+    }
+
+    // --- The durable commit, and the ONLY one. ---
+    // Taken AFTER the IddCx call returned and with no other lock held —
+    // the device lock is held for the whole of every dispatch(), so it
+    // must never be on the far side of an OS call. `settle_modes` also
+    // records the sticky per-monitor `err::UPDATE_FAILED` that carries a
+    // not-applied outcome back to the host in every GET_STATUS reply,
+    // which is the channel a retry decision is made on.
+    let result = match push {
+        UpdatePush::Applied { .. } => ModeUpdateResult::Applied,
+        _ => ModeUpdateResult::NotApplied,
+    };
+    let settled = shell.dev.lock().unwrap().table.settle_modes(session_id, update_seq, result);
+    if !settled {
+        // The update was superseded by a newer one, or its session is
+        // gone. Neither is an error — the newer update's own settle
+        // covers a superset of these modes — but a silent miss and a
+        // missing settle look identical in a capture, so say which.
+        tracelogging::write_event!(
+            PROVIDER,
+            "UpdateModesSettleStale",
+            level(Informational),
+            u64("session", &session_id),
+            u64("seq", &update_seq)
+        );
+    }
+}
+
+/// The push itself. Split out so the caller has exactly one settle site
+/// and one trace site — a return path that forgot to settle would leave
+/// the table holding a pending list forever, and the whole point of the
+/// pending state is that it is always resolved.
+fn push_modes(shell: &Shell, session_id: u64, modes: Vec<Mode>) -> UpdatePush {
+    // The DDI documents TargetModeCount as "cannot be zero". The merge
+    // cannot produce an empty list, so this is a guard against a future
+    // caller, not a live case — but it must never reach the OS.
+    if modes.is_empty() {
+        return UpdatePush::Failed {
+            stage: UPD_STAGE_EMPTY,
+            code: luminal_driver_proto::err::BAD_MODE,
+            count: 0,
+            rolled_back: false,
+        };
+    }
+    let count = modes.len() as u32;
+
+    // A session parked by a TDR duck-out has no monitor object to push
+    // at — it was departed, and the replug creates a NEW one. Patch the
+    // parked spec so the re-arrival advertises the new list; without this
+    // the update would be silently undone by the recovery.
+    //
+    // It is still a DEFERRAL, not an application: nothing has been
+    // advertised to the OS, the replug may yet give up, and the durable
+    // list must not claim otherwise. The patch and the retry converge —
+    // a retry re-merges from the durable list to exactly this list.
+    {
+        let mut ducked = shell.ducked.lock().unwrap();
+        if let Some(d) = ducked.iter_mut().find(|d| d.session_id == session_id) {
+            d.modes = modes;
+            return UpdatePush::Deferred { stage: UPD_STAGE_PARKED, count };
+        }
+    }
+
+    // Deferral checks come BEFORE anything is published. Both are
+    // lock-free reads of state the effects worker cannot race with
+    // itself, and taking them here means a deferral leaves the runtime
+    // list exactly as it was — the build-17 original published first and
+    // returned, leaving the runtime list ahead of a durable list it never
+    // committed, which is the divergence in a second guise.
+    //
+    // A duck in flight: the monitor is arrived but its transport is
+    // REBUILDING and the recovery poller is judging whether the OS
+    // re-assigns on its own. Do not hand that decision a mode-list change
+    // mid-flight; the host retries once the duck settles.
+    if shell.tdr_duck_pending.load(std::sync::atomic::Ordering::SeqCst) {
+        return UpdatePush::Deferred { stage: UPD_STAGE_DUCK_PENDING, count };
+    }
+    // A final device exit (D3Final) clears the adapter, and the OS
+    // destroys its child monitor objects with it.
+    if shell.adapter().is_none() {
+        return UpdatePush::Deferred { stage: UPD_STAGE_NO_ADAPTER, count };
+    }
+
+    // --- Under the lock: publish, snapshot, build. No IddCx calls. ---
+    let (monitor, previous, previous_static, pushed, target_modes) = {
+        let mut monitors = shell.monitors.lock().unwrap();
+        let Some(rt) = monitors.get_mut(&session_id) else {
+            return UpdatePush::Failed {
+                stage: UPD_STAGE_NO_MONITOR,
+                code: luminal_driver_proto::err::NO_SUCH_SESSION,
+                count,
+                rolled_back: false,
+            };
         };
         let monitor = rt.monitor;
+        let pushed = modes.clone();
         let previous = core::mem::replace(&mut rt.modes, modes);
         let previous_static = rt.static_mode_count;
         // static_mode_count deliberately unchanged: the appended entries
@@ -566,48 +679,9 @@ pub fn update_modes(session_id: u64, modes: Vec<Mode>) {
         for (slot, mode) in target_modes.iter_mut().zip(rt.modes.iter()) {
             fill_target_mode2(slot, mode);
         }
-        (monitor, previous, previous_static, target_modes)
+        (monitor, previous, previous_static, pushed, target_modes)
     };
-    let count = target_modes.len() as u32;
     let dynamic = (count as usize).saturating_sub(previous_static) as u32;
-
-    // A duck is in flight: the monitor is arrived but its transport is
-    // REBUILDING and the recovery poller is judging whether the OS
-    // re-assigns on its own. Do not hand that decision a mode-list change
-    // mid-flight — the new list is already stored, so the OS picks it up
-    // at the next parse/query the recovery drives anyway.
-    if shell.tdr_duck_pending.load(std::sync::atomic::Ordering::SeqCst) {
-        tracelogging::write_event!(
-            PROVIDER,
-            "UpdateModesDeferred",
-            level(Informational),
-            u64("session", &session_id),
-            u32("stage", &UPD_STAGE_DUCK_PENDING),
-            u32("modes", &count)
-        );
-        return;
-    }
-
-    // Last check before touching the OS: a final device exit (D3Final)
-    // clears the adapter, and the OS destroys its child monitor objects
-    // with it. Every monitor LIFECYCLE call is serialized with this one on
-    // the effects worker — plug, unplug, duck and replug all run here — so
-    // the handle cannot be departed underneath us; the power callback is
-    // the one path that is NOT on this thread. `plug` accepts the same
-    // exposure with a single entry check (a documented, accepted residual
-    // risk); doing it immediately before the call leaves only lock-free
-    // work in the window.
-    if shell.adapter().is_none() {
-        tracelogging::write_event!(
-            PROVIDER,
-            "UpdateModesDeferred",
-            level(Warning),
-            u64("session", &session_id),
-            u32("stage", &UPD_STAGE_NO_ADAPTER),
-            u32("modes", &count)
-        );
-        return;
-    }
 
     // --- No locks held. The OS may re-enter our DDIs inside this call. ---
     let status = unsafe {
@@ -624,16 +698,7 @@ pub fn update_modes(session_id: u64, modes: Vec<Mode>) {
     // borrows it for the duration of the call.
 
     if status == STATUS_SUCCESS {
-        tracelogging::write_event!(
-            PROVIDER,
-            "UpdateModesApplied",
-            level(Informational),
-            u64("session", &session_id),
-            u32("modes", &count),
-            u32("dynamic", &dynamic),
-            i32("status", &status)
-        );
-        return;
+        return UpdatePush::Applied { count, dynamic };
     }
 
     // --- Failure: restore the previous list. ---
@@ -642,12 +707,21 @@ pub fn update_modes(session_id: u64, modes: Vec<Mode>) {
     // reaped, ducked, or replugged onto a NEW monitor object — and
     // writing a stale list onto a fresh monitor would be worse than the
     // failure being rolled back.
+    //
+    // The list comparison is the second half of that check and the reason
+    // this restore can never SHRINK a live list below anything another
+    // update added: it only runs when the runtime list is still, byte for
+    // byte, the one this call published, and it puts back the exact list
+    // that was in force a moment earlier — a superset of whatever the OS
+    // has committed, since the merge only ever appends. (Constraint 2:
+    // the rollback was the one path able to shrink a live list; scoped
+    // like this it can only undo its own append.)
     let mut rolled_back = false;
     let mut raced = false;
     {
         let mut monitors = shell.monitors.lock().unwrap();
         match monitors.get_mut(&session_id) {
-            Some(rt) if rt.monitor == monitor => {
+            Some(rt) if rt.monitor == monitor && rt.modes == pushed => {
                 rt.modes = previous;
                 rt.static_mode_count = previous_static;
                 rolled_back = true;
@@ -655,24 +729,11 @@ pub fn update_modes(session_id: u64, modes: Vec<Mode>) {
             _ => raced = true,
         }
     }
-    tracelogging::write_event!(
-        PROVIDER,
-        "UpdateModesFailed",
-        level(Warning),
-        u64("session", &session_id),
-        u32("stage", &if raced { UPD_STAGE_ROLLBACK_RACED } else { UPD_STAGE_OS_CALL }),
-        i32("code", &status),
-        u32("modes", &count),
-        u32("rolled_back", &u32::from(rolled_back))
-    );
-
-    // Surface it to the host without inventing a new channel: the sticky
-    // per-monitor last_error is already in every GET_STATUS reply. Taken
-    // AFTER the IddCx call returned and with no other lock held — the
-    // device lock is held for the whole of every dispatch(), so it must
-    // never be on the far side of an OS call.
-    if let Some(m) = shell.dev.lock().unwrap().table.get_mut(session_id) {
-        m.last_error = luminal_driver_proto::err::UPDATE_FAILED;
+    UpdatePush::Failed {
+        stage: if raced { UPD_STAGE_ROLLBACK_RACED } else { UPD_STAGE_OS_CALL },
+        code: status,
+        count,
+        rolled_back,
     }
 }
 

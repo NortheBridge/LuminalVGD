@@ -288,9 +288,32 @@ pub struct VgdUpdateModesReply {
     pub session_id: u64,
     /// `0` (accepted) or a negative proto `err::*` code.
     pub result: i32,
-    /// Modes in force after the merge.
+    /// Modes the monitor advertises once this request is applied.
     pub mode_count: u32,
+    /// Requested modes the driver took — appended now or already
+    /// advertised. `accepted < requested` means the monitor's list was at
+    /// its cap and the rest did not fit: partial application, NOT an
+    /// error, and nothing that fit was discarded.
+    pub accepted: u32,
+    /// Echo of the request's `mode_count`.
+    pub requested: u32,
+    /// `VGD_UPDATE_PENDING` / `VGD_UPDATE_PARTIAL`.
+    pub flags: u32,
 }
+
+/// [`VgdUpdateModesReply::flags`]: the list is not in force yet — the
+/// driver queued the OS-side push, which cannot have run before this call
+/// returned. A push that fails or is deferred leaves the PREVIOUS list in
+/// force and the request fully retryable (resending it really does push
+/// again), and surfaces as the monitor's sticky `last_error` (`-13`) in
+/// the status reply.
+pub const VGD_UPDATE_PENDING: u32 = 1;
+/// [`VgdUpdateModesReply::flags`]: fewer modes accepted than requested,
+/// because the monitor's list is at its cap. Success with detail — what
+/// fit was applied and nothing was removed.
+pub const VGD_UPDATE_PARTIAL: u32 = 2;
+const _: () = assert!(VGD_UPDATE_PENDING == luminal_driver_proto::update_status::PENDING);
+const _: () = assert!(VGD_UPDATE_PARTIAL == luminal_driver_proto::update_status::PARTIAL);
 
 /// Grow a LIVE monitor's advertised mode list — no destroy/create cycle,
 /// so no `DBT_DEVNODES_CHANGED` broadcast and no monitor churn (proto
@@ -316,7 +339,14 @@ pub struct VgdUpdateModesReply {
 /// - **`result == 0` means ACCEPTED, not applied.** The driver completes
 ///   the request before it calls the OS. The applied/failed outcome shows
 ///   up in ETW and as the monitor's sticky `last_error` in the status
-///   reply.
+///   reply. `result == 0` with neither flag set is the only shape that
+///   means "every mode you asked for is advertised right now"; with
+///   `VGD_UPDATE_PENDING` set, an update is still outstanding, and if it
+///   does not land the previous list stays in force and this exact
+///   request can simply be sent again.
+/// - **Check `accepted` against `requested`.** They differ when the
+///   monitor's list is already at its cap; the modes that fit were still
+///   applied.
 #[no_mangle]
 pub unsafe extern "C" fn vgd_update_modes(
     dev: *mut VgdDeviceHandle,
@@ -349,6 +379,9 @@ pub unsafe extern "C" fn vgd_update_modes(
                     session_id: reply.session_id,
                     result: reply.result,
                     mode_count: reply.mode_count,
+                    accepted: reply.accepted(),
+                    requested: reply.requested(),
+                    flags: reply.flags(),
                 };
                 0
             }

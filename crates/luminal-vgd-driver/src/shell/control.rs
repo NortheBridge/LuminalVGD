@@ -1467,8 +1467,12 @@ fn apply_now(effects: Vec<Effect>) {
             // re-enters the mode DDIs synchronously, so this may never run
             // on an IOCTL or callback frame, and never under a lock those
             // DDIs take.
-            Effect::UpdateModes { session_id, modes } => {
-                monitors::update_modes(session_id, modes)
+            // It also owes the session table a settle_modes for
+            // `update_seq` — the durable list stays pending until the OS
+            // push is confirmed, so this effect is the only thing that
+            // can resolve it, in either direction.
+            Effect::UpdateModes { session_id, update_seq, modes } => {
+                monitors::update_modes(session_id, update_seq, modes)
             }
             Effect::PersistState(blob) => unsafe { write_persisted(&blob) },
         }
@@ -1518,13 +1522,24 @@ unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out
                 // Accepted. `queued` distinguishes a real change from an
                 // idempotent resend of an already-advertised list, which
                 // deliberately produces no effect and no OS call.
+                // `accepted`/`requested` are the build-17 partial-
+                // application counts, and `pending` says whether the
+                // reported list is in force yet: without them a capture
+                // cannot tell a fully applied update from one the cap
+                // truncated or one still waiting on the effects worker,
+                // which is exactly the ambiguity that let a silent no-op
+                // read as success.
                 tracelogging::write_event!(
                     PROVIDER,
                     "UpdateModesAccepted",
                     level(Informational),
                     u64("session", &reply.session_id),
                     u32("modes", &reply.mode_count),
-                    u32("queued", &u32::from(!result.effects.is_empty()))
+                    u32("queued", &u32::from(!result.effects.is_empty())),
+                    u32("accepted", &reply.accepted()),
+                    u32("requested", &reply.requested()),
+                    u32("pending", &u32::from(reply.is_pending())),
+                    u32("partial", &u32::from(reply.is_partial()))
                 );
             } else {
                 tracelogging::write_event!(

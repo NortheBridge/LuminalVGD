@@ -44,8 +44,25 @@ pub struct Monitor {
     /// EDID identity, derived from `display_id` unless overridden.
     pub edid_serial: u32,
     pub product_code: u16,
-    /// Validated mode list, preferred first.
+    /// Validated mode list, preferred first. **The list actually IN
+    /// FORCE** — what the monitor advertises and what every
+    /// replug-from-`DeviceState` plugs with. `UPDATE_MODES` does not write
+    /// it; only [`SessionTable::settle_modes`] does, and only after the OS
+    /// push succeeded. See [`pending_modes`](Self::pending_modes).
     pub modes: Vec<Mode>,
+    /// A merged list that has been handed to the shell for an
+    /// `IddCxMonitorUpdateModes2` push but is NOT yet in force (build 17).
+    ///
+    /// This exists because the reply and the push are on different
+    /// threads: `dispatch` completes the IRP, the effects worker calls the
+    /// OS afterwards. Committing [`modes`](Self::modes) at dispatch time
+    /// made the durable state claim modes the OS had not accepted — and
+    /// then an identical retry merged to "nothing to add" and reported
+    /// success while the monitor advertised nothing of the sort, so the
+    /// caller could not recover. Keeping the merge here until
+    /// [`settle_modes`](SessionTable::settle_modes) confirms the push is
+    /// what makes a retry re-push.
+    pub pending_modes: Option<PendingModes>,
     pub adapter_luid: u64,
     pub physical_width_mm: u32,
     pub physical_height_mm: u32,
@@ -72,6 +89,67 @@ impl Monitor {
     pub fn preferred_mode(&self) -> &Mode {
         &self.modes[0]
     }
+
+    /// The list a further `UPDATE_MODES` merges onto: the outstanding
+    /// pending list if there is one, else the list in force. Merging onto
+    /// the pending list keeps two requests in flight additive instead of
+    /// letting the second silently discard the first's modes.
+    fn merge_base(&self) -> &[Mode] {
+        match &self.pending_modes {
+            Some(p) => &p.modes,
+            None => &self.modes,
+        }
+    }
+}
+
+/// A mode-list change that has been accepted by the driver and handed to
+/// the shell, but is not in force until the OS push succeeds.
+#[derive(Clone, Debug)]
+pub struct PendingModes {
+    /// Table-wide monotonic id of this update. Carried out to the shell
+    /// with the effect and back in [`SessionTable::settle_modes`], so a
+    /// settle that arrives after the session was destroyed and recreated,
+    /// or after a newer update superseded this one, is a no-op instead of
+    /// committing a list nobody asked for.
+    pub seq: u64,
+    /// The full post-merge list the shell is pushing.
+    pub modes: Vec<Mode>,
+}
+
+/// What the shell's `IddCxMonitorUpdateModes2` push did, reported back to
+/// the table by [`SessionTable::settle_modes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeUpdateResult {
+    /// The OS accepted the list; it is now what the monitor advertises.
+    Applied,
+    /// The push failed, or was deferred and never made (a TDR duck in
+    /// flight, a torn-down adapter, a monitor that raced away). Either way
+    /// the previous list is still in force, so the pending list is
+    /// discarded and the next identical request merges — and pushes —
+    /// again. The distinction between "refused" and "never attempted" is
+    /// an ETW stage, not a state change here: both mean *not applied*.
+    NotApplied,
+}
+
+/// Driver-side outcome of an `UPDATE_MODES` request, everything the reply
+/// and the effect need.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModeUpdate {
+    /// The full post-merge list. Already in force when `pending` is false;
+    /// otherwise what the queued push carries.
+    pub merged: Vec<Mode>,
+    /// Requested entries the merged list advertises (already-present ones
+    /// included).
+    pub accepted: usize,
+    /// Requested entries that did not fit under `MAX_MODES_PER_MONITOR`.
+    pub dropped: usize,
+    /// `Some(seq)` when THIS call created a pending update the caller must
+    /// push. `None` when there was nothing new to add.
+    pub queued: Option<u64>,
+    /// True while any push for this monitor is outstanding — this call's
+    /// or an earlier one's. `!pending` is the only state in which `merged`
+    /// can be reported as actually in force.
+    pub pending: bool,
 }
 
 /// The monitor table plus its policy knobs.
@@ -80,6 +158,10 @@ pub struct SessionTable {
     watchdog_secs: u32,
     monitors: BTreeMap<u64, Monitor>,
     connectors: ConnectorTable,
+    /// Monotonic id handed to each accepted `UPDATE_MODES`. Never reset —
+    /// not even by `destroy` — so a settle for a torn-down session can
+    /// never be mistaken for one belonging to its replacement.
+    update_seq: u64,
 }
 
 /// Resolve the wire lease-timeout field against the driver default
@@ -112,6 +194,7 @@ impl SessionTable {
             watchdog_secs,
             monitors: BTreeMap::new(),
             connectors: ConnectorTable::new(max_monitors),
+            update_seq: 0,
         }
     }
 
@@ -253,6 +336,7 @@ impl SessionTable {
             edid_serial,
             product_code,
             modes,
+            pending_modes: None,
             adapter_luid,
             physical_width_mm: req.physical_width_mm,
             physical_height_mm: req.physical_height_mm,
@@ -274,9 +358,7 @@ impl SessionTable {
     }
 
     /// `UPDATE_MODES` (proto 0.5): grow a live monitor's advertised mode
-    /// list. Returns `(list in force, how many were appended)`; an
-    /// `added == 0` result means the request was a no-op and the caller
-    /// must NOT disturb the OS.
+    /// list. Returns a [`ModeUpdate`] describing what the request bought.
     ///
     /// Bit depth and dynamic range are NOT taken from the request: they
     /// are monitor-wide, derived from an EDID that cannot be reissued on a
@@ -284,19 +366,36 @@ impl SessionTable {
     /// existing depth. A request that would need a different depth is
     /// simply a mode the envelope rejects — never a silent depth change.
     ///
-    /// The stored list is the host's INTENT. It is what a later replug
-    /// from `DeviceState` (device re-add, D3Final re-bring-up, permanent
-    /// pool restore) plugs with — which is why the update has to land
-    /// here and not only in the shell's runtime copy, or every one of
-    /// those paths would silently revert to the create-time list.
+    /// # The commit ordering, which is the point of this function
+    ///
+    /// This does NOT change [`Monitor::modes`]. The merged list is parked
+    /// in [`Monitor::pending_modes`] and the caller pushes it at the OS;
+    /// the list in force changes only when [`settle_modes`](Self::settle_modes)
+    /// reports [`ModeUpdateResult::Applied`].
+    ///
+    /// Committing here instead — as build 17 originally did — is wrong in
+    /// both directions: the IRP completes before the push runs, so on a
+    /// failed or deferred push the durable list claimed modes the monitor
+    /// did not advertise (and a replug from `DeviceState` would then plug
+    /// them for real), and worse, the next IDENTICAL request merged to
+    /// "nothing to add", produced no effect, and returned success — a
+    /// permanent silent no-op with no way for the caller to recover.
+    ///
+    /// The pending list is still the host's INTENT and still lives here
+    /// rather than only in the shell, because it is this table that every
+    /// replug-from-`DeviceState` path (device re-add, D3Final
+    /// re-bring-up, permanent-pool restore) plugs with — the commit just
+    /// waits for proof.
     pub fn update_modes(
         &mut self,
         session_id: u64,
         specs: &[ModeSpec],
         drv_caps: u32,
-    ) -> Result<(Vec<Mode>, usize), CoreError> {
+    ) -> Result<ModeUpdate, CoreError> {
         let m = self.monitors.get(&session_id).ok_or(CoreError::NoSuchSession)?;
         // Monitor-wide depth/range, from the list the monitor already has.
+        // Append-only merging never moves entry 0, so the pending list (if
+        // any) has the same preferred mode and the same depth.
         let (bit_depth_raw, hdr_raw) = {
             let pref = m.preferred_mode();
             (pref.bit_depth.as_raw(), u32::from(pref.hdr))
@@ -308,16 +407,80 @@ impl SessionTable {
             hdr_raw,
             drv_caps,
         )?;
-        let (merged, added) = Mode::merge_additive(&m.modes, &requested);
-        if added > 0 {
-            // Only mutate after every fallible step has passed, so a
-            // rejected request leaves the session exactly as it was.
-            self.monitors
-                .get_mut(&session_id)
-                .expect("looked up above")
-                .modes = merged.clone();
+        let merge = Mode::merge_additive(m.merge_base(), &requested);
+        if merge.appended == 0 {
+            // Nothing new. Report whether an earlier push is still in
+            // flight: with one outstanding, `merged` is a list the OS has
+            // not accepted yet, and saying otherwise would be the same lie
+            // in a different place.
+            return Ok(ModeUpdate {
+                merged: merge.merged,
+                accepted: merge.accepted,
+                dropped: merge.dropped,
+                queued: None,
+                pending: m.pending_modes.is_some(),
+            });
         }
-        Ok((merged, added))
+        // Only mutate after every fallible step has passed, so a rejected
+        // request leaves the session exactly as it was.
+        self.update_seq += 1;
+        let seq = self.update_seq;
+        self.monitors
+            .get_mut(&session_id)
+            .expect("looked up above")
+            .pending_modes = Some(PendingModes { seq, modes: merge.merged.clone() });
+        Ok(ModeUpdate {
+            merged: merge.merged,
+            accepted: merge.accepted,
+            dropped: merge.dropped,
+            queued: Some(seq),
+            pending: true,
+        })
+    }
+
+    /// Report what the shell's `IddCxMonitorUpdateModes2` push did with the
+    /// pending update `seq` (build 17). Returns true when `seq` was still
+    /// the monitor's outstanding update, i.e. when this settle decided
+    /// anything.
+    ///
+    /// [`Applied`](ModeUpdateResult::Applied) is the ONLY thing that
+    /// changes the list in force. [`NotApplied`](ModeUpdateResult::NotApplied)
+    /// discards the pending list and records `err::UPDATE_FAILED` as the
+    /// monitor's sticky last error, which is what makes the next identical
+    /// request merge again, queue again, and genuinely re-push instead of
+    /// collapsing into a success that means nothing.
+    ///
+    /// A stale `seq` — the session was destroyed and recreated, or a newer
+    /// update superseded this one — settles nothing and is reported false.
+    /// That is not a failure: the newer update carries a superset of this
+    /// one's modes (merges are additive and stack on the pending list), so
+    /// its own settle covers them.
+    pub fn settle_modes(
+        &mut self,
+        session_id: u64,
+        seq: u64,
+        result: ModeUpdateResult,
+    ) -> bool {
+        let Some(m) = self.monitors.get_mut(&session_id) else {
+            return false;
+        };
+        if m.pending_modes.as_ref().map(|p| p.seq) != Some(seq) {
+            return false;
+        }
+        let pending = m.pending_modes.take().expect("matched above");
+        match result {
+            ModeUpdateResult::Applied => m.modes = pending.modes,
+            ModeUpdateResult::NotApplied => {
+                m.last_error = luminal_driver_proto::err::UPDATE_FAILED
+            }
+        }
+        true
+    }
+
+    /// The list a pending update is trying to install, if any. Test and
+    /// introspection helper — the shell reads the list out of the effect.
+    pub fn pending_modes(&self, session_id: u64) -> Option<&[Mode]> {
+        self.monitors.get(&session_id)?.pending_modes.as_ref().map(|p| p.modes.as_slice())
     }
 
     /// Explicit teardown at stream end. Retained identities keep their
@@ -646,6 +809,7 @@ mod tests {
     /// not the shell's runtime one — is what every replug-from-DeviceState
     /// path plugs with, so if the update did not land here it would revert
     /// on the next device re-add, D3Final re-bring-up, or pool restore.
+    /// It lands only once the OS push is confirmed.
     #[test]
     fn update_modes_appends_to_the_stored_list_without_disturbing_the_preferred_mode() {
         let mut t = table();
@@ -655,17 +819,133 @@ mod tests {
         // The motivating case: add the frame-generation-doubled rate to a
         // monitor created at the base rate.
         let doubled = ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 };
-        let (list, added) = t.update_modes(1, &[doubled], CAPS).unwrap();
-        assert_eq!((list.len(), added), (2, 1));
+        let u = t.update_modes(1, &[doubled], CAPS).unwrap();
+        assert_eq!((u.merged.len(), u.accepted, u.dropped), (2, 1, 0));
+        let seq = u.queued.expect("a push is required");
+        assert!(u.pending, "not in force until the OS says so");
+        assert_eq!(t.get(1).unwrap().modes.len(), 1, "list in force unchanged so far");
+        assert_eq!(t.pending_modes(1).unwrap().len(), 2);
+
+        // The push succeeded: NOW it is durable.
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied));
         let m = t.get(1).unwrap();
         assert_eq!(m.modes.len(), 2);
         assert_eq!(m.preferred_mode().refresh_millihz, 60_000, "preferred untouched");
         assert_eq!(m.modes[1].refresh_millihz, 120_000);
+        assert!(m.pending_modes.is_none());
+        assert_eq!(m.last_error, 0);
 
-        // Idempotent: resending the same list is a traced no-op, not a
-        // second push at the OS.
-        let (list, added) = t.update_modes(1, &[doubled], CAPS).unwrap();
-        assert_eq!((list.len(), added), (2, 0));
+        // Idempotent: resending a list that is genuinely in force is a
+        // no-op, not a second push at the OS.
+        let u = t.update_modes(1, &[doubled], CAPS).unwrap();
+        assert_eq!((u.merged.len(), u.queued, u.pending), (2, None, false));
+    }
+
+    /// FINDINGS 1/3/4, the durable half. A push that did not take must
+    /// leave the table exactly where it was, and the next identical
+    /// request must produce a NEW push — the old code committed at request
+    /// time, so the retry merged to nothing and reported success forever.
+    #[test]
+    fn a_push_that_did_not_take_leaves_the_list_in_force_alone_and_stays_retryable() {
+        let mut t = table();
+        t.create(0, &req(1), CAPS, &adapters(), 0).unwrap();
+        let before = t.get(1).unwrap().modes.clone();
+        let doubled = ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 };
+
+        // Refused by the OS and never attempted (deferred) are the SAME
+        // state change here — the ETW stage is what tells them apart —
+        // which is exactly why a deferral is as retryable as a failure.
+        let first = t.update_modes(1, &[doubled], CAPS).unwrap();
+        let seq = first.queued.expect("first request queues a push");
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::NotApplied));
+        assert_eq!(t.get(1).unwrap().modes, before, "modes unchanged, carry on");
+        assert!(t.pending_modes(1).is_none(), "pending discarded");
+        assert_eq!(
+            t.get(1).unwrap().last_error,
+            luminal_driver_proto::err::UPDATE_FAILED,
+            "surfaced in GET_STATUS"
+        );
+
+        // The retry: a REAL second push, with a fresh id.
+        let retry = t.update_modes(1, &[doubled], CAPS).unwrap();
+        let retry_seq = retry.queued.expect("the retry must actually re-push");
+        assert_ne!(retry_seq, seq);
+        assert!(retry.pending);
+        assert_eq!(t.get(1).unwrap().modes, before, "still not in force");
+
+        // ...and when that one lands, it lands.
+        assert!(t.settle_modes(1, retry_seq, ModeUpdateResult::Applied));
+        assert_eq!(t.get(1).unwrap().modes.len(), 2);
+    }
+
+    /// A settle can arrive late — after a newer update superseded it, or
+    /// after the session was destroyed and its id reused. Neither may
+    /// commit a list nobody is pushing.
+    #[test]
+    fn a_stale_settle_commits_nothing() {
+        let mut t = table();
+        t.create(0, &req(1), CAPS, &adapters(), 0).unwrap();
+        let a = ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 };
+        let b = ModeSpec { width: 1280, height: 720, refresh_millihz: 60_000 };
+
+        let first = t.update_modes(1, &[a], CAPS).unwrap().queued.unwrap();
+        // A second request stacks onto the pending list (additive), so the
+        // first push's list is a subset of the second's.
+        let second = t.update_modes(1, &[b], CAPS).unwrap();
+        let second_seq = second.queued.unwrap();
+        assert_eq!(second.merged.len(), 3, "merged onto the pending list, not the live one");
+
+        assert!(!t.settle_modes(1, first, ModeUpdateResult::Applied), "superseded");
+        assert_eq!(t.get(1).unwrap().modes.len(), 1);
+        assert!(t.settle_modes(1, second_seq, ModeUpdateResult::Applied));
+        assert_eq!(t.get(1).unwrap().modes.len(), 3);
+
+        // Destroy + recreate the same session id, then settle the dead
+        // update: the ids are table-wide and never reused, so it misses.
+        let third = t.update_modes(1, &[ModeSpec { width: 640, height: 480, refresh_millihz: 60_000 }], CAPS)
+            .unwrap()
+            .queued
+            .unwrap();
+        t.destroy(1).unwrap();
+        t.create(0, &req(1), CAPS, &adapters(), 0).unwrap();
+        assert!(!t.settle_modes(1, third, ModeUpdateResult::Applied));
+        assert_eq!(t.get(1).unwrap().modes.len(), 1, "the replacement keeps its own list");
+    }
+
+    /// FINDING 2, durable half: at the cap the merge keeps what fits and
+    /// counts what it could not, so the caller can report partial
+    /// application instead of plain success.
+    #[test]
+    fn update_modes_reports_what_did_not_fit() {
+        let mut t = table();
+        let mut r = req(1);
+        r.mode_count = 3;
+        r.modes[1] = ModeSpec { width: 1920, height: 1080, refresh_millihz: 90_000 };
+        r.modes[2] = ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 };
+        t.create(0, &r, CAPS, &adapters(), 0).unwrap();
+
+        let u = t
+            .update_modes(
+                1,
+                &[
+                    ModeSpec { width: 1920, height: 1080, refresh_millihz: 144_000 },
+                    ModeSpec { width: 1920, height: 1080, refresh_millihz: 240_000 },
+                ],
+                CAPS,
+            )
+            .unwrap();
+        assert_eq!((u.accepted, u.dropped), (1, 1), "one fit, one did not");
+        assert_eq!(u.merged.len(), 4);
+        let seq = u.queued.unwrap();
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied));
+        assert_eq!(t.get(1).unwrap().modes.len(), 4);
+
+        // The list is full now: a further request is all-dropped, and that
+        // is still not an error — nothing was lost, nothing was gained.
+        let u = t
+            .update_modes(1, &[ModeSpec { width: 1920, height: 1080, refresh_millihz: 240_000 }], CAPS)
+            .unwrap();
+        assert_eq!((u.accepted, u.dropped, u.queued, u.pending), (0, 1, None, false));
     }
 
     #[test]
@@ -692,6 +972,7 @@ mod tests {
         let many = [ModeSpec { width: 1920, height: 1080, refresh_millihz: 30_000 }; 5];
         assert_eq!(t.update_modes(1, &many, CAPS).err(), Some(CoreError::BadMode));
         assert_eq!(t.get(1).unwrap().modes, before, "session untouched by every rejection");
+        assert!(t.pending_modes(1).is_none(), "and nothing queued at the OS");
     }
 
     /// The monitor-wide depth is EDID-derived and the EDID cannot be
@@ -705,11 +986,12 @@ mod tests {
         hdr.bit_depth = 110;
         hdr.hdr = 1;
         t.create(0, &hdr, CAPS, &adapters(), 0).unwrap();
-        let (list, added) = t
+        let u = t
             .update_modes(1, &[ModeSpec { width: 1920, height: 1080, refresh_millihz: 120_000 }], CAPS)
             .unwrap();
-        assert_eq!(added, 1);
-        assert!(list.iter().all(|m| m.hdr && m.bit_depth.as_raw() == 110));
+        assert_eq!(u.accepted, 1);
+        assert!(u.queued.is_some());
+        assert!(u.merged.iter().all(|m| m.hdr && m.bit_depth.as_raw() == 110));
 
         // Same monitor, a driver WITHOUT the HDR cap: the existing depth no
         // longer validates, so the update fails cleanly instead of

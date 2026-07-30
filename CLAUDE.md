@@ -972,12 +972,60 @@ missing.
 - **`result == OK` means ACCEPTED, not applied.** The IRP completes before the
   effects run, so the reply structurally cannot carry the IddCx status. Do not
   let host code (or docs) claim otherwise.
-- ETW (existing provider): `UpdateModesAccepted`, `UpdateModesDenied(stage,code)`,
-  `UpdateModesApplied(modes,dynamic,status)`, `UpdateModesDeferred(stage)`,
-  `UpdateModesFailed(stage,code,rolled_back)`, plus a `dynamic` field added to
-  `ParseDescription2` / `QueryTargetModes2`. Note this is the FIRST ETW at the
-  dispatch layer at all — nothing there traced anything before, which is how
-  the build-8 ACL outage stayed unexplained for three builds.
+- **NOTHING COMMITS UNTIL THE OS TAKES IT (fixed 2026-07-30, second pass).**
+  The first cut committed the DURABLE list inside `dispatch` — before the push,
+  and unconditionally. Three symptoms, one defect: a failed push rolled back
+  only the RUNTIME list, so durable and runtime diverged; a DEFERRED push
+  (duck in flight / adapter cleared) left durable asserting modes the OS was
+  never told about; and worst, the identical RETRY then merged to "nothing to
+  add", emitted no effect, and returned `OK` — a permanent silent no-op
+  reporting success while the monitor advertised the old list, with no way for
+  the caller to recover. The contract now: `SessionTable::update_modes` parks
+  the merge in `Monitor.pending_modes` with a table-wide monotonic
+  `update_seq`; `Effect::UpdateModes` carries that seq; `monitors::update_modes`
+  is the only caller of `IddCxMonitorUpdateModes2` and owes exactly ONE
+  `settle_modes`, with `Applied` (and only `Applied`) committing
+  `Monitor.modes`. Failed AND deferred both settle `NotApplied` → pending
+  discarded, every copy keeps the pre-update list, sticky
+  `err::UPDATE_FAILED`, and the next identical request genuinely re-pushes.
+  Rules that fall out and must not be re-broken: a deferral is NOT an
+  application (the parked-spec patch is best-effort and still settles
+  NotApplied — a retry re-merges to the same list, so they converge); a
+  request arriving while a push is outstanding merges onto the PENDING list,
+  never the live one, so nothing in flight is discarded; a stale settle
+  (superseded, or session destroyed and the id reused) commits nothing, which
+  is why the seq is table-wide and never reset.
+- **Partial application is reported, not swallowed.** `merge_additive` returns
+  `Merge { merged, appended, accepted, dropped }` and no longer `break`s at the
+  cap (a later entry may already be advertised — breaking miscounted it as
+  dropped). `UpdateModesReply` fills its `reserved` words —
+  `[0] accepted, [1] requested, [2] flags` — read through
+  `accepted()/requested()/flags()/is_pending()/is_partial()/fully_in_force()`.
+  The struct does NOT grow (still 40 bytes, asserted). `update_status::PARTIAL`
+  = the list was at MAX_MODES_PER_MONITOR and the rest did not fit;
+  `PENDING` = queued at the OS, not in force yet. Partial stays `err::OK`:
+  never fail the session, never drop the modes that DID fit (constraint 1).
+  `result == OK` with neither flag is the ONLY shape meaning "in force, in
+  full, right now".
+- **The rollback can no longer shrink a live list below anyone else's
+  appends** (constraint 2's minor finding): the failure path restores only when
+  the monitor handle still matches AND the runtime list is still, entry for
+  entry, the one this call published; the restored list is the pre-update
+  baseline, a superset of anything the OS has committed (merges only append),
+  so the restore can only undo its own append. The durable list is never
+  shrunk by any path.
+- ETW (existing provider): `UpdateModesAccepted(modes,queued,accepted,
+  requested,pending,partial)`, `UpdateModesDenied(stage,code)`,
+  `UpdateModesApplied(modes,dynamic,status)`,
+  `UpdateModesDeferred(stage,modes,retryable)`,
+  `UpdateModesFailed(stage,code,modes,rolled_back)`,
+  `UpdateModesSettleStale(seq)` (a push whose update was superseded or whose
+  session is gone — silent, it would be indistinguishable from a settle that
+  never happened, and a missing settle is the one way to leak a pending list),
+  plus a `dynamic` field added to `ParseDescription2` / `QueryTargetModes2`.
+  Note this is the FIRST ETW at the dispatch layer at all — nothing there
+  traced anything before, which is how the build-8 ACL outage stayed
+  unexplained for three builds. Settle these names BEFORE signing.
 - Found and fixed while testing: the UPDATE_MODES arm validated the OUTPUT
   buffer only at reply-write time, so a short output buffer mutated the session
   table while the effect was dropped with `BadBuffer` — permanently diverging

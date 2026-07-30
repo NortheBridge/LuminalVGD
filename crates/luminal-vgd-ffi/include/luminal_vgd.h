@@ -50,6 +50,23 @@
  */
 #define VGD_CURSOR_SHAPE_BUFFER_SIZE ((256 * 256) * 4)
 
+/**
+ * [`VgdUpdateModesReply::flags`]: the list is not in force yet — the
+ * driver queued the OS-side push, which cannot have run before this call
+ * returned. A push that fails or is deferred leaves the PREVIOUS list in
+ * force and the request fully retryable (resending it really does push
+ * again), and surfaces as the monitor's sticky `last_error` (`-13`) in
+ * the status reply.
+ */
+#define VGD_UPDATE_PENDING 1
+
+/**
+ * [`VgdUpdateModesReply::flags`]: fewer modes accepted than requested,
+ * because the monitor's list is at its cap. Success with detail — what
+ * fit was applied and nothing was removed.
+ */
+#define VGD_UPDATE_PARTIAL 2
+
 typedef struct VgdCursorHandle VgdCursorHandle;
 
 typedef struct VgdDeviceHandle VgdDeviceHandle;
@@ -140,9 +157,24 @@ typedef struct VgdUpdateModesReply {
    */
   int32_t result;
   /**
-   * Modes in force after the merge.
+   * Modes the monitor advertises once this request is applied.
    */
   uint32_t mode_count;
+  /**
+   * Requested modes the driver took — appended now or already
+   * advertised. `accepted < requested` means the monitor's list was at
+   * its cap and the rest did not fit: partial application, NOT an
+   * error, and nothing that fit was discarded.
+   */
+  uint32_t accepted;
+  /**
+   * Echo of the request's `mode_count`.
+   */
+  uint32_t requested;
+  /**
+   * `VGD_UPDATE_PENDING` / `VGD_UPDATE_PARTIAL`.
+   */
+  uint32_t flags;
 } VgdUpdateModesReply;
 
 /**
@@ -264,7 +296,14 @@ int32_t vgd_create_monitor(struct VgdDeviceHandle *dev,
  * - **`result == 0` means ACCEPTED, not applied.** The driver completes
  *   the request before it calls the OS. The applied/failed outcome shows
  *   up in ETW and as the monitor's sticky `last_error` in the status
- *   reply.
+ *   reply. `result == 0` with neither flag set is the only shape that
+ *   means "every mode you asked for is advertised right now"; with
+ *   `VGD_UPDATE_PENDING` set, an update is still outstanding, and if it
+ *   does not land the previous list stays in force and this exact
+ *   request can simply be sent again.
+ * - **Check `accepted` against `requested`.** They differ when the
+ *   monitor's list is already at its cap; the modes that fit were still
+ *   applied.
  */
 int32_t vgd_update_modes(struct VgdDeviceHandle *dev,
                          const struct VgdUpdateModesRequest *req,

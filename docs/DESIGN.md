@@ -201,6 +201,46 @@ restored on failure. A failed update degrades to "keep the current modes"
 `err::UPDATE_FAILED` in the monitor's sticky `GET_STATUS` last error plus
 an ETW event carrying stage and status.
 
+**Commit ordering — nothing is committed until the OS takes it.** There
+are three copies of a mode list (the session table's durable one, the
+shell's runtime one, and a TDR-parked spec) and the reply is written on a
+different thread from the push, so the ordering is the whole correctness
+argument:
+
+- `SessionTable::update_modes` validates and merges but writes the result
+  to `Monitor.pending_modes`, **not** `Monitor.modes`. The effect carries
+  the merge plus a table-wide monotonic `update_seq`.
+- `monitors::update_modes` (effects worker) is the only caller of
+  `IddCxMonitorUpdateModes2` and owes the table exactly one
+  `settle_modes(session_id, update_seq, …)`. `Applied` — and only
+  `Applied` — commits `Monitor.modes`.
+- A push that FAILED (the OS refused; the runtime list is rolled back) or
+  was DEFERRED (a TDR duck in flight, the adapter torn down, the session
+  parked) settles `NotApplied`: the pending list is discarded, every copy
+  keeps the pre-update list, and the monitor's sticky last error becomes
+  `err::UPDATE_FAILED`. The **next identical request therefore merges,
+  queues and pushes for real** — a retry is a retry, not a no-op.
+- A stale settle (superseded by a newer update, or its session destroyed)
+  commits nothing; the newer update's list is a superset, since a merge
+  in flight stacks onto the pending list rather than the live one.
+
+Committing at IOCTL time instead — as build 17 first shipped — made the
+durable state assert modes the OS had refused, and turned the identical
+retry into a silent no-op that returned `OK`: the caller was told it
+succeeded, the monitor advertised the old list, and there was no way back.
+
+**Partial application is reported, not swallowed.** The merge keeps every
+requested mode that fits and counts the ones that do not (`accepted` /
+`dropped`). The reply carries `accepted`, `requested` and a flags word in
+`UpdateModesReply.reserved` — the struct may never grow, both sides
+length-check it — where `update_status::PARTIAL` means "the list was at
+`MAX_MODES_PER_MONITOR` and the rest did not fit" and
+`update_status::PENDING` means "queued at the OS, not in force yet".
+Partial is success with detail: nothing that fit is discarded and the
+session is never failed (constraint 1). `result == OK` with neither flag
+set is the only shape that means "everything you asked for is advertised
+right now" (`UpdateModesReply::fully_in_force`).
+
 **Open empirical question (build 17's first traced install must answer
 it).** `IDARG_IN_UPDATEMODES2` carries TARGET modes only. The OS skips
 `EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION2` only for remote drivers that set

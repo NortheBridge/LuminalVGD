@@ -464,8 +464,18 @@ fn main() -> ExitCode {
             match dev.update_modes(&upd) {
                 Ok(r) if r.result == err::OK => {
                     println!(
-                        "    accepted: {} modes in force (accepted != applied — check ETW)",
-                        r.mode_count
+                        "    accepted {}/{} requested, {} modes in list{}{}",
+                        r.accepted(),
+                        r.requested(),
+                        r.mode_count,
+                        if r.is_partial() { " — PARTIAL: the rest did not fit the cap" } else { "" },
+                        if r.is_pending() {
+                            " — PENDING: queued at the OS, not in force yet (check ETW; \
+                             if it does not land, the previous list stays and this exact \
+                             request can be re-sent)"
+                        } else {
+                            " — in force"
+                        },
                     );
                 }
                 Ok(r) => eprintln!("    driver refused: result {} ({} in force)", r.result, r.mode_count),
