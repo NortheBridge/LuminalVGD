@@ -787,22 +787,14 @@ monitor arrival.
   interrogates one) is unreachable from there. That site now marks the ring
   REBUILDING and arms a duck, gated to device-duck mode. The REBUILDING
   mark is load-bearing, not cosmetic — a duck armed against a still-ACTIVE
-  ring settles on its first tick and does nothing.
-- **The re-arm at `frame_loop`'s `create_device_on_luid` failure is what
-  closes the loop**, and it is the one site build 14/15 never needed. While
-  the GPU is down the OS keeps unassigning/reassigning; each replacement
-  worker dies THERE, before it owns a device, so `maybe_queue_tdr_duck`
-  (which interrogates one) is unreachable. Without the re-arm the poller
-  sees `assign_seq` move, declares the transport restored, exits, and
-  nothing watches the ring again — the heartbeat freezes and the bounded
-  deadline arm becomes unreachable, so "duck the device" would quietly
-  degrade into "do nothing, forever". `queue_tdr_duck`'s one-in-flight CAS
-  makes the re-arm idempotent (a storm of failing workers collapses to one
-  duck) and the cadence is the OS's reassign rate, not a spin. Gated to
-  device-duck mode: the legacy gate must restore builds 14/15 faithfully,
-  not an improved version of them. `TdrDeviceReassigned` therefore carries
-  `gpu_confirmed` — the OS can re-assign while the GPU is still dead, and
-  without that field a trace cannot tell that case from a real recovery.
+  ring settles on its first tick and does nothing. Without this re-arm the
+  whole mode degrades into "do nothing, forever": while the GPU is down the
+  OS keeps unassigning/reassigning, every replacement worker dies at that
+  same site, and nothing would ever be watching the ring again. The re-arm
+  is idempotent — `queue_tdr_duck`'s one-in-flight CAS collapses a storm of
+  failing workers into a single duck, and the cadence is the OS's reassign
+  rate, not a spin. Gated to device-duck mode because the legacy gate must
+  restore builds 14/15 faithfully, not an improved version of them.
 - **Device-ducked monitors stay in `shell.monitors` and OUT of
   `shell.ducked`.** That invariant is load-bearing: `unplug`'s ducked fast
   path, `plug`'s parked-twin purge and the D3Final drain all assume "in
