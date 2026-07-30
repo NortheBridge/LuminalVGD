@@ -152,14 +152,19 @@ unsafe extern "C" fn evt_device_add(
     // it: a field trace must say which policy this binary is running
     // WITHOUT needing a repro to find out.
     //
-    // Read back out of DeviceState rather than reusing the local: that
-    // makes DriverConfig::tdr_duck_mode the single source of truth for
-    // what the driver actually runs, instead of a field written once and
-    // never read while the shell mirrors a parallel copy. (Shell::init is
-    // a get_or_init, so a same-process device re-add keeps the FIRST
-    // DeviceState — this read reports what is really in force, which is
-    // the value the trace below must carry.)
-    let effective_mode = shell.dev.lock().unwrap().tdr_duck_mode();
+    // Use the value THIS device add just read from the registry, not a
+    // read-back out of DeviceState. `Shell::init` is a `get_or_init`, so on
+    // a same-process devnode re-add the freshly constructed DeviceState is
+    // discarded and the read-back returns the FIRST device's mode — which
+    // would silently ignore the gate flip that `pnputil /restart-device` is
+    // the documented way to apply. `set_tdr_duck_mode` exists precisely to
+    // be set after `init` for this reason (see its doc comment); feeding it
+    // the stale value defeated it.
+    //
+    // This gate is the escape hatch back to the build-14/15 display duck-out.
+    // If it does not take effect without a reinstall, a bad field outcome
+    // costs a signing round instead of a device restart.
+    let effective_mode = tdr_duck_mode;
     shell.set_tdr_duck_mode(effective_mode);
     control::trace_tdr_duck_config(effective_mode, tdr_gate_source);
 
