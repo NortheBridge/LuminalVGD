@@ -1449,6 +1449,7 @@ fn apply_now(effects: Vec<Effect>) {
                 display_id,
                 connector_index,
                 modes,
+                targets,
                 adapter_luid,
                 ring_slots,
                 edid,
@@ -1457,6 +1458,7 @@ fn apply_now(effects: Vec<Effect>) {
                 display_id,
                 connector_index,
                 modes,
+                targets,
                 adapter_luid,
                 ring_slots,
                 edid,
@@ -1471,8 +1473,8 @@ fn apply_now(effects: Vec<Effect>) {
             // `update_seq` — the durable list stays pending until the OS
             // push is confirmed, so this effect is the only thing that
             // can resolve it, in either direction.
-            Effect::UpdateModes { session_id, update_seq, modes } => {
-                monitors::update_modes(session_id, update_seq, modes)
+            Effect::UpdateModes { session_id, update_seq, targets } => {
+                monitors::update_modes(session_id, update_seq, targets)
             }
             Effect::PersistState(blob) => unsafe { write_persisted(&blob) },
         }
@@ -1538,10 +1540,17 @@ unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out
                     u32("queued", &u32::from(!result.effects.is_empty())),
                     u32("accepted", &reply.accepted()),
                     u32("requested", &reply.requested()),
+                    u32("rejected", &reply.rejected()),
                     u32("pending", &u32::from(reply.is_pending())),
                     u32("partial", &u32::from(reply.is_partial()))
                 );
             } else {
+                // `rejected` / `first_rejected` are what make a BAD_MODE
+                // here diagnosable: a request refused because every mode
+                // it named is outside the monitor's create-time
+                // description reads identically to a malformed request
+                // without them, and the two need completely different
+                // fixes (create with a wider superset vs fix the caller).
                 tracelogging::write_event!(
                     PROVIDER,
                     "UpdateModesDenied",
@@ -1549,7 +1558,9 @@ unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out
                     u64("session", &reply.session_id),
                     u32("stage", &UPD_DISPATCH_STAGE_VALIDATE),
                     i32("code", &reply.result),
-                    u32("modes", &reply.mode_count)
+                    u32("modes", &reply.mode_count),
+                    u32("rejected", &reply.rejected()),
+                    u32("first_rejected", &reply.first_rejected())
                 );
             }
         }
@@ -1561,7 +1572,9 @@ unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out
                 u64("session", &0u64),
                 u32("stage", &UPD_DISPATCH_STAGE_BUFFER),
                 i32("code", &luminal_driver_proto::err::INTERNAL),
-                u32("modes", &0u32)
+                u32("modes", &0u32),
+                u32("rejected", &0u32),
+                u32("first_rejected", &luminal_driver_proto::NO_REJECTED_INDEX)
             );
         }
     }

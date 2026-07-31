@@ -67,16 +67,21 @@ struct Args {
     /// Watch the shared cursor section during the hold: print position/
     /// visibility changes and fetch each new shape (caps::HW_CURSOR).
     cursor: bool,
-    /// `--add-mode WxH@HZ` (repeatable): modes to push onto the LIVE
-    /// monitor partway through the hold via UPDATE_MODES (proto 0.5).
-    /// This is the standalone way to exercise build 17 — and the way to
-    /// answer the one question the headers do not: whether the OS
-    /// re-solicits ParseMonitorDescription2 after an
-    /// IddCxMonitorUpdateModes2, which is what decides if a dynamically
-    /// ADDED mode can survive the OS's monitor∩target intersection.
-    add_modes: Vec<ModeSpec>,
+    /// `--target-mode WxH@HZ` (repeatable): the TARGET subset to publish
+    /// partway through the hold via UPDATE_MODES (proto 0.5). Every entry
+    /// must also be one of the create-time modes (the positional
+    /// `WxH@HZ` args) — the monitor description is frozen at creation, so
+    /// anything else is rejected with detail rather than published.
+    ///
+    /// This is the standalone way to exercise build 17, and the way to
+    /// answer the one thing the headers do not say: whether
+    /// IddCxMonitorUpdateModes2 REPLACES the target list or APPENDS to
+    /// it. Publish a strict subset and watch the ETW
+    /// (`UpdateModesApplied` modes vs superset, then whether
+    /// `QueryTargetModes2` reappears) plus what Display Settings offers.
+    target_modes: Vec<ModeSpec>,
     /// Seconds into the hold at which to issue the update.
-    add_after_secs: u64,
+    target_after_secs: u64,
 }
 
 /// Default mode list when none is given: 4K120 preferred (LG-OLED-class
@@ -97,8 +102,8 @@ fn parse_args() -> Result<Args, String> {
         ephemeral: false,
         consume: false,
         cursor: false,
-        add_modes: Vec::new(),
-        add_after_secs: 5,
+        target_modes: Vec::new(),
+        target_after_secs: 5,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -111,14 +116,19 @@ fn parse_args() -> Result<Args, String> {
                 let v = it.next().ok_or("--hold needs a value")?;
                 args.hold_secs = v.parse().map_err(|_| format!("bad --hold value: {v}"))?;
             }
-            "--add-mode" => {
-                let v = it.next().ok_or("--add-mode needs a WxH@HZ value")?;
-                args.add_modes.push(parse_mode(&v)?);
+            // `--add-mode` is kept as an alias so the build-17 command
+            // lines already written down still parse — but note the
+            // semantics changed: the flag now names the subset to
+            // PUBLISH, and cannot introduce a mode the create call did
+            // not list.
+            "--target-mode" | "--add-mode" => {
+                let v = it.next().ok_or("--target-mode needs a WxH@HZ value")?;
+                args.target_modes.push(parse_mode(&v)?);
             }
-            "--add-after" => {
-                let v = it.next().ok_or("--add-after needs a value")?;
-                args.add_after_secs =
-                    v.parse().map_err(|_| format!("bad --add-after value: {v}"))?;
+            "--target-after" | "--add-after" => {
+                let v = it.next().ok_or("--target-after needs a value")?;
+                args.target_after_secs =
+                    v.parse().map_err(|_| format!("bad --target-after value: {v}"))?;
             }
             mode if mode.contains('x') => args.explicit_modes.push(parse_mode(mode)?),
             other => return Err(format!("unknown argument: {other}")),
@@ -146,7 +156,9 @@ fn main() -> ExitCode {
             eprintln!("vgd-probe: {e}");
             eprintln!(
                 "usage: vgd-probe [status] [WxH@HZ ...] [--hold SECS] [--ephemeral] [--consume] [--cursor]\n\
-                 \x20      [--add-mode WxH@HZ ...] [--add-after SECS]"
+                 \x20      [--target-mode WxH@HZ ...] [--target-after SECS]\n\
+                 \x20  --target-mode publishes a SUBSET of the create-time modes on the live\n\
+                 \x20  monitor; every value must also appear as a positional WxH@HZ."
             );
             return ExitCode::FAILURE;
         }
@@ -432,22 +444,20 @@ fn main() -> ExitCode {
                 break;
             }
         }
-        // Build 17: push extra modes onto the LIVE monitor, once, partway
-        // through the hold. The interesting evidence is in the ETW trace
-        // rather than here: UpdateModesApplied, then whether
-        // ParseDescription2 / QueryTargetModes2 reappear with dynamic > 0
-        // (the OS re-soliciting the list — the added mode can surface) or
-        // do not (the target-only push never reaches the monitor∩target
-        // intersection, and dynamic ADD is not achievable this way).
-        // Display Settings on the monitor is the user-visible half.
-        if !args.add_modes.is_empty() && tick + 1 == args.add_after_secs {
+        // Build 17: publish a TARGET subset on the LIVE monitor, once,
+        // partway through the hold. The interesting evidence is in the
+        // ETW trace rather than here: UpdateModesApplied carries the
+        // published count and the superset size, and whether
+        // QueryTargetModes2 then reappears says whether the OS
+        // re-solicited the list. Display Settings on the monitor is the
+        // user-visible half and the tiebreak between REPLACE and APPEND:
+        // if it now offers only the published subset, the DDI replaces.
+        if !args.target_modes.is_empty() && tick + 1 == args.target_after_secs {
             let mut modes = [ModeSpec::default(); MAX_MODES_PER_MONITOR as usize];
-            let mut wanted: Vec<ModeSpec> = mode_list.clone();
-            for m in &args.add_modes {
-                if !wanted.contains(m) && wanted.len() < MAX_MODES_PER_MONITOR as usize {
-                    wanted.push(*m);
-                }
-            }
+            // Sent verbatim, deliberately NOT unioned with the create
+            // list: the whole point is to see a strict subset published.
+            let wanted: Vec<ModeSpec> =
+                args.target_modes.iter().copied().take(MAX_MODES_PER_MONITOR as usize).collect();
             modes[..wanted.len()].copy_from_slice(&wanted);
             let upd = UpdateModesRequest {
                 session_id,
@@ -464,11 +474,15 @@ fn main() -> ExitCode {
             match dev.update_modes(&upd) {
                 Ok(r) if r.result == err::OK => {
                     println!(
-                        "    accepted {}/{} requested, {} modes in list{}{}",
+                        "    accepted {}/{} requested, {} modes published{}{}",
                         r.accepted(),
                         r.requested(),
                         r.mode_count,
-                        if r.is_partial() { " — PARTIAL: the rest did not fit the cap" } else { "" },
+                        if r.is_partial() {
+                            " — PARTIAL: some are not in the create-time list (see index below)"
+                        } else {
+                            ""
+                        },
                         if r.is_pending() {
                             " — PENDING: queued at the OS, not in force yet (check ETW; \
                              if it does not land, the previous list stays and this exact \
@@ -477,8 +491,25 @@ fn main() -> ExitCode {
                             " — in force"
                         },
                     );
+                    if r.rejected() > 0 {
+                        println!(
+                            "    {} rejected, first at request index {} — that mode was never \
+                             in the monitor description and cannot be added to a live monitor; \
+                             pass it as a positional WxH@HZ at create instead",
+                            r.rejected(),
+                            r.first_rejected()
+                        );
+                    }
                 }
-                Ok(r) => eprintln!("    driver refused: result {} ({} in force)", r.result, r.mode_count),
+                Ok(r) => {
+                    eprintln!(
+                        "    driver refused: result {} ({} published, {} rejected, first at {})",
+                        r.result,
+                        r.mode_count,
+                        r.rejected(),
+                        r.first_rejected()
+                    )
+                }
                 // The expected shape against a pre-0.5 driver: the opcode
                 // is unknown, the IOCTL fails, and the session carries on
                 // untouched. Never fatal.

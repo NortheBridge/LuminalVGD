@@ -277,8 +277,11 @@ pub struct VgdUpdateModesRequest {
     pub session_id: u64,
     /// Reserved; pass 0.
     pub flags: u32,
-    /// Valid entries in `modes` (1..=4).
+    /// Valid entries in `modes` (1..=4). Zero is refused — the offered
+    /// list can be replaced, never emptied.
     pub mode_count: u32,
+    /// The complete set of modes the monitor should offer from now on.
+    /// Every entry must be one the monitor was CREATED with.
     pub modes: [VgdModeSpec; 4],
 }
 
@@ -288,18 +291,30 @@ pub struct VgdUpdateModesReply {
     pub session_id: u64,
     /// `0` (accepted) or a negative proto `err::*` code.
     pub result: i32,
-    /// Modes the monitor advertises once this request is applied.
+    /// Modes the monitor offers once this request is applied.
     pub mode_count: u32,
-    /// Requested modes the driver took — appended now or already
-    /// advertised. `accepted < requested` means the monitor's list was at
-    /// its cap and the rest did not fit: partial application, NOT an
-    /// error, and nothing that fit was discarded.
+    /// Requested modes the driver published. `accepted < requested` means
+    /// the rest are modes this monitor was not created with and can never
+    /// offer: partial application, NOT an error, and nothing that existed
+    /// was discarded.
     pub accepted: u32,
     /// Echo of the request's `mode_count`.
     pub requested: u32,
     /// `VGD_UPDATE_PENDING` / `VGD_UPDATE_PARTIAL`.
     pub flags: u32,
+    /// Requested modes with no counterpart in the monitor's create-time
+    /// list. `accepted + rejected == requested` always.
+    pub rejected: u32,
+    /// Index into `modes` of the first rejected entry, or
+    /// [`VGD_NO_REJECTED_INDEX`] — so a caller can name the mode it
+    /// cannot have instead of only counting it.
+    pub first_rejected: u32,
 }
+
+/// [`VgdUpdateModesReply::first_rejected`] when nothing was rejected.
+/// Distinct from index 0, which is a real rejection of the first mode.
+pub const VGD_NO_REJECTED_INDEX: u32 = u32::MAX;
+const _: () = assert!(VGD_NO_REJECTED_INDEX == luminal_driver_proto::NO_REJECTED_INDEX);
 
 /// [`VgdUpdateModesReply::flags`]: the list is not in force yet — the
 /// driver queued the OS-side push, which cannot have run before this call
@@ -309,20 +324,22 @@ pub struct VgdUpdateModesReply {
 /// the status reply.
 pub const VGD_UPDATE_PENDING: u32 = 1;
 /// [`VgdUpdateModesReply::flags`]: fewer modes accepted than requested,
-/// because the monitor's list is at its cap. Success with detail — what
-/// fit was applied and nothing was removed.
+/// because some requested modes are not in the monitor's create-time list
+/// and can never be offered. Success with detail — everything that exists
+/// was published. See [`VgdUpdateModesReply::rejected`].
 pub const VGD_UPDATE_PARTIAL: u32 = 2;
 const _: () = assert!(VGD_UPDATE_PENDING == luminal_driver_proto::update_status::PENDING);
 const _: () = assert!(VGD_UPDATE_PARTIAL == luminal_driver_proto::update_status::PARTIAL);
 
-/// Grow a LIVE monitor's advertised mode list — no destroy/create cycle,
-/// so no `DBT_DEVNODES_CHANGED` broadcast and no monitor churn (proto
-/// 0.5, driver build 17+).
+/// Change WHICH of a LIVE monitor's create-time modes it currently
+/// offers — no destroy/create cycle, so no `DBT_DEVNODES_CHANGED`
+/// broadcast and no monitor churn (proto 0.5, driver build 17+).
 ///
-/// The motivating case: a client is already streaming a display created
-/// at its base refresh rate, and only then launches a frame-generation
-/// title. Calling this with `{base, doubled}` makes the doubled rate
-/// selectable on the existing display.
+/// The motivating case: a client streams a display whose create call
+/// listed both its base refresh rate and the frame-generation-doubled
+/// one, and only then launches a framegen title. Calling this with
+/// `{doubled}` makes the doubled rate the one on offer, and calling it
+/// again with `{base, doubled}` (or `{base}`) puts things back.
 ///
 /// # Contract the caller must honor
 ///
@@ -330,23 +347,31 @@ const _: () = assert!(VGD_UPDATE_PARTIAL == luminal_driver_proto::update_status:
 ///   driver the opcode is unknown and this returns [`VGD_ERR_IO`]; that
 ///   is safe (never a false success) but it is a wasted round trip, and
 ///   the log line the caller writes should name the driver's version.
-/// - **Additive only.** The driver unions the request into the current
-///   list and NEVER removes a mode; `modes[0]` of the created monitor
-///   stays preferred. Passing a shorter list does not shrink anything.
+/// - **You can only choose among the modes you CREATED the monitor
+///   with.** A monitor's description is frozen at creation — no IddCx DDI
+///   replaces it on a live monitor, and Windows only offers modes that
+///   are in BOTH the description and the pushed list — so a mode that was
+///   not in `vgd_create_monitor`'s list is rejected here
+///   (`VGD_UPDATE_PARTIAL`, or `result` = `-3` if nothing requested
+///   exists). Create with every mode you might later want.
+/// - **The list is replaced, never emptied.** `mode_count == 0` is
+///   refused; so is a request in which every mode is unknown to the
+///   monitor. In both cases the previously offered list stays in force.
 /// - **Degrade, never refuse.** Treat both `VGD_ERR_IO` and any negative
-///   `result` as "the mode list is unchanged, carry on with the session".
-///   A failed update is never a reason to tear a stream down.
+///   `result` as "the offered modes are unchanged, carry on with the
+///   session". A failed update is never a reason to tear a stream down.
 /// - **`result == 0` means ACCEPTED, not applied.** The driver completes
 ///   the request before it calls the OS. The applied/failed outcome shows
 ///   up in ETW and as the monitor's sticky `last_error` in the status
 ///   reply. `result == 0` with neither flag set is the only shape that
-///   means "every mode you asked for is advertised right now"; with
+///   means "every mode you asked for is offered right now"; with
 ///   `VGD_UPDATE_PENDING` set, an update is still outstanding, and if it
 ///   does not land the previous list stays in force and this exact
 ///   request can simply be sent again.
-/// - **Check `accepted` against `requested`.** They differ when the
-///   monitor's list is already at its cap; the modes that fit were still
-///   applied.
+/// - **Check `accepted` against `requested`**, and read `rejected` /
+///   `first_rejected` when they differ: that names a mode this monitor
+///   will never offer, which is a create-time problem, not a retryable
+///   one.
 #[no_mangle]
 pub unsafe extern "C" fn vgd_update_modes(
     dev: *mut VgdDeviceHandle,
@@ -382,6 +407,8 @@ pub unsafe extern "C" fn vgd_update_modes(
                     accepted: reply.accepted(),
                     requested: reply.requested(),
                     flags: reply.flags(),
+                    rejected: reply.rejected(),
+                    first_rejected: reply.first_rejected(),
                 };
                 0
             }

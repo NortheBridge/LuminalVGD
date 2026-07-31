@@ -38,8 +38,9 @@ pub const PROTO_VERSION_MAJOR: u16 = 0;
 /// tail reads as zeros), so hosts should announce
 /// [`PROTO_VERSION_MINOR_REQUIRED`] at handshake — not this constant —
 /// unless they genuinely refuse to run without 0.4 features.
-/// v0.5: `UPDATE_MODES` (`FN_UPDATE_MODES`) — change a LIVE monitor's
-/// advertised mode list without a DESTROY+CREATE cycle, plus
+/// v0.5: `UPDATE_MODES` (`FN_UPDATE_MODES`) — change which of a LIVE
+/// monitor's create-time modes it currently offers, without a
+/// DESTROY+CREATE cycle, plus
 /// [`caps::DYNAMIC_MODES`], [`UpdateModesRequest`]/[`UpdateModesReply`]
 /// and [`err::UPDATE_FAILED`]. Purely additive: no existing struct,
 /// IOCTL value, or error code moved, so a 0.3/0.4 host that never sends
@@ -91,8 +92,11 @@ pub mod caps {
     pub const MULTI_MODE: u32 = 1 << 7;
     /// Permanent display pool IOCTLs supported.
     pub const PERMANENT_POOL: u32 = 1 << 8;
-    /// `UPDATE_MODES` (proto 0.5) is implemented: a LIVE monitor's
-    /// advertised mode list can grow without a destroy/create cycle.
+    /// `UPDATE_MODES` (proto 0.5) is implemented: which of a LIVE
+    /// monitor's create-time modes it offers can be changed without a
+    /// destroy/create cycle. (It does NOT mean new modes can be added —
+    /// see [`UpdateModesRequest`](super::UpdateModesRequest); no IddCx DDI
+    /// can do that on an arrived monitor.)
     ///
     /// THE detection mechanism for the feature — preferred over comparing
     /// `driver_proto_minor >= 5`, because caps travel in both the
@@ -166,9 +170,10 @@ pub mod ioctl {
     /// [`UpdateModesReply`](super::UpdateModesReply). Proto 0.5, gated on
     /// [`caps::DYNAMIC_MODES`](super::caps::DYNAMIC_MODES).
     ///
-    /// Grows the advertised mode list of a LIVE monitor (see
+    /// Replaces the target-mode list a LIVE monitor publishes, within its
+    /// create-time superset (see
     /// [`UpdateModesRequest`](super::UpdateModesRequest) for the
-    /// additive-merge semantics). An older driver answers
+    /// replace-target-modes semantics). An older driver answers
     /// `STATUS_INVALID_DEVICE_REQUEST` for this code, which surfaces as an
     /// I/O failure host-side — never as a false success.
     pub const IOCTL_UPDATE_MODES: u32 = ctl_code(FN_UPDATE_MODES);
@@ -206,9 +211,9 @@ pub mod err {
     pub const IDENTITY_IN_USE: i32 = -11;
     /// Permanent-pool config invalid (count above cap, bad mode…).
     pub const BAD_POOL: i32 = -12;
-    /// `UPDATE_MODES`: the advertised list could NOT be changed and the
-    /// PREVIOUS list is still in force. This is the constraint-1 degrade
-    /// signal — never a departed monitor, never a refused session.
+    /// `UPDATE_MODES`: the published target list could NOT be changed and
+    /// the PREVIOUS list is still in force. This is the constraint-1
+    /// degrade signal — never a departed monitor, never a refused session.
     ///
     /// Note where it can appear: the `UPDATE_MODES` reply completes before
     /// the driver calls the OS, so the reply carries driver-side
@@ -449,22 +454,44 @@ pub struct DestroyMonitorRequest {
     pub session_id: u64,
 }
 
-/// `UPDATE_MODES` (proto 0.5): grow a LIVE monitor's advertised mode list
-/// without a destroy/create cycle.
+/// `UPDATE_MODES` (proto 0.5): REPLACE the set of modes a LIVE monitor
+/// currently offers, without a destroy/create cycle.
 ///
-/// **Semantics are ADDITIVE-MERGE, and that is a safety property, not a
-/// convenience.** The driver unions `modes[..mode_count]` into the
-/// session's current list, preserving the existing order and appending
-/// only modes that are not already advertised (capped at
-/// [`MAX_MODES_PER_MONITOR`]). Consequences that the design depends on:
+/// **Semantics are REPLACE-TARGET-MODES within the monitor's create-time
+/// superset.** `modes[..mode_count]` is the list the monitor should offer
+/// from now on. The driver validates every entry against the mode list the
+/// session was CREATED with and publishes the survivors as the monitor's
+/// IddCx TARGET-mode list (`IddCxMonitorUpdateModes2`).
 ///
-/// - `modes[0]` never changes, so the EDID's preferred detailed timing —
-///   frozen at `IddCxMonitorCreate` and underivable afterwards — stays
-///   truthful, and `PreferredMonitorModeIdx` keeps meaning what it did.
-/// - The mode the OS has currently committed can never disappear, so the
-///   update cannot force a modeset on a display that is mid-stream.
-/// - A capability can never be REMOVED by this opcode. Shrinking a live
-///   list is deliberately not expressible; end the session instead.
+/// **This opcode cannot add a mode the monitor was not created with, and
+/// no IddCx DDI can.** `IDARG_IN_UPDATEMODES2` carries target modes only;
+/// nothing in IddCx 1.10 or 1.11 replaces an arrived monitor's
+/// DESCRIPTION, so its monitor-mode set is frozen at `IddCxMonitorCreate`;
+/// and Windows offers the INTERSECTION of the monitor-mode list with the
+/// target-mode list (skipped only for remote drivers setting
+/// `IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE`, which
+/// a console-session driver cannot be). **Hosts must therefore CREATE the
+/// monitor with every mode they might later want** — e.g. both the base
+/// rate and the frame-generation-doubled rate — and use this opcode to
+/// choose among them. An entry with no counterpart in the create-time list
+/// is rejected with detail (see [`UpdateModesReply::rejected`]), never
+/// silently accepted.
+///
+/// Consequences the design depends on:
+///
+/// - Whatever is published is a subset of a list the EDID already
+///   describes, so `modes[0]`'s preferred detailed timing and
+///   `PreferredMonitorModeIdx` stay truthful for the life of the monitor.
+/// - The published list can never be EMPTY:
+///   `IDARG_IN_UPDATEMODES2.TargetModeCount` "cannot be zero"
+///   (IddCx.h:3594). `mode_count == 0`, and a request whose entries are
+///   ALL outside the superset, are both refused with `err::BAD_MODE` and
+///   change nothing.
+/// - A refusal is a refused REQUEST. The previously published list stays
+///   in force, the monitor is never departed, and the session never fails.
+/// - Gating is REVERSIBLE: a later request can publish the wider subset
+///   again. (Note the OS may re-select a mode when the one it committed
+///   stops being offered — that is what asking for gating means.)
 ///
 /// The bit depth / dynamic range are monitor-wide and fixed at create —
 /// they are derived from the EDID, which cannot be reissued on a live
@@ -481,7 +508,10 @@ pub struct UpdateModesRequest {
     /// Reserved bitmask; no bits defined in 0.5. Unknown bits ignored.
     pub flags: u32,
     /// Number of valid entries in `modes` (1..=`MAX_MODES_PER_MONITOR`).
+    /// Zero is refused: the target list may be replaced, never emptied.
     pub mode_count: u32,
+    /// The target subset to publish, preferred first. Every entry must
+    /// match a mode from this session's `CREATE_MONITOR` list.
     pub modes: [ModeSpec; MAX_MODES_PER_MONITOR as usize],
     /// Growth budget; must be 0. Requests may grow by APPENDING after
     /// this (see [`UPDATE_MODES_REQUEST_SIZE_V5`]) because the driver's
@@ -508,27 +538,35 @@ pub mod update_status {
     /// a failed or deferred push leaves the previous list in force and the
     /// request fully retryable — resending it really does push again.
     pub const PENDING: u32 = 1 << 0;
-    /// Fewer modes were accepted than requested, because the list is at
-    /// [`super::MAX_MODES_PER_MONITOR`]. **This is partial success, not an
-    /// error**: every mode that fit was applied and nothing was removed.
-    /// Compare [`UpdateModesReply::accepted`] with
-    /// [`UpdateModesReply::requested`] for the counts.
+    /// Fewer modes were accepted than requested, because some requested
+    /// entries have no counterpart in the monitor's create-time mode list
+    /// and therefore could never be offered. **This is partial success,
+    /// not an error**: every mode that exists is published and the session
+    /// carries on. Compare [`UpdateModesReply::accepted`] with
+    /// [`UpdateModesReply::requested`], and read
+    /// [`UpdateModesReply::first_rejected`] for WHICH entry was refused.
+    ///
+    /// A host seeing this has asked for a mode the monitor was not created
+    /// with; the fix is a create-time superset that includes it, not a
+    /// retry.
     pub const PARTIAL: u32 = 1 << 1;
 }
 
 /// `UPDATE_MODES` reply.
 ///
 /// **`result == OK` means ACCEPTED FOR APPLICATION, not "the OS is now
-/// advertising these modes."** The driver completes this IRP before it
+/// offering these modes."** The driver completes this IRP before it
 /// touches IddCx (side effects never run on an IOCTL frame), so the reply
-/// structurally cannot carry the `IddCxMonitorUpdateModes` status. The
+/// structurally cannot carry the `IddCxMonitorUpdateModes2` status. The
 /// OS-side outcome arrives later as ETW plus the monitor's sticky
 /// [`err::UPDATE_FAILED`] in `GET_STATUS`. What the reply CAN say
 /// precisely is whether an application is still outstanding
 /// ([`update_status::PENDING`]) and how much of the request the driver
-/// took ([`accepted`](Self::accepted) vs [`requested`](Self::requested)) —
+/// took ([`accepted`](Self::accepted) vs [`requested`](Self::requested),
+/// with [`rejected`](Self::rejected) and
+/// [`first_rejected`](Self::first_rejected) naming what it could not) —
 /// so `result == OK` with neither flag set is the one shape that means
-/// "exactly what you asked for is advertised right now".
+/// "exactly what you asked for is offered right now".
 ///
 /// This struct can never grow: the driver writes replies all-or-nothing
 /// and hosts reject a reply whose length differs from what they expect,
@@ -543,28 +581,59 @@ pub struct UpdateModesReply {
     pub session_id: u64,
     /// `err::OK` or a negative `err::*` code.
     pub result: i32,
-    /// Modes the monitor will advertise once this request is applied: the
-    /// post-merge count (which is < the requested total when the list was
-    /// already at [`MAX_MODES_PER_MONITOR`]). On any error, and whenever
-    /// [`update_status::PENDING`] is clear, it is what is advertised NOW —
+    /// Modes the monitor will offer once this request is applied: the size
+    /// of the published target list. On any error, and whenever
+    /// [`update_status::PENDING`] is clear, it is what is offered NOW —
     /// 0 only when the session does not exist.
     pub mode_count: u32,
-    /// `[0]` accepted, `[1]` requested, `[2]` flags, `[3..]` must be 0.
-    /// Read through [`accepted`](Self::accepted),
-    /// [`requested`](Self::requested) and [`flags`](Self::flags).
+    /// `[0]` accepted, `[1]` requested, `[2]` flags, `[3]` rejected,
+    /// `[4]` first-rejected index (or [`NO_REJECTED_INDEX`]), `[5]` must
+    /// be 0. Read through the accessors, never by index.
     pub reserved: [u32; 6],
 }
 
+/// [`UpdateModesReply::first_rejected`] when nothing was rejected.
+/// Distinguishable from index 0, which is a real rejection of the FIRST
+/// requested mode — the case a bare 0 would silently mislabel.
+pub const NO_REJECTED_INDEX: u32 = u32::MAX;
+
 impl UpdateModesReply {
+    /// A zeroed reply for `session_id`, with the rejection index already
+    /// at [`NO_REJECTED_INDEX`]. Use this rather than a struct literal:
+    /// a literal's `reserved: [0; 6]` would read back as "the FIRST
+    /// requested mode was rejected", which is a real and different
+    /// outcome.
+    pub fn new(session_id: u64) -> Self {
+        let mut reserved = [0u32; 6];
+        reserved[Self::IDX_FIRST_REJECTED] = NO_REJECTED_INDEX;
+        Self { session_id, result: err::OK, mode_count: 0, reserved }
+    }
+
     const IDX_ACCEPTED: usize = 0;
     const IDX_REQUESTED: usize = 1;
     const IDX_FLAGS: usize = 2;
+    const IDX_REJECTED: usize = 3;
+    const IDX_FIRST_REJECTED: usize = 4;
 
-    /// Requested modes the driver took: appended now or already
-    /// advertised. Never > [`requested`](Self::requested); less means the
-    /// rest did not fit under [`MAX_MODES_PER_MONITOR`].
+    /// Requested modes the driver published: those with a compatible entry
+    /// in the monitor's create-time list. Never >
+    /// [`requested`](Self::requested); less means the rest are modes this
+    /// monitor was not created with and can never offer.
     pub fn accepted(&self) -> u32 {
         self.reserved[Self::IDX_ACCEPTED]
+    }
+
+    /// Requested modes with no counterpart in the monitor's create-time
+    /// list. `accepted() + rejected() == requested()` always.
+    pub fn rejected(&self) -> u32 {
+        self.reserved[Self::IDX_REJECTED]
+    }
+
+    /// Index into the request of the first rejected mode, or
+    /// [`NO_REJECTED_INDEX`]. Lets a host name the offending mode in a log
+    /// instead of only counting it.
+    pub fn first_rejected(&self) -> u32 {
+        self.reserved[Self::IDX_FIRST_REJECTED]
     }
 
     /// Echo of the request's `mode_count`, so a caller can detect partial
@@ -586,7 +655,7 @@ impl UpdateModesReply {
         self.flags() & update_status::PARTIAL != 0
     }
 
-    /// True only when every requested mode is advertised by the monitor
+    /// True only when every requested mode is offered by the monitor
     /// **right now** — accepted in full, with no push still outstanding.
     /// The one predicate a host should use before telling a client a mode
     /// is available.
@@ -600,6 +669,16 @@ impl UpdateModesReply {
         self.reserved[Self::IDX_ACCEPTED] = accepted;
         self.reserved[Self::IDX_REQUESTED] = requested;
         self.reserved[Self::IDX_FLAGS] = flags;
+    }
+
+    /// Set the rejection detail (which requested modes the monitor cannot
+    /// offer at all). Separate from [`set_detail`](Self::set_detail)
+    /// because every outcome fills the counts, while only a rejection
+    /// fills these.
+    pub fn set_rejected(&mut self, rejected: u32, first_rejected: Option<u32>) {
+        self.reserved[Self::IDX_REJECTED] = rejected;
+        self.reserved[Self::IDX_FIRST_REJECTED] =
+            first_rejected.unwrap_or(NO_REJECTED_INDEX);
     }
 }
 
@@ -1174,6 +1253,38 @@ mod tests {
         assert_eq!(err::UPDATE_FAILED, -13);
         assert_eq!(err::BAD_POOL, -12);
         assert_eq!(err::NOT_HANDSHAKEN, -10);
+    }
+
+    /// The reply's detail words live in `reserved` because the struct may
+    /// never grow, so their positions ARE the ABI. The sentinel matters
+    /// most: a zeroed reply must not read as "your first mode was
+    /// rejected", which is a real and completely different outcome.
+    #[test]
+    fn update_modes_reply_detail_words_are_positional_and_have_a_no_rejection_sentinel() {
+        let mut r = UpdateModesReply::new(7);
+        assert_eq!((r.session_id, r.result, r.mode_count), (7, err::OK, 0));
+        assert_eq!(r.rejected(), 0);
+        assert_eq!(r.first_rejected(), NO_REJECTED_INDEX, "not index 0");
+        assert_eq!(NO_REJECTED_INDEX, u32::MAX);
+
+        r.set_detail(2, 3, update_status::PARTIAL | update_status::PENDING);
+        r.set_rejected(1, Some(2));
+        assert_eq!(r.reserved, [2, 3, update_status::PARTIAL | update_status::PENDING, 1, 2, 0]);
+        assert_eq!((r.accepted(), r.requested(), r.rejected(), r.first_rejected()), (2, 3, 1, 2));
+        assert!(r.is_partial() && r.is_pending() && !r.fully_in_force());
+        assert_eq!(r.accepted() + r.rejected(), r.requested());
+
+        // A rejection of the very first requested mode is index 0, and
+        // must be distinguishable from "nothing rejected".
+        r.set_rejected(1, Some(0));
+        assert_eq!(r.first_rejected(), 0);
+        r.set_rejected(0, None);
+        assert_eq!(r.first_rejected(), NO_REJECTED_INDEX);
+
+        // Clean success is the one shape a host may act on directly.
+        let mut ok = UpdateModesReply::new(7);
+        ok.set_detail(2, 2, 0);
+        assert!(ok.fully_in_force());
     }
 
     /// The detail fields live INSIDE the reserved words — the reply may

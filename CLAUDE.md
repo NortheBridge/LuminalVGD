@@ -900,38 +900,119 @@ ground where the 13/14/15 field checklists are still pending.
 
 ### Build 17 — dynamic mode lists (2026-07-30, branch `feat/dynamic-modes-build17`; UNSIGNED, UNINSTALLED, UNVALIDATED)
 
+> **REWRITTEN 2026-07-30 (second model).** Everything below the
+> "REPLACE-TARGET-MODES" heading supersedes the additive-merge design that
+> the rest of this section originally described; the historical text is
+> kept only where it still documents a live rule. Read the new part first.
+
 Branched from `feat/duck-the-device-build16` @ 7a3f696, so build 16 rides
-along. **A monitor's advertised mode list can now GROW without a
-DESTROY+CREATE cycle** — proto 0.5 `UPDATE_MODES` (`FN 0x809`,
+along. **Which of a monitor's create-time modes it offers can now change
+without a DESTROY+CREATE cycle** — proto 0.5 `UPDATE_MODES` (`FN 0x809`,
 `IOCTL 0x0022_2024`) bound to `IddCxMonitorUpdateModes2`. The motivating
-case has no create-time answer: a client streams "Desktop" over Moonlight,
-the display exists at the base rate, and only THEN a frame-generation title
-launches wanting a doubled rate that was never advertised. The only prior
-remedy was a monitor cycle, which broadcasts `DBT_DEVNODES_CHANGED` (kills
-GTA V Enhanced via its own uncatchable `0xC000041D` handler) and which
-amplified the 2026-07-30 wedge.
+case: a client streams "Desktop" over Moonlight and only THEN a
+frame-generation title launches wanting the doubled rate on offer. The
+only prior remedy was a monitor cycle, which broadcasts
+`DBT_DEVNODES_CHANGED` (kills GTA V Enhanced via its own uncatchable
+`0xC000041D` handler) and which amplified the 2026-07-30 wedge.
+
+#### REPLACE-TARGET-MODES — the corrected model (do not re-derive)
+
+Established from the 1.10 headers, the IddCx 1.11 update page, the
+`IddCxMonitorUpdateModes2` reference page, and the
+VirtualDrivers/Virtual-Display-Driver source (IddCx 1.10, MIT, calls
+UpdateModes ZERO times):
+
+- `IDARG_IN_UPDATEMODES2` (IddCx.h:3586) carries ONLY
+  `{ Reason, TargetModeCount, pTargetModes }`. **TARGET** modes.
+- There is **NO DDI in 1.10 or 1.11 that replaces a monitor's DESCRIPTION**
+  on an arrived monitor. The monitor-mode set is fixed at
+  `IddCxMonitorCreate`. Changing it means departure + recreate.
+- `IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE` (which
+  would skip the intersection) is documented remote-drivers-only; a console
+  driver cannot opt in (`REMOTE_SESSION_DRIVER` fails adapter init).
+- Windows selects from the **INTERSECTION** of the monitor-mode list and
+  the target-mode list.
+
+Therefore: advertise a static SUPERSET of monitor modes at creation
+(EDID → `ParseMonitorDescription2`), then use `IddCxMonitorUpdateModes2`
+to publish the currently valid TARGET subset. **It can gate/steer within
+the superset; it can never enlarge it.** Hosts must CREATE with every mode
+they might later want (base rate *and* framegen rate). A requested target
+with no entry in the superset is rejected with detail (`rejected`,
+`first_rejected`), never published. **`TargetModeCount` cannot be zero**
+(IddCx.h:3594) — the target list is replaceable, never emptyable; both
+`mode_count == 0` and an all-out-of-superset request are `err::BAD_MODE`
+with the published list untouched. `Reason` is
+`IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS` (IddCx.h:327).
+
+**Function-table index 6 (`IddCxMonitorUpdateModes`) is DELETED from
+bindings.rs and must never be re-added.** Verbatim from the
+`IddCxMonitorUpdateModes2` reference page: "drivers reporting
+IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 can only call
+IddCxMonitorUpdateModes2; calling IddCxMonitorUpdateModes is an error."
+CAN_PROCESS_FP16 is the ONLY adapter flag `entry.rs` sets
+(`caps.Flags = ...CAN_PROCESS_FP16`, entry.rs:251 — the HDR10 contract),
+so index 6 is forbidden for this driver as long as it does HDR at all. The
+comment block where the wrapper used to be carries the citation.
+
+State split, three layers, each with two lists now:
+`Monitor.modes` (durable superset, frozen) + `Monitor.target_modes`
+(durable published subset, seeded to the whole superset at create, carried
+by `Effect::PlugMonitor.targets` so a replug never silently ungates);
+`MonitorRt.monitor_modes` + `MonitorRt.target_modes`;
+`DuckedMonitor.monitor_modes` + `.target_modes`. `static_mode_count` and
+`ORIGIN_DRIVER` are GONE — every monitor mode comes from the EDID that
+created the monitor, so `MONITORDESCRIPTOR` is now simply true.
+`ParseDescription2` serves the superset, `QueryTargetModes2` the subset.
+
+**REPLACE vs APPEND is still undocumented, and it no longer matters for
+safety.** The Learn Remarks say only "update the mode list previously
+reported for a monitor"; the headers say nothing. The code ASSUMES REPLACE
+(recorded at `shell::monitors::push_targets`) and is correct either way
+because of one invariant re-checked immediately before the OS call against
+the LIVE `monitor_modes`: `targets ⊆ superset`. Replace ⇒ OS holds
+`targets`; append ⇒ `previous ∪ targets`; re-solicit ⇒ `targets`. All
+three are non-empty subsets of the frozen superset, so the intersection is
+non-empty and fully activatable — no unactivatable mode, no monitor
+without targets, no failed session. Only effectiveness differs (append
+would fail to remove a rate). **How a reader tells:** publish a strict
+subset, then in one trace read `UpdateModesApplied(modes, superset)`,
+whether `QueryTargetModes2` reappears with the pushed count, and how many
+rates Display Settings offers — `published` ⇒ replace/re-query,
+`superset` ⇒ append or no re-solicit. `vgd-probe --target-mode WxH@HZ`
+(alias `--add-mode`, same flag, new meaning) exercises it standalone.
+
+ETW changed with the model: `UpdateModesApplied(modes, superset, status)`;
+`ParseDescription2(modes, published, buffer)` and
+`QueryTargetModes2(modes, superset, buffer)` replace the old `dynamic`
+field; `UpdateModesAccepted` / `UpdateModesDenied` gained `rejected` (and
+Denied gained `first_rejected`). New deny stage
+`UPD_STAGE_NOT_IN_SUPERSET = 9`. Settle these names BEFORE signing.
+
+#### Historical (additive-merge, superseded — kept for the rules that survived)
 
 Verified before writing any code (do not re-derive): `IddCxMonitorUpdateModes`
 = table index 6, `IddCxMonitorUpdateModes2` = 34, `IddFunctionTableNumEntries`
 = 36 for 1.10 — in the eWDK header the build compiles against
 (`10.0.28000.0/um/iddcx/1.10/IddCxFuncEnum.h:230,258`) AND in our generated
 bindings. Both were already emitted by bindgen; only the wrappers were
-missing.
+missing. (Index 6's wrapper has since been DELETED — see the
+CAN_PROCESS_FP16 rule above. Index 34 is the only legal entry.)
 
-- **Additive-merge is the safety property, not a convenience** (`Mode::merge_additive`,
-  core/modes.rs). Entries are only APPENDED, never removed or reordered.
-  Therefore: `modes[0]` never moves, so the EDID's preferred detailed timing
-  — frozen at `IddCxMonitorCreate`, not reissuable on a live monitor — keeps
-  describing the mode we still call preferred; and the mode the OS has
-  COMMITTED can never disappear, which is what stops an update forcing a
-  modeset mid-stream. The driver cannot identify the committed mode
-  (`evt_commit_modes2` stores nothing), so "never drop anything" is the only
-  available guarantee. Shrinking a live list is deliberately not expressible.
-- **Appended modes are `ORIGIN_DRIVER`, not `ORIGIN_MONITORDESCRIPTOR`**
-  (`MonitorRt.static_mode_count` splits the list). They demonstrably did not
-  come from the frozen EDID, and the OS validates descriptor-origin modes
-  against the description it holds — claiming otherwise is a false statement
-  it may act on. Create-time modes keep MONITORDESCRIPTOR exactly as shipped.
+- ~~**Additive-merge is the safety property**~~ — SUPERSEDED. `merge_additive`
+  is gone; `Mode::select_targets` replaced it. The reasoning was applied to
+  the wrong list: appending to what the code called "the monitor's modes"
+  could never enlarge the frozen description, so it bought nothing the OS
+  would honour. The *concern* it addressed survives and is now explicit —
+  the driver still cannot identify the committed mode
+  (`evt_commit_modes2` stores nothing), so gating a rate the OS has
+  committed will make it re-select. That is now a deliberate, host-requested
+  effect rather than something the design forbids.
+- ~~**Appended modes are `ORIGIN_DRIVER`**~~ — SUPERSEDED, along with
+  `MonitorRt.static_mode_count`. Nothing is ever appended to the monitor
+  list, so every monitor mode really does come from the EDID that created
+  it and `MONITORDESCRIPTOR` is unconditionally truthful
+  (`monitors::MONITOR_MODE_ORIGIN`).
 - **The lock protocol is the whole of the danger.** `IddCxMonitorUpdateModes2`
   makes the OS re-enter `QueryTargetModes2` / `ParseDescription2` /
   `AssignSwapChain` SYNCHRONOUSLY on the calling thread, and all of those take
@@ -949,12 +1030,15 @@ missing.
   new list in a re-entrant query — so the trace records what happened instead of
   pretending it is atomic. `err::UPDATE_FAILED` (-13) lands in the monitor's
   sticky `GET_STATUS` last error.
-- **Three places the list lives, all covered.** `MonitorRt.modes` (live),
-  `core::session::Monitor.modes` (durable — what every replug-from-DeviceState
-  plugs with; without it a device re-add / D3Final re-bring-up / pool restore
-  silently reverts), and `DuckedMonitor.modes` (parked under the legacy TDR
-  gate — an update landing while parked patches the parked spec instead of
-  calling IddCx, since the re-arrival creates a NEW monitor object).
+- **Three places the list lives, all covered** — and since the rewrite each
+  holds BOTH lists: `MonitorRt.{monitor_modes,target_modes}` (live),
+  `core::session::Monitor.{modes,target_modes}` (durable — what every
+  replug-from-DeviceState plugs with; without the target half a device
+  re-add / D3Final re-bring-up / pool restore silently un-gates), and
+  `DuckedMonitor.{monitor_modes,target_modes}` (parked under the legacy TDR
+  gate — an update landing while parked patches the parked target subset
+  instead of calling IddCx, since the re-arrival creates a NEW monitor
+  object, and re-checks it against the parked superset first).
 - **Deferrals rather than refusals**: a duck in flight (`tdr_duck_pending`) or a
   cleared adapter stores the list and skips the OS push — traced — so the
   recovery's own re-negotiation picks it up. Build 16's regression test
@@ -980,49 +1064,59 @@ missing.
   never told about; and worst, the identical RETRY then merged to "nothing to
   add", emitted no effect, and returned `OK` — a permanent silent no-op
   reporting success while the monitor advertised the old list, with no way for
-  the caller to recover. The contract now: `SessionTable::update_modes` parks
-  the merge in `Monitor.pending_modes` with a table-wide monotonic
-  `update_seq`; `Effect::UpdateModes` carries that seq; `monitors::update_modes`
+  the caller to recover. The contract now (unchanged by the rewrite except
+  for which list it guards): `SessionTable::update_modes` parks the selection
+  in `Monitor.pending_targets` with a table-wide monotonic `update_seq`;
+  `Effect::UpdateModes` carries that seq; `monitors::update_modes`
   is the only caller of `IddCxMonitorUpdateModes2` and owes exactly ONE
   `settle_modes`, with `Applied` (and only `Applied`) committing
-  `Monitor.modes`. Failed AND deferred both settle `NotApplied` → pending
-  discarded, every copy keeps the pre-update list, sticky
+  `Monitor.target_modes`. Failed AND deferred both settle `NotApplied` →
+  pending discarded, every copy keeps the pre-update list, sticky
   `err::UPDATE_FAILED`, and the next identical request genuinely re-pushes.
   Rules that fall out and must not be re-broken: a deferral is NOT an
   application (the parked-spec patch is best-effort and still settles
-  NotApplied — a retry re-merges to the same list, so they converge); a
-  request arriving while a push is outstanding merges onto the PENDING list,
-  never the live one, so nothing in flight is discarded; a stale settle
-  (superseded, or session destroyed and the id reused) commits nothing, which
-  is why the seq is table-wide and never reset.
-- **Partial application is reported, not swallowed.** `merge_additive` returns
-  `Merge { merged, appended, accepted, dropped }` and no longer `break`s at the
-  cap (a later entry may already be advertised — breaking miscounted it as
-  dropped). `UpdateModesReply` fills its `reserved` words —
-  `[0] accepted, [1] requested, [2] flags` — read through
-  `accepted()/requested()/flags()/is_pending()/is_partial()/fully_in_force()`.
+  NotApplied — a retry re-selects to the same list, so they converge); a
+  request arriving while a push is outstanding replaces the PENDING
+  selection, never the live one (replace semantics: last intent wins, and
+  the effects worker is serialized so push #1 finishes before push #2
+  starts); a stale settle (superseded, or session destroyed and the id
+  reused) commits nothing, which is why the seq is table-wide and never
+  reset. Residual, accepted and documented at `settle_modes`: a superseded
+  push that SUCCEEDED followed by a superseding one that FAILED leaves the
+  durable subset lagging the OS's until the next request — both are valid
+  non-empty subsets of the superset, so nothing unactivatable results.
+- **Partial application is reported, not swallowed.** `Mode::select_targets`
+  returns `TargetSelection { targets, accepted, rejected, first_rejected }`
+  with `accepted + rejected == requested.len()` always. `UpdateModesReply`
+  fills its `reserved` words — `[0] accepted, [1] requested, [2] flags,
+  [3] rejected, [4] first_rejected` — read through
+  `accepted()/requested()/flags()/rejected()/first_rejected()/is_pending()/
+  is_partial()/fully_in_force()`, never by index; build with
+  `UpdateModesReply::new`, because a literal `[0; 6]` reads back as "your
+  FIRST mode was rejected" (`NO_REJECTED_INDEX` = `u32::MAX` is the sentinel).
   The struct does NOT grow (still 40 bytes, asserted). `update_status::PARTIAL`
-  = the list was at MAX_MODES_PER_MONITOR and the rest did not fit;
-  `PENDING` = queued at the OS, not in force yet. Partial stays `err::OK`:
-  never fail the session, never drop the modes that DID fit (constraint 1).
-  `result == OK` with neither flag is the ONLY shape meaning "in force, in
-  full, right now".
-- **The rollback can no longer shrink a live list below anyone else's
-  appends** (constraint 2's minor finding): the failure path restores only when
-  the monitor handle still matches AND the runtime list is still, entry for
-  entry, the one this call published; the restored list is the pre-update
-  baseline, a superset of anything the OS has committed (merges only append),
-  so the restore can only undo its own append. The durable list is never
-  shrunk by any path.
+  now = some requested modes are not in the create-time description and can
+  never be offered; `PENDING` = queued at the OS, not in force yet. Partial
+  stays `err::OK`: never fail the session, never drop the modes that DO
+  exist (constraint 1). `result == OK` with neither flag is the ONLY shape
+  meaning "in force, in full, right now". Total rejection is `err::BAD_MODE`
+  with the same detail — a refused REQUEST, not a failed session.
+- **The rollback can only undo its own write**: the failure path restores
+  only when the monitor handle still matches AND the runtime target list is
+  still, entry for entry, the one this call published. What it puts back was
+  itself a non-empty subset of the same frozen superset, so a rollback can
+  produce neither an empty nor an unactivatable target list.
 - ETW (existing provider): `UpdateModesAccepted(modes,queued,accepted,
-  requested,pending,partial)`, `UpdateModesDenied(stage,code)`,
-  `UpdateModesApplied(modes,dynamic,status)`,
+  requested,rejected,pending,partial)`,
+  `UpdateModesDenied(stage,code,modes,rejected,first_rejected)`,
+  `UpdateModesApplied(modes,superset,status)`,
   `UpdateModesDeferred(stage,modes,retryable)`,
   `UpdateModesFailed(stage,code,modes,rolled_back)`,
   `UpdateModesSettleStale(seq)` (a push whose update was superseded or whose
   session is gone — silent, it would be indistinguishable from a settle that
   never happened, and a missing settle is the one way to leak a pending list),
-  plus a `dynamic` field added to `ParseDescription2` / `QueryTargetModes2`.
+  plus `published` on `ParseDescription2` and `superset` on
+  `QueryTargetModes2` (the pair that answers replace-vs-append).
   Note this is the FIRST ETW at the dispatch layer at all — nothing there
   traced anything before, which is how the build-8 ACL outage stayed
   unexplained for three builds. Settle these names BEFORE signing.
@@ -1034,27 +1128,27 @@ missing.
   — the session just exists un-plugged and the watchdog reaps it — and left
   alone deliberately.)
 
-**THE OPEN QUESTION, and it can invalidate the feature.** `IDARG_IN_UPDATEMODES2`
-carries TARGET modes only. `IddCx.h:258-264` says the OS skips
-`ParseMonitorDescription2` ONLY for remote drivers setting
-`REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE` — which a console-session driver
-(entry.rs sets only CAN_PROCESS_FP16) is not and cannot be. So the presented
-list stays monitor∩target, and an ADDED mode surfaces only if the OS
-re-solicits the parse DDI after the update. Our parse/query handlers read the
-live list, so a re-parse is sufficient — but NOTHING in the 1.10 headers says
-whether one happens, and no entry point in the whole 36-entry table updates a
-monitor description. Equally undocumented: whether an update broadcasts a
-devnode change (the header says only "An OS callback function the driver calls
-to update the mode list"). **Do not assert either way in code or docs until
-measured.** One traced install answers both: `vgd-probe 2560x1440@120 --hold 30
---add-mode 2560x1440@240 --add-after 10` with a logman session on the provider
-GUID — look for `UpdateModesApplied`, then whether `ParseDescription2` /
-`QueryTargetModes2` reappear with `dynamic=1`, whether the added rate shows up
-in Display Settings, and whether any devnode-change follows. If the OS does not
-re-parse, dynamic ADD is not achievable through this DDI for a console-session
-driver and the approach has to change before more is built on it. Everything
-shipped here is still correct and safe in that case — it just would not surface
-a new mode.
+**THE OPEN QUESTION AS FIRST WRITTEN — now ANSWERED, and it is what forced
+the rewrite above.** The original text asked whether the OS re-solicits
+`ParseMonitorDescription2` after an `IddCxMonitorUpdateModes2`, hoping a
+re-parse would let an ADDED mode survive the monitor∩target intersection.
+That hope was unfounded: `ParseMonitorDescription2` is handed the EDID the
+monitor was CREATED with, and no DDI reissues it, so re-parsing could only
+ever return the same superset. Dynamic ADD is not achievable through this
+DDI for a console-session driver, full stop. The feature is now
+replace-target-modes within the create-time superset (above), which is
+achievable and is what the traced install will measure.
+
+The measurement command changes with it:
+`vgd-probe 2560x1440@120 2560x1440@240 --hold 30 --target-mode 2560x1440@240
+--target-after 10` with a logman session on the provider GUID — create with
+BOTH rates, then publish only the doubled one. Look for
+`UpdateModesApplied(modes=1, superset=2)`, then whether
+`QueryTargetModes2` reappears, whether Display Settings drops to one rate
+(⇒ REPLACE) or keeps both (⇒ APPEND / no re-solicit), and whether any
+devnode-change follows. Still undocumented and still not to be asserted
+either way in code or docs until measured: the devnode-change question, and
+replace-vs-append (safe either way — see the invariant above).
 
 Host-side work remaining (LuminalShine, NOT done here): the pinned submodule
 `src/drivers/luminal-display` is at da0349b = build 15 / proto 0.4, so it cannot

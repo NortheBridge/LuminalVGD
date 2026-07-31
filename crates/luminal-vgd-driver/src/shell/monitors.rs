@@ -30,11 +30,13 @@ fn container_guid(display_id: u64) -> ffi::GUID {
 
 /// Plug one monitor: IddCxMonitorCreate + IddCxMonitorArrival.
 /// Called with no locks held (only takes the monitors map lock briefly).
+#[allow(clippy::too_many_arguments)]
 pub fn plug(
     session_id: u64,
     display_id: u64,
     connector_index: u32,
-    modes: Vec<Mode>,
+    monitor_modes: Vec<Mode>,
+    target_modes: Vec<Mode>,
     adapter_luid: u64,
     ring_slots: u32,
     edid: Box<[u8; 256]>,
@@ -94,19 +96,18 @@ pub fn plug(
         let ring = std::sync::Arc::new(super::swapchain::RingHandle::new(
             super::swapchain::FrameRing::new(session_id, ring_slots),
         ));
-        // Every mode this monitor object is created with counts as
+        // Every mode this monitor object is created with is
         // descriptor-origin: the EDID handed to IddCxMonitorCreate above
         // was generated from this very list (its preferred detailed timing
-        // is modes[0]). Only modes appended LATER, to a monitor whose EDID
-        // can no longer be reissued, are ORIGIN_DRIVER.
-        let static_mode_count = modes.len();
+        // is monitor_modes[0]). Nothing is ever added to it — the target
+        // list below is what UPDATE_MODES steers, always within it.
         let displaced = shell.monitors.lock().unwrap().insert(
             session_id,
             MonitorRt {
                 monitor: OsHandle(monitor.cast()),
                 edid,
-                modes,
-                static_mode_count,
+                monitor_modes,
+                target_modes,
                 display_id,
                 connector_index,
                 adapter_luid,
@@ -293,7 +294,8 @@ fn duck_selected(expected_epoch: u64, only: Option<&[u64]>) -> usize {
             connector_index: rt.connector_index,
             adapter_luid: rt.adapter_luid,
             edid: rt.edid,
-            modes: rt.modes,
+            monitor_modes: rt.monitor_modes,
+            target_modes: rt.target_modes,
             ring: rt.ring,
         });
         parked += 1;
@@ -376,17 +378,17 @@ pub fn replug_ducked() {
             // Reinstate the runtime with the ORIGINAL ring Arc: sequences
             // and the generation continue, and the next assign retires
             // textures exactly like any reassignment.
-            // A fresh monitor object: its whole list is create-time again
-            // (same reasoning as plug — the EDID it was just created with
-            // is the one this list was generated from).
-            let static_mode_count = d.modes.len();
+            // The new monitor object is created from the SAME EDID, so it
+            // gets the same monitor-mode superset; the published target
+            // subset carries over too, or the re-arrival would silently
+            // undo whatever gating was in force when the duck started.
             let displaced = shell.monitors.lock().unwrap().insert(
                 d.session_id,
                 super::MonitorRt {
                     monitor: super::OsHandle(monitor.cast()),
                     edid: d.edid,
-                    modes: d.modes,
-                    static_mode_count,
+                    monitor_modes: d.monitor_modes,
+                    target_modes: d.target_modes,
                     display_id: d.display_id,
                     connector_index: d.connector_index,
                     adapter_luid: d.adapter_luid,
@@ -434,35 +436,33 @@ pub fn replug_ducked() {
     }
 }
 
-/// A snapshot of one monitor's advertised list, taken under the monitors
-/// lock and handed to a DDI handler by value. `static_count` is the split
-/// between create-time modes and modes appended later by `UPDATE_MODES`
-/// (see `MonitorRt::static_mode_count`).
+/// A snapshot of one monitor's two mode lists, taken under the monitors
+/// lock and handed to a DDI handler by value.
+///
+/// The split is the whole build-17 model: `monitor` is the frozen
+/// description (reported by the parse DDIs), `targets` is the currently
+/// published subset (reported by the query-target DDIs and pushed by
+/// `IddCxMonitorUpdateModes2`). Windows offers the intersection, and
+/// `targets ⊆ monitor` is an invariant every writer upholds, so the
+/// intersection is exactly `targets` and is never empty.
 struct ModeSnapshot {
-    modes: Vec<Mode>,
-    static_count: usize,
+    monitor: Vec<Mode>,
+    targets: Vec<Mode>,
 }
 
-impl ModeSnapshot {
-    fn len(&self) -> usize {
-        self.modes.len()
-    }
-
-    /// Truthful origin for the mode at `index`. Create-time modes are
-    /// what the EDID handed to `IddCxMonitorCreate` describes; anything
-    /// appended afterwards demonstrably is not, because that EDID cannot
-    /// be reissued on a live monitor.
-    fn origin(&self, index: usize) -> ffi::IDDCX_MONITOR_MODE_ORIGIN {
-        if index < self.static_count {
-            ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-        } else {
-            ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_DRIVER
-        }
-    }
-}
+/// Every mode a LuminalVGD monitor object is created with comes out of the
+/// EDID handed to `IddCxMonitorCreate` — the driver generates that EDID
+/// from that list — so descriptor origin is the truthful answer for all of
+/// them, and nothing is ever added afterwards to make it untrue.
+/// (`..._ORIGIN_DRIVER` exists for modes the driver knows about separately
+/// from the description. Build 17's first model needed it because it
+/// appended to this list; the corrected model never does.)
+const MONITOR_MODE_ORIGIN: ffi::IDDCX_MONITOR_MODE_ORIGIN =
+    ffi::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
 
 // ---------------------------------------------------------------------
-// UPDATE_MODES (build 17): change the advertised list of a LIVE monitor.
+// UPDATE_MODES (build 17): replace the TARGET-mode list a LIVE monitor
+// publishes, within the monitor-mode superset fixed at create.
 // ---------------------------------------------------------------------
 
 /// Stages for the `UpdateModes*` ETW events (constraint 4: every deny/fail
@@ -475,36 +475,50 @@ const UPD_STAGE_DUCK_PENDING: u32 = 3; // stored, OS push skipped (duck in fligh
 const UPD_STAGE_OS_CALL: u32 = 4; // IddCxMonitorUpdateModes2 returned failure
 const UPD_STAGE_ROLLBACK_RACED: u32 = 5; // monitor changed under a failed push
 const UPD_STAGE_NO_ADAPTER: u32 = 8; // adapter torn down before the push (6/7 are control.rs's)
+const UPD_STAGE_NOT_IN_SUPERSET: u32 = 9; // a target the live monitor cannot describe
 
-/// What the OS push did with a pending mode list. Every variant is
+/// What the OS push did with a pending target list. Every variant is
 /// reported to `SessionTable::settle_modes`, and only `Applied` commits.
 enum UpdatePush {
     /// `IddCxMonitorUpdateModes2` returned success: the list is in force.
-    Applied { count: u32, dynamic: u32 },
+    Applied { published: u32, superset: u32 },
     /// No OS call was made and nothing was left changed. RETRYABLE — the
-    /// host's next identical request merges and pushes for real.
+    /// host's next identical request resolves and pushes for real.
     Deferred { stage: u32, count: u32 },
     /// The OS refused, or there was nothing to push at.
     Failed { stage: u32, code: i32, count: u32, rolled_back: bool },
 }
 
-/// Apply a validated, already-merged mode list to a live monitor.
+/// Publish a validated target subset on a live monitor.
 ///
 /// Runs ONLY on the effects worker (via `Effect::UpdateModes`), because
 /// `IddCxMonitorUpdateModes2` makes the OS re-enter our mode DDIs
 /// synchronously on the calling thread.
 ///
-/// # The commit ordering (build 17 fix)
+/// # What is being changed, and what cannot be
+///
+/// `targets` is the TARGET-mode list to publish. The monitor's
+/// DESCRIPTION — its monitor-mode set — is frozen at
+/// `IddCxMonitorCreate`: `IDARG_IN_UPDATEMODES2` carries target modes
+/// only, and no entry point in the IddCx 1.10/1.11 function table
+/// replaces an arrived monitor's description. Windows offers the
+/// intersection of the two lists (the intersection is skipped only for
+/// remote drivers setting REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE,
+/// which a console-session driver cannot set), so this call can gate and
+/// steer within the superset and can never enlarge it. Enlarging is a
+/// departure + recreate, which is the thing the opcode exists to avoid.
+///
+/// # The commit ordering (build 17 fix, kept)
 ///
 /// `update_seq` names the update the session table is holding PENDING.
 /// This function owes it exactly one `settle_modes`, and passes
 /// `Applied` only when the OS really took the list. Nothing else in the
-/// driver commits a mode list. The original build-17 ordering committed
-/// the durable list at IOCTL time, before the push — so a refused or
-/// deferred push left durable state asserting modes the monitor did not
-/// advertise, and the identical retry merged to "nothing to add",
-/// emitted no effect, and returned OK forever. Now a push that did not
-/// take leaves every copy on the pre-update list and the retry pushes
+/// driver commits a published list. The original build-17 ordering
+/// committed the durable list at IOCTL time, before the push — so a
+/// refused or deferred push left durable state asserting a list the
+/// monitor did not have, and the identical retry resolved to "nothing to
+/// do", emitted no effect, and returned OK forever. Now a push that did
+/// not take leaves every copy on the pre-update list and the retry pushes
 /// again.
 ///
 /// # The lock protocol, which is the whole of the danger here
@@ -521,28 +535,37 @@ enum UpdatePush {
 /// re-entrant query has to see the new list, or the OS is told about
 /// modes the driver then denies it.
 ///
-/// # Failure is always "keep the current modes"
+/// # Failure is always "target modes unchanged, carry on"
 ///
-/// Constraint 1: an update that the OS refuses degrades to the previous
-/// list. It never departs the monitor, never touches the ring, and never
-/// fails the session. The rollback is best-effort by nature — the OS may
-/// already have consumed the new list in a re-entrant query before
-/// returning failure — so the trace records what happened rather than
-/// pretending the two views are atomic.
-pub fn update_modes(session_id: u64, update_seq: u64, modes: Vec<Mode>) {
+/// Constraint 1: an update the OS refuses degrades to the previously
+/// published list. It never departs the monitor, never empties the target
+/// list, never touches the ring, and never fails the session. The
+/// rollback is best-effort by nature — the OS may already have consumed
+/// the new list in a re-entrant query before returning failure — so the
+/// trace records what happened rather than pretending the two views are
+/// atomic. Both lists are non-empty subsets of the same frozen superset,
+/// so whichever one the OS ends up holding is fully activatable.
+pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
     let shell = Shell::get();
-    let push = push_modes(shell, session_id, modes);
+    let push = push_targets(shell, session_id, targets);
 
     // Constraint 5: every deny/fail path carries stage + code.
     match push {
-        UpdatePush::Applied { count, dynamic } => {
+        UpdatePush::Applied { published, superset } => {
+            // `published` vs `superset` is THE measurement this feature
+            // turns on (see push_targets' replace-vs-append note): a
+            // trace showing published < superset, then QueryTargetModes2
+            // re-solicited with the same published count, then Display
+            // Settings offering `published` modes, says the DDI replaces.
+            // Display Settings still offering `superset` says it appends
+            // (or that no re-solicit happened at all).
             tracelogging::write_event!(
                 PROVIDER,
                 "UpdateModesApplied",
                 level(Informational),
                 u64("session", &session_id),
-                u32("modes", &count),
-                u32("dynamic", &dynamic),
+                u32("modes", &published),
+                u32("superset", &superset),
                 i32("status", &STATUS_SUCCESS)
             );
         }
@@ -605,11 +628,48 @@ pub fn update_modes(session_id: u64, update_seq: u64, modes: Vec<Mode>) {
 /// and one trace site — a return path that forgot to settle would leave
 /// the table holding a pending list forever, and the whole point of the
 /// pending state is that it is always resolved.
-fn push_modes(shell: &Shell, session_id: u64, modes: Vec<Mode>) -> UpdatePush {
-    // The DDI documents TargetModeCount as "cannot be zero". The merge
-    // cannot produce an empty list, so this is a guard against a future
-    // caller, not a live case — but it must never reach the OS.
-    if modes.is_empty() {
+///
+/// # REPLACE vs APPEND — the undocumented part, and why it does not matter
+///
+/// Nothing in the IddCx 1.10 headers or on the
+/// `IddCxMonitorUpdateModes2` reference page says whether the pushed list
+/// REPLACES the monitor's target list or is APPENDED to it; the Remarks
+/// say only "update the mode list previously reported for a monitor".
+/// **This code assumes REPLACE** — that is what the request semantics are
+/// written to express and what the ETW counts are worded for — but it is
+/// correct either way, because of one invariant enforced right here: the
+/// list handed to the OS is always a subset of the monitor-mode superset
+/// this monitor object was created with (re-checked below against the
+/// LIVE `monitor_modes`, not merely trusted from the session table).
+/// Therefore:
+///
+/// - REPLACE  ⇒ the OS holds `targets`.
+/// - APPEND   ⇒ the OS holds `previous ∪ targets`.
+/// - RE-QUERY ⇒ the OS re-solicits `QueryTargetModes2`, which reports
+///   `targets`, i.e. replace.
+///
+/// In all three the OS's target list is a NON-EMPTY subset of the frozen
+/// superset, so the monitor∩target intersection is non-empty and every
+/// mode in it is one the monitor really describes: no unactivatable mode,
+/// no monitor left with no targets, no failed session. The only
+/// difference is effectiveness — under APPEND a gate does not actually
+/// remove the old rate, it just adds nothing, and the update is a no-op
+/// the host can detect.
+///
+/// **How a reader tells which one it is** (the signing round settles it):
+/// push a strict subset (published < superset), then in the trace read
+/// `UpdateModesApplied(modes, superset)`, whether `QueryTargetModes2`
+/// reappears with `published` equal to the pushed count, and finally
+/// count the rates Display Settings offers. `published` ⇒ replace or
+/// re-query; `superset` ⇒ append (or no re-solicit). Do not assert either
+/// in code or docs until that is measured.
+fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> UpdatePush {
+    // `IDARG_IN_UPDATEMODES2.TargetModeCount` "cannot be zero"
+    // (IddCx.h:3594). The core layer refuses an empty selection before it
+    // can ever become an effect, so this is the second gate, not the
+    // first — but it is the one standing directly in front of the OS
+    // call, and it must never be removed.
+    if targets.is_empty() {
         return UpdatePush::Failed {
             stage: UPD_STAGE_EMPTY,
             code: luminal_driver_proto::err::BAD_MODE,
@@ -617,22 +677,34 @@ fn push_modes(shell: &Shell, session_id: u64, modes: Vec<Mode>) -> UpdatePush {
             rolled_back: false,
         };
     }
-    let count = modes.len() as u32;
+    let count = targets.len() as u32;
 
     // A session parked by a TDR duck-out has no monitor object to push
     // at — it was departed, and the replug creates a NEW one. Patch the
-    // parked spec so the re-arrival advertises the new list; without this
-    // the update would be silently undone by the recovery.
+    // parked selection so the re-arrival publishes it; without this the
+    // update would be silently undone by the recovery.
     //
     // It is still a DEFERRAL, not an application: nothing has been
-    // advertised to the OS, the replug may yet give up, and the durable
+    // published to the OS, the replug may yet give up, and the durable
     // list must not claim otherwise. The patch and the retry converge —
-    // a retry re-merges from the durable list to exactly this list.
+    // a retry resolves from the durable superset to exactly this list.
+    // The parked superset is the same one the request was validated
+    // against (the replug recreates from the same EDID), so the subset
+    // relation still holds; re-check anyway, because it is one compare
+    // and the alternative is an unactivatable parked spec.
     {
         let mut ducked = shell.ducked.lock().unwrap();
         if let Some(d) = ducked.iter_mut().find(|d| d.session_id == session_id) {
-            d.modes = modes;
-            return UpdatePush::Deferred { stage: UPD_STAGE_PARKED, count };
+            if targets.iter().all(|m| d.monitor_modes.contains(m)) {
+                d.target_modes = targets;
+                return UpdatePush::Deferred { stage: UPD_STAGE_PARKED, count };
+            }
+            return UpdatePush::Failed {
+                stage: UPD_STAGE_NOT_IN_SUPERSET,
+                code: luminal_driver_proto::err::BAD_MODE,
+                count,
+                rolled_back: false,
+            };
         }
     }
 
@@ -656,8 +728,8 @@ fn push_modes(shell: &Shell, session_id: u64, modes: Vec<Mode>) -> UpdatePush {
         return UpdatePush::Deferred { stage: UPD_STAGE_NO_ADAPTER, count };
     }
 
-    // --- Under the lock: publish, snapshot, build. No IddCx calls. ---
-    let (monitor, previous, previous_static, pushed, target_modes) = {
+    // --- Under the lock: validate, publish, snapshot, build. No IddCx. ---
+    let (monitor, previous, pushed, superset, target_modes) = {
         let mut monitors = shell.monitors.lock().unwrap();
         let Some(rt) = monitors.get_mut(&session_id) else {
             return UpdatePush::Failed {
@@ -667,29 +739,47 @@ fn push_modes(shell: &Shell, session_id: u64, modes: Vec<Mode>) -> UpdatePush {
                 rolled_back: false,
             };
         };
+        // THE containment check, against the LIVE monitor object's own
+        // description rather than the session table's copy. The core
+        // layer already filtered, but this is the last statement before
+        // the OS call and the two lists could in principle have been
+        // reconciled by different paths (a replug rebuilding the runtime,
+        // a session id reused). Publishing a target the monitor cannot
+        // describe would be invisible to the user and inexplicable in a
+        // trace; refusing it costs one scan of at most four entries.
+        if !targets.iter().all(|m| rt.monitor_modes.contains(m)) {
+            return UpdatePush::Failed {
+                stage: UPD_STAGE_NOT_IN_SUPERSET,
+                code: luminal_driver_proto::err::BAD_MODE,
+                count,
+                rolled_back: false,
+            };
+        }
         let monitor = rt.monitor;
-        let pushed = modes.clone();
-        let previous = core::mem::replace(&mut rt.modes, modes);
-        let previous_static = rt.static_mode_count;
-        // static_mode_count deliberately unchanged: the appended entries
-        // are NOT described by the EDID this monitor object was created
-        // with, and that EDID cannot be reissued.
+        let superset = rt.monitor_modes.len() as u32;
+        let pushed = targets.clone();
+        let previous = core::mem::replace(&mut rt.target_modes, targets);
+        // monitor_modes is deliberately untouched: the EDID that
+        // describes it cannot be reissued, and nothing here claims to
+        // change what the monitor IS — only what it currently offers.
         let mut target_modes: Vec<ffi::IDDCX_TARGET_MODE2> =
-            vec![unsafe { zeroed() }; rt.modes.len()];
-        for (slot, mode) in target_modes.iter_mut().zip(rt.modes.iter()) {
+            vec![unsafe { zeroed() }; rt.target_modes.len()];
+        for (slot, mode) in target_modes.iter_mut().zip(rt.target_modes.iter()) {
             fill_target_mode2(slot, mode);
         }
-        (monitor, previous, previous_static, pushed, target_modes)
+        (monitor, previous, pushed, superset, target_modes)
     };
-    let dynamic = (count as usize).saturating_sub(previous_static) as u32;
 
     // --- No locks held. The OS may re-enter our DDIs inside this call. ---
     let status = unsafe {
         let mut in_args: ffi::IDARG_IN_UPDATEMODES2 = zeroed();
-        // OTHER is the honest reason: the enum's other values are power /
-        // bandwidth / product-configuration constraints, and "the client
-        // enabled frame generation" is none of those.
-        in_args.Reason = ffi::IDDCX_UPDATE_REASON_IDDCX_UPDATE_REASON_OTHER;
+        // CONFIGURATION_CONSTRAINTS: the set of modes that is valid right
+        // now changed because of how the display is configured (the host
+        // gating on the client's current workload). Not POWER_CONSTRAINTS
+        // and not either bandwidth reason — those name specific physical
+        // limits we are not reporting.
+        in_args.Reason =
+            ffi::IDDCX_UPDATE_REASON_IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS;
         in_args.TargetModeCount = count;
         in_args.pTargetModes = target_modes.as_ptr().cast_mut();
         bindings::monitor_update_modes2(monitor.0.cast(), &in_args)
@@ -698,32 +788,29 @@ fn push_modes(shell: &Shell, session_id: u64, modes: Vec<Mode>) -> UpdatePush {
     // borrows it for the duration of the call.
 
     if status == STATUS_SUCCESS {
-        return UpdatePush::Applied { count, dynamic };
+        return UpdatePush::Applied { published: count, superset };
     }
 
-    // --- Failure: restore the previous list. ---
+    // --- Failure: restore the previously published list. ---
     // Re-verify identity first (the AssignRacedUnplug pattern): between
     // dropping the guard and here, the session can have been destroyed,
     // reaped, ducked, or replugged onto a NEW monitor object — and
     // writing a stale list onto a fresh monitor would be worse than the
     // failure being rolled back.
     //
-    // The list comparison is the second half of that check and the reason
-    // this restore can never SHRINK a live list below anything another
-    // update added: it only runs when the runtime list is still, byte for
-    // byte, the one this call published, and it puts back the exact list
-    // that was in force a moment earlier — a superset of whatever the OS
-    // has committed, since the merge only ever appends. (Constraint 2:
-    // the rollback was the one path able to shrink a live list; scoped
-    // like this it can only undo its own append.)
+    // The list comparison is the second half of that check: the restore
+    // only runs when the runtime list is still, entry for entry, the one
+    // this call published, so it can only undo its own write and never a
+    // later update's. What it puts back was itself a non-empty subset of
+    // the same frozen superset, so the rollback cannot produce an
+    // unactivatable or empty target list either.
     let mut rolled_back = false;
     let mut raced = false;
     {
         let mut monitors = shell.monitors.lock().unwrap();
         match monitors.get_mut(&session_id) {
-            Some(rt) if rt.monitor == monitor && rt.modes == pushed => {
-                rt.modes = previous;
-                rt.static_mode_count = previous_static;
+            Some(rt) if rt.monitor == monitor && rt.target_modes == pushed => {
+                rt.target_modes = previous;
                 rolled_back = true;
             }
             _ => raced = true,
@@ -747,7 +834,10 @@ fn session_modes_for_edid(data: &[u8]) -> Option<ModeSnapshot> {
     monitors
         .values()
         .find(|rt| rt.edid[8..16] == data[8..16])
-        .map(|rt| ModeSnapshot { modes: rt.modes.clone(), static_count: rt.static_mode_count })
+        .map(|rt| ModeSnapshot {
+            monitor: rt.monitor_modes.clone(),
+            targets: rt.target_modes.clone(),
+        })
 }
 
 fn modes_for_monitor_object(monitor: ffi::IDDCX_MONITOR) -> Option<ModeSnapshot> {
@@ -756,7 +846,10 @@ fn modes_for_monitor_object(monitor: ffi::IDDCX_MONITOR) -> Option<ModeSnapshot>
     monitors
         .values()
         .find(|rt| rt.monitor == OsHandle(monitor.cast()))
-        .map(|rt| ModeSnapshot { modes: rt.modes.clone(), static_count: rt.static_mode_count })
+        .map(|rt| ModeSnapshot {
+            monitor: rt.monitor_modes.clone(),
+            targets: rt.target_modes.clone(),
+        })
 }
 
 /// Fill one `IDDCX_TARGET_MODE2` slot from a mode.
@@ -820,20 +913,20 @@ pub unsafe extern "C" fn evt_parse_monitor_description(
         return STATUS_INVALID_PARAMETER;
     };
 
-    out.MonitorModeBufferOutputCount = snapshot.len() as u32;
-    // modes[0] is preferred, and `UPDATE_MODES` can only APPEND — so this
-    // index keeps naming the same mode for the life of the monitor, which
-    // is what lets it stay consistent with the frozen EDID's preferred
-    // detailed timing.
+    // The MONITOR list: the frozen superset, never the published subset.
+    // `UPDATE_MODES` cannot change what is reported here, which is what
+    // keeps index 0 naming the same mode for the life of the monitor and
+    // consistent with the frozen EDID's preferred detailed timing.
+    out.MonitorModeBufferOutputCount = snapshot.monitor.len() as u32;
     out.PreferredMonitorModeIdx = 0;
     if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = snapshot.len().min(inp.MonitorModeBufferInputCount as usize);
+    let fill = snapshot.monitor.len().min(inp.MonitorModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pMonitorModes, fill);
-    for (i, (slot, mode)) in slots.iter_mut().zip(snapshot.modes.iter()).enumerate() {
+    for (slot, mode) in slots.iter_mut().zip(snapshot.monitor.iter()) {
         slot.Size = size_of::<ffi::IDDCX_MONITOR_MODE>() as u32;
-        slot.Origin = snapshot.origin(i);
+        slot.Origin = MONITOR_MODE_ORIGIN;
         slot.MonitorVideoSignalInfo = signal_info(mode, 0);
     }
     out.MonitorModeBufferOutputCount = fill as u32;
@@ -864,13 +957,16 @@ pub unsafe extern "C" fn evt_query_target_modes(
         return STATUS_INVALID_PARAMETER;
     };
 
-    out.TargetModeBufferOutputCount = snapshot.len() as u32;
+    // The TARGET list: the currently published subset, which is what
+    // `UPDATE_MODES` steers and what the OS intersects with the monitor
+    // description.
+    out.TargetModeBufferOutputCount = snapshot.targets.len() as u32;
     if inp.TargetModeBufferInputCount == 0 || inp.pTargetModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = snapshot.len().min(inp.TargetModeBufferInputCount as usize);
+    let fill = snapshot.targets.len().min(inp.TargetModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pTargetModes, fill);
-    for (slot, mode) in slots.iter_mut().zip(snapshot.modes.iter()) {
+    for (slot, mode) in slots.iter_mut().zip(snapshot.targets.iter()) {
         slot.Size = size_of::<ffi::IDDCX_TARGET_MODE>() as u32;
         slot.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, 1);
         // Zero, matching MaxDisplayPipelineRate = 0: bandwidth management
@@ -959,31 +1055,31 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         );
         return STATUS_INVALID_PARAMETER;
     };
-    // `dynamic` is the build-17 question this event exists to answer: if
-    // the OS never re-parses after an IddCxMonitorUpdateModes2, a
-    // dynamically added mode can never survive the OS's monitor∩target
-    // intersection, and a trace showing ParseDescription2 with dynamic=0
-    // after an UpdateModesApplied says so in one line.
-    let dynamic = (snapshot.len() - snapshot.static_count) as u32;
+    // `modes` here is the SUPERSET and is expected to be constant for the
+    // life of the monitor — an `UPDATE_MODES` can never move it, so a
+    // trace where it changes means something re-created the monitor.
+    // `published` rides along so one line of a capture shows the gate
+    // this monitor is currently under: published < modes means a subset
+    // is being offered.
     tracelogging::write_event!(
         PROVIDER,
         "ParseDescription2",
         level(Informational),
-        u32("modes", &(snapshot.len() as u32)),
-        u32("dynamic", &dynamic),
+        u32("modes", &(snapshot.monitor.len() as u32)),
+        u32("published", &(snapshot.targets.len() as u32)),
         u32("buffer", &inp.MonitorModeBufferInputCount)
     );
 
-    out.MonitorModeBufferOutputCount = snapshot.len() as u32;
+    out.MonitorModeBufferOutputCount = snapshot.monitor.len() as u32;
     out.PreferredMonitorModeIdx = 0;
     if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = snapshot.len().min(inp.MonitorModeBufferInputCount as usize);
+    let fill = snapshot.monitor.len().min(inp.MonitorModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pMonitorModes, fill);
-    for (i, (slot, mode)) in slots.iter_mut().zip(snapshot.modes.iter()).enumerate() {
+    for (slot, mode) in slots.iter_mut().zip(snapshot.monitor.iter()) {
         slot.Size = size_of::<ffi::IDDCX_MONITOR_MODE2>() as u32;
-        slot.Origin = snapshot.origin(i);
+        slot.Origin = MONITOR_MODE_ORIGIN;
         slot.MonitorVideoSignalInfo = signal_info(mode, 0);
         slot.BitsPerComponent = wire_bpc_for(mode);
     }
@@ -1007,23 +1103,29 @@ pub unsafe extern "C" fn evt_query_target_modes2(
         );
         return STATUS_INVALID_PARAMETER;
     };
-    let dynamic = (snapshot.len() - snapshot.static_count) as u32;
+    // `modes` is the published TARGET count and `superset` the monitor
+    // description's size. This pairing is the build-17 measurement: after
+    // an `UpdateModesApplied(modes=N, superset=M)` with N < M, seeing
+    // this event again with modes=N is the OS re-soliciting the target
+    // list (so a replace really took), and NOT seeing it says the push
+    // was absorbed without a re-query — at which point what Display
+    // Settings offers decides replace vs append.
     tracelogging::write_event!(
         PROVIDER,
         "QueryTargetModes2",
         level(Informational),
-        u32("modes", &(snapshot.len() as u32)),
-        u32("dynamic", &dynamic),
+        u32("modes", &(snapshot.targets.len() as u32)),
+        u32("superset", &(snapshot.monitor.len() as u32)),
         u32("buffer", &inp.TargetModeBufferInputCount)
     );
 
-    out.TargetModeBufferOutputCount = snapshot.len() as u32;
+    out.TargetModeBufferOutputCount = snapshot.targets.len() as u32;
     if inp.TargetModeBufferInputCount == 0 || inp.pTargetModes.is_null() {
         return STATUS_SUCCESS;
     }
-    let fill = snapshot.len().min(inp.TargetModeBufferInputCount as usize);
+    let fill = snapshot.targets.len().min(inp.TargetModeBufferInputCount as usize);
     let slots = core::slice::from_raw_parts_mut(inp.pTargetModes, fill);
-    for (slot, mode) in slots.iter_mut().zip(snapshot.modes.iter()) {
+    for (slot, mode) in slots.iter_mut().zip(snapshot.targets.iter()) {
         fill_target_mode2(slot, mode);
     }
     out.TargetModeBufferOutputCount = fill as u32;

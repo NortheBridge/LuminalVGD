@@ -93,26 +93,26 @@ pub(crate) struct MonitorRt {
     /// The exact EDID served to the OS. Boxed so the pointer handed to
     /// IddCxMonitorCreate stays stable while the map rehashes.
     pub edid: Box<[u8; 256]>,
-    /// The advertised mode list. Mutable since build 17 (`UPDATE_MODES`),
-    /// but ONLY through `monitors::update_modes`, and only ever by
-    /// APPENDING — see its docs for why `modes[0]` is effectively frozen
-    /// for the life of the monitor object.
-    pub modes: Vec<Mode>,
-    /// How many leading entries of `modes` were present when this monitor
-    /// object was created, i.e. the ones the EDID handed to
-    /// `IddCxMonitorCreate` can be said to describe. Entries at or after
-    /// this index were added later by `UPDATE_MODES` and are reported to
-    /// the OS as `IDDCX_MONITOR_MODE_ORIGIN_DRIVER` ("not a direct
-    /// resolution of processing the monitor description, but separate
-    /// knowledge the driver has") instead of `..._MONITORDESCRIPTOR`.
+    /// The MONITOR-mode list this monitor object was created with — what
+    /// `evt_parse_monitor_description2` reports, every entry
+    /// `IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR` because the 256-byte
+    /// EDID in `edid` was generated from exactly this list.
     ///
-    /// This is not bookkeeping for its own sake: the 256-byte EDID is
-    /// frozen at `IddCxMonitorCreate` and cannot be reissued on a live
-    /// monitor, so claiming a dynamically added mode came out of the
-    /// monitor descriptor is a false statement to the OS — and one it may
-    /// act on, since it validates descriptor-origin modes against the
-    /// description it holds.
-    pub static_mode_count: usize,
+    /// **Immutable for the life of the monitor object.** The EDID cannot
+    /// be reissued and no IddCx 1.10/1.11 DDI replaces an arrived
+    /// monitor's description, so this set can only change by departure +
+    /// recreate. `UPDATE_MODES` does not touch it.
+    pub monitor_modes: Vec<Mode>,
+    /// The TARGET-mode list currently published — what
+    /// `evt_query_target_modes2` reports and what
+    /// `IddCxMonitorUpdateModes2` pushes. Always a non-empty subset of
+    /// `monitor_modes`, because Windows offers the intersection of the two
+    /// and a target outside the monitor list could never surface.
+    ///
+    /// Mutable since build 17 (`UPDATE_MODES`), but ONLY through
+    /// `monitors::update_modes`, which is the only caller of
+    /// `IddCxMonitorUpdateModes2`.
+    pub target_modes: Vec<Mode>,
     /// Plug identity, kept so a TDR duck-out can re-arrive the same
     /// monitor (same container GUID via display_id, same connector)
     /// without a round trip through the host.
@@ -279,11 +279,15 @@ pub(crate) struct DuckedMonitor {
     pub connector_index: u32,
     pub adapter_luid: u64,
     pub edid: Box<[u8; 256]>,
-    /// The advertised list at park time. An `UPDATE_MODES` that lands
-    /// while a session is parked patches THIS copy (there is no monitor
-    /// object to push at), or the re-arrival would silently restore the
-    /// pre-update list.
-    pub modes: Vec<Mode>,
+    /// The monitor-mode superset at park time — what the re-arrival's new
+    /// monitor object is created with. The EDID above describes it, so
+    /// the two must be replugged together.
+    pub monitor_modes: Vec<Mode>,
+    /// The published target subset at park time. An `UPDATE_MODES` that
+    /// lands while a session is parked patches THIS copy (there is no
+    /// monitor object to push at), or the re-arrival would silently
+    /// restore the pre-update selection.
+    pub target_modes: Vec<Mode>,
     pub ring: std::sync::Arc<swapchain::RingHandle>,
 }
 

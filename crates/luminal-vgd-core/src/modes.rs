@@ -126,84 +126,104 @@ impl Mode {
         Ok(out)
     }
 
-    /// Additive merge for `UPDATE_MODES` (proto 0.5): return `current`
-    /// with every entry of `added` that is not already advertised
-    /// appended, capped at `MAX_MODES_PER_MONITOR`.
+    /// Resolve an `UPDATE_MODES` request (proto 0.5) into the TARGET-mode
+    /// list to publish: every entry of `requested` that has a compatible
+    /// entry in `supported` — the monitor-mode SUPERSET fixed at
+    /// `IddCxMonitorCreate` — in request order, deduplicated.
     ///
-    /// Append-only is the whole safety argument for changing the mode list
-    /// of a LIVE monitor, and every clause below is load-bearing:
+    /// # Why this is a filter and not a merge (build 17, second model)
     ///
-    /// - `current[0]` is never displaced, so the EDID's preferred detailed
-    ///   timing (frozen at `IddCxMonitorCreate`, and NOT reissuable
-    ///   afterwards) keeps describing the mode the driver still calls
-    ///   preferred, and `PreferredMonitorModeIdx = 0` keeps meaning what
-    ///   the OS was told at arrival.
-    /// - No entry is ever removed, so the mode the OS currently has
-    ///   COMMITTED is still in the list after the update. The driver
-    ///   cannot identify the committed mode (`EvtIddCxMonitorCommitModes2`
-    ///   stores nothing), so "never drop anything" is the only way to
-    ///   guarantee the update does not invalidate it — which is what keeps
-    ///   an update from forcing a modeset on a live stream.
-    /// - Duplicates collapse, so a host that resends its full desired list
-    ///   every time is idempotent rather than cap-exhausting.
+    /// `IDARG_IN_UPDATEMODES2` (IddCx.h:3586) carries `{ Reason,
+    /// TargetModeCount, pTargetModes }` — TARGET modes, nothing else.
+    /// There is no DDI anywhere in IddCx 1.10 or 1.11 that replaces an
+    /// arrived monitor's DESCRIPTION, so its MONITOR-mode set is frozen at
+    /// create; and Windows presents the INTERSECTION of the monitor-mode
+    /// list with the target-mode list (the intersection is skipped only
+    /// for remote drivers setting
+    /// `IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE`,
+    /// which a console-session driver cannot be). So a target this driver
+    /// publishes with no counterpart in `supported` is invisible to the
+    /// user no matter what the OS returns — it is a lie the driver would
+    /// then have to explain. Filtering here is what makes the reply
+    /// truthful.
     ///
-    /// Returns a [`Merge`]. `appended == 0` means the update is a no-op and
-    /// the caller should not disturb the OS at all; `dropped > 0` means the
-    /// request did not fit and the caller MUST say so (see [`Merge`]).
-    pub fn merge_additive(current: &[Mode], added: &[Mode]) -> Merge {
-        let mut out = current.to_vec();
-        let mut appended = 0usize;
+    /// # The safety property
+    ///
+    /// `targets ⊆ supported`, always. That single containment is what
+    /// makes the published list safe under EITHER possible semantics of
+    /// `IddCxMonitorUpdateModes2` (replace or append — undocumented, see
+    /// `shell::monitors::push_targets`): a replace leaves the OS holding
+    /// `targets`, an append leaves it holding `previous ∪ targets`, and
+    /// every list this driver ever publishes is a subset of the same fixed
+    /// superset — so the intersection is non-empty and every mode in it is
+    /// one the monitor really describes. Windows can always activate
+    /// something.
+    ///
+    /// A request whose entries are ALL outside `supported` yields an empty
+    /// `targets`, which the caller must refuse rather than publish:
+    /// IddCx.h:3594 states `TargetModeCount` "cannot be zero", and a
+    /// monitor with no targets is a monitor with nothing to activate.
+    /// [`TargetSelection::is_empty`] is that check.
+    pub fn select_targets(supported: &[Mode], requested: &[Mode]) -> TargetSelection {
+        let mut targets: Vec<Mode> = Vec::with_capacity(requested.len());
         let mut accepted = 0usize;
-        let mut dropped = 0usize;
-        for mode in added {
-            // Already advertised: accepted, nothing to append. Checked
-            // BEFORE the cap so a request that is a subset of a full list
-            // reports "all accepted" rather than "all dropped" — a resend
-            // of an in-force list is idempotent success, not truncation.
-            if out.contains(mode) {
-                accepted += 1;
+        let mut rejected = 0usize;
+        let mut first_rejected = None;
+        for (i, mode) in requested.iter().enumerate() {
+            if !supported.contains(mode) {
+                // Outside the superset established at create. Counted and
+                // located, never silently dropped: a caller told only
+                // "fewer than you asked for" cannot tell which mode the
+                // monitor will never offer, and that is precisely the
+                // fact it needs to stop offering it to a client.
+                rejected += 1;
+                first_rejected.get_or_insert(i);
                 continue;
             }
-            if out.len() >= MAX_MODES_PER_MONITOR as usize {
-                // No room. Keep going rather than breaking: a later entry
-                // may already be advertised, and reporting it as dropped
-                // would understate what the caller actually got.
-                dropped += 1;
-                continue;
+            // A duplicate is already published by this very list, so it
+            // counts as accepted — that keeps `accepted + rejected ==
+            // requested.len()` true for every input, which is the
+            // invariant the reply's partial-application test rests on.
+            if !targets.contains(mode) {
+                targets.push(*mode);
             }
-            out.push(*mode);
-            appended += 1;
             accepted += 1;
         }
-        Merge { merged: out, appended, accepted, dropped }
+        TargetSelection { targets, accepted, rejected, first_rejected }
     }
 }
 
-/// The outcome of [`Mode::merge_additive`].
+/// The outcome of [`Mode::select_targets`].
 ///
-/// `accepted` / `dropped` exist because the cap is silent otherwise: the
-/// merge keeps every mode that fits (never displacing anything already
-/// advertised, per the append-only rule above) and simply has nowhere to
-/// put the rest. A caller that only looked at `merged` would report plain
-/// success for a request it did not fully honor, and the host would go on
-/// believing it can select a mode that will never be offered.
-///
-/// `accepted + dropped == added.len()` always: every requested entry is
-/// either advertised by `merged` (appended now or already present) or was
-/// refused for want of room, never both and never neither.
+/// `accepted + rejected == requested.len()` always: every requested entry
+/// either has a compatible monitor mode (and is therefore published) or
+/// does not, never both and never neither.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Merge {
-    /// The post-merge list, preferred first. `merged[0] == current[0]`.
-    pub merged: Vec<Mode>,
-    /// Entries actually appended (0 = nothing changed).
-    pub appended: usize,
-    /// Requested entries that `merged` advertises — appended now or
-    /// already present.
+pub struct TargetSelection {
+    /// The target list to publish, in request order, deduplicated. A
+    /// subset of the monitor superset by construction. **Never publish
+    /// this when it is empty** — see [`is_empty`](Self::is_empty).
+    pub targets: Vec<Mode>,
+    /// Requested entries the monitor can really offer.
     pub accepted: usize,
-    /// Requested entries that did not fit under [`MAX_MODES_PER_MONITOR`].
-    /// `dropped > 0` is PARTIAL application: real success for the modes
-    /// that fit, and a fact the caller has to pass on.
-    pub dropped: usize,
+    /// Requested entries with no compatible entry in the monitor
+    /// superset. `rejected > 0` with `accepted > 0` is PARTIAL
+    /// application: the modes that exist are published and the rest are
+    /// reported — never a failed request, never a failed session.
+    pub rejected: usize,
+    /// Index into the request of the first rejected entry, so a caller can
+    /// name the offending mode instead of just counting it.
+    pub first_rejected: Option<usize>,
+}
+
+impl TargetSelection {
+    /// Nothing in the request exists on this monitor. The caller must
+    /// refuse the request with detail and leave the published list alone:
+    /// `TargetModeCount` cannot be zero (IddCx.h:3594), and an empty
+    /// target list would leave the monitor with nothing to activate.
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -313,82 +333,96 @@ mod tests {
         Mode::validate(2560, 1440, hz, 8, 0, ALL_CAPS).unwrap()
     }
 
-    /// Build 17: the merge that makes a live mode list growable. The
-    /// motivating case is the whole reason the opcode exists — a monitor
-    /// created at the base rate for a Moonlight desktop stream, then a
-    /// frame-generation game launches and the doubled rate has to become
-    /// available WITHOUT a destroy/create cycle.
+    /// Build 17: the target selection that makes a live monitor's
+    /// ADVERTISED set steerable. The motivating case is the whole reason
+    /// the opcode exists — a monitor created with both the base rate and
+    /// the frame-generation-doubled rate in its superset, streaming at the
+    /// base rate, and then a framegen title launches and only the doubled
+    /// rate should be on offer, WITHOUT a destroy/create cycle.
     #[test]
-    fn additive_merge_adds_the_framegen_rate_without_disturbing_the_live_one() {
-        let live = vec![m(120_000)];
-        let r = Mode::merge_additive(&live, &[m(240_000)]);
-        assert_eq!((r.appended, r.accepted, r.dropped), (1, 1, 0));
-        assert_eq!(r.merged, vec![m(120_000), m(240_000)]);
-        // Preferred timing untouched: the EDID still describes modes[0].
-        assert_eq!(r.merged[0], live[0]);
+    fn select_targets_publishes_the_requested_subset_of_the_superset() {
+        let superset = vec![m(120_000), m(240_000)];
+        let r = Mode::select_targets(&superset, &[m(240_000)]);
+        assert_eq!((r.accepted, r.rejected, r.first_rejected), (1, 0, None));
+        assert_eq!(r.targets, vec![m(240_000)]);
+        assert!(!r.is_empty());
+
+        // ...and back again. A replace can steer in both directions; an
+        // append-only merge structurally could not.
+        let r = Mode::select_targets(&superset, &[m(120_000)]);
+        assert_eq!(r.targets, vec![m(120_000)]);
+
+        // Order is the request's, not the superset's: the host decides
+        // which target it puts first.
+        let r = Mode::select_targets(&superset, &[m(240_000), m(120_000)]);
+        assert_eq!(r.targets, vec![m(240_000), m(120_000)]);
+        assert_eq!((r.accepted, r.rejected), (2, 0));
+    }
+
+    /// The containment that makes the publish safe whichever way
+    /// `IddCxMonitorUpdateModes2` behaves: a target with no monitor mode
+    /// behind it can never reach the OS, so the target list is always a
+    /// subset of the frozen superset and the intersection Windows presents
+    /// is always non-empty and always activatable.
+    #[test]
+    fn select_targets_rejects_anything_outside_the_superset_with_detail() {
+        let superset = vec![m(60_000), m(120_000)];
+        // The classic mistake this model exists to make impossible:
+        // "advertise a rate the monitor description never described".
+        let r = Mode::select_targets(&superset, &[m(120_000), m(240_000)]);
+        assert_eq!(r.targets, vec![m(120_000)], "only what the monitor really has");
+        assert_eq!((r.accepted, r.rejected), (1, 1));
+        assert_eq!(r.first_rejected, Some(1), "and WHICH entry was refused");
+        assert!(!r.is_empty(), "partial: publish what exists");
+
+        for t in &r.targets {
+            assert!(superset.contains(t), "targets ⊆ superset, always");
+        }
+    }
+
+    /// Everything asked for is outside the superset. The selection is
+    /// empty, and an empty target list must never be published:
+    /// IddCx.h:3594 says TargetModeCount "cannot be zero", and a monitor
+    /// with no targets has nothing Windows can activate.
+    #[test]
+    fn select_targets_reports_an_empty_selection_rather_than_an_empty_list() {
+        let superset = vec![m(60_000)];
+        let r = Mode::select_targets(&superset, &[m(120_000), m(240_000)]);
+        assert!(r.is_empty(), "the caller must refuse, not publish");
+        assert_eq!((r.accepted, r.rejected, r.first_rejected), (0, 2, Some(0)));
+
+        // Degenerate input: an empty request selects nothing, and is
+        // likewise refusable rather than publishable.
+        let r = Mode::select_targets(&superset, &[]);
+        assert!(r.is_empty());
+        assert_eq!((r.accepted, r.rejected), (0, 0));
     }
 
     #[test]
-    fn additive_merge_never_removes_and_never_reorders() {
-        let live = vec![m(120_000), m(240_000)];
-        // A host asking for ONLY the doubled rate cannot drop the base
-        // rate — the OS may have it committed right now.
-        let r = Mode::merge_additive(&live, &[m(240_000)]);
-        assert_eq!((r.merged.as_slice(), r.appended), (live.as_slice(), 0));
-        assert_eq!((r.accepted, r.dropped), (1, 0), "already advertised == accepted");
-        // Nor can it promote a later mode to preferred.
-        let r = Mode::merge_additive(&live, &[m(240_000), m(60_000)]);
-        assert_eq!(r.merged, vec![m(120_000), m(240_000), m(60_000)]);
-        assert_eq!((r.appended, r.accepted, r.dropped), (1, 2, 0));
-        assert_eq!(r.merged[0], live[0]);
-    }
-
-    #[test]
-    fn additive_merge_is_idempotent_and_capped() {
-        let live = vec![m(120_000)];
+    fn select_targets_is_idempotent_and_counts_every_requested_entry() {
+        let superset = vec![m(60_000), m(90_000), m(120_000), m(240_000)];
+        assert_eq!(superset.len(), MAX_MODES_PER_MONITOR as usize);
         let want = [m(120_000), m(240_000)];
-        let once = Mode::merge_additive(&live, &want);
-        let twice = Mode::merge_additive(&once.merged, &want);
-        assert_eq!(once.merged, twice.merged, "resending the same desired list changes nothing");
-        assert_eq!((once.appended, twice.appended), (1, 0));
-        assert_eq!((once.accepted, twice.accepted), (2, 2));
+        let once = Mode::select_targets(&superset, &want);
+        let twice = Mode::select_targets(&superset, &once.targets);
+        assert_eq!(once.targets, twice.targets, "resending the published list changes nothing");
 
-        // At the cap, extra entries are dropped rather than displacing
-        // anything already advertised.
-        let full = vec![m(60_000), m(90_000), m(120_000), m(240_000)];
-        assert_eq!(full.len(), MAX_MODES_PER_MONITOR as usize);
-        let r = Mode::merge_additive(&full, &[m(30_000)]);
-        assert_eq!((r.merged, r.appended), (full, 0));
-    }
-
-    /// FINDING 2 — the cap must not be silent. A request that does not fit
-    /// is PARTIAL application: the modes that fit are really applied (they
-    /// must not be thrown away), and the ones that did not have to be
-    /// counted, or the caller reports plain success for a mode the monitor
-    /// will never offer.
-    #[test]
-    fn additive_merge_counts_what_it_could_not_fit() {
-        // Room for exactly one more, three asked for.
-        let live = vec![m(60_000), m(90_000), m(120_000)];
-        let r = Mode::merge_additive(&live, &[m(144_000), m(240_000), m(360_000)]);
-        assert_eq!(r.merged.len(), MAX_MODES_PER_MONITOR as usize);
-        assert_eq!(r.appended, 1, "the one that fits is kept, not discarded");
-        assert_eq!((r.accepted, r.dropped), (1, 2));
-        assert_eq!(r.merged[..3], live[..], "nothing already advertised was displaced");
-        assert_eq!(r.merged[3], m(144_000), "request order preserved");
-
-        // A full list plus a request that is partly already advertised:
-        // the present entries count as accepted, only the new ones are
-        // dropped. (Break-on-cap would have miscounted the tail here.)
-        let full = vec![m(60_000), m(90_000), m(120_000), m(240_000)];
-        let r = Mode::merge_additive(&full, &[m(30_000), m(120_000)]);
-        assert_eq!((r.appended, r.accepted, r.dropped), (0, 1, 1));
-        assert_eq!(r.merged, full);
+        // A duplicate is already published by this list: accepted, listed
+        // once. The whole superset is publishable in one go.
+        let r = Mode::select_targets(&superset, &[m(60_000), m(60_000)]);
+        assert_eq!((r.targets, r.accepted, r.rejected), (vec![m(60_000)], 2, 0));
+        let r = Mode::select_targets(&superset, &superset);
+        assert_eq!(r.targets, superset);
 
         // The invariant every caller relies on to report honestly.
-        for req in [vec![m(30_000)], vec![m(30_000), m(45_000)], vec![m(120_000)]] {
-            let r = Mode::merge_additive(&full, &req);
-            assert_eq!(r.accepted + r.dropped, req.len());
+        for req in [
+            vec![m(30_000)],
+            vec![m(30_000), m(45_000)],
+            vec![m(120_000)],
+            vec![m(120_000), m(30_000), m(240_000)],
+        ] {
+            let r = Mode::select_targets(&superset, &req);
+            assert_eq!(r.accepted + r.rejected, req.len());
         }
     }
 }

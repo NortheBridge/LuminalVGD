@@ -104,7 +104,7 @@ Device interface GUID (new, LuminalVGD-owned): `LUMINAL_VGD_INTERFACE_GUID`.
 | `QUERY_LEASE { session_id }` | identity, connector, remaining lease time |
 | `SET_RENDER_ADAPTER { luid }` | device-wide preference for unset-adapter creates |
 | `SET_PERMANENT_POOL` / `QUERY_PERMANENT_POOL` | always-on display pool (see §3.2.2) |
-| `UPDATE_MODES { session_id, modes[≤4] }` | grow a LIVE monitor's mode list (see §3.2.5); `caps::DYNAMIC_MODES` |
+| `UPDATE_MODES { session_id, modes[≤4] }` | re-publish which of a LIVE monitor's create-time modes it offers (see §3.2.5); `caps::DYNAMIC_MODES` |
 | `GET_STATUS` | monitor list, ring health, last error — for diagnostics |
 
 SudoVDA behaviors preserved: max-monitors cap (default 10), PING-fed
@@ -157,104 +157,150 @@ what makes the Windows HDR toggle dependable on a virtual display.
 
 #### 3.2.5 Dynamic mode lists (`caps::DYNAMIC_MODES`, proto 0.5, build 17)
 
-Before build 17 a monitor's advertised mode list was fixed at
+Before build 17 the set of modes a monitor offered was fixed at
 `CREATE_MONITOR`: the only way to change it was `DESTROY_MONITOR` +
 `CREATE_MONITOR`, i.e. a monitor cycle — which broadcasts
 `DBT_DEVNODES_CHANGED` (the documented GTA V Enhanced killer, an
 uncatchable `0xC000041D` in its own handler) and which amplified the
-2026-07-30 machine-wide wedge. The motivating case has no create-time
-answer at all: a client streams "Desktop" over Moonlight, the display is
-created at the base refresh rate, and only *then* does the user launch a
-frame-generation title whose doubled rate was never advertised.
+2026-07-30 machine-wide wedge. The motivating case: a client streams
+"Desktop" over Moonlight and only *then* launches a frame-generation
+title whose doubled rate should become the one on offer.
 
-`UPDATE_MODES` binds `IddCxMonitorUpdateModes2` (function-table index 34;
-the v1 entry at index 6 is bound for symmetry but never called — it cannot
-carry `BitsPerComponent`, which our per-mode wire depth needs).
+**The model, established from the IddCx 1.10 headers, the 1.11 update
+page, the `IddCxMonitorUpdateModes2` reference and the (1.10, MIT)
+VirtualDrivers/Virtual-Display-Driver source, which calls UpdateModes
+zero times:**
 
-The semantics are **additive-merge**, and every clause is a safety
+- `IDARG_IN_UPDATEMODES2` (IddCx.h:3586) carries only
+  `{ Reason, TargetModeCount, pTargetModes }` — **TARGET** modes.
+- **No DDI in IddCx 1.10 or 1.11 replaces an arrived monitor's
+  DESCRIPTION.** Its monitor-mode set is fixed at `IddCxMonitorCreate`
+  (verified against the whole 36-entry function table). Changing it means
+  departure + recreate.
+- `IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE`, which
+  would skip the intersection, is documented remote-drivers-only; a
+  console-session driver cannot opt in (setting `REMOTE_SESSION_DRIVER`
+  fails adapter init).
+- Windows selects from the **intersection** of the monitor-mode list and
+  the target-mode list.
+
+So: the driver advertises a static **superset** of monitor modes at
+creation (the `CREATE_MONITOR` list, carried by the EDID and served from
+`EvtIddCxParseMonitorDescription2`), and uses
+`IddCxMonitorUpdateModes2` to publish the currently valid **target
+subset**. That works with no departure provided every published target has
+a compatible entry in the superset. It can gate and steer within the
+superset; it can never enlarge it. **Hosts must create a monitor with
+every mode they might later want** — e.g. both the base rate and the
+framegen-doubled rate.
+
+Build 17's first cut implemented an additive merge onto what it treated as
+the monitor list. That was the wrong list and the wrong operation.
+
+`UPDATE_MODES` binds `IddCxMonitorUpdateModes2` (function-table index 34).
+**Index 6 (`IddCxMonitorUpdateModes`) is not bound at all**: per its
+reference page, "drivers reporting `IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16`
+can only call `IddCxMonitorUpdateModes2`; calling
+`IddCxMonitorUpdateModes` is an error", and CAN_PROCESS_FP16 is the only
+adapter flag we set (the HDR10 contract).
+
+The semantics are **replace-target-modes**, and every clause is a safety
 property rather than a convenience:
 
-- The request is unioned into the current list; entries are only ever
-  APPENDED, never removed or reordered, capped at `MAX_MODES_PER_MONITOR`.
-- `modes[0]` therefore never changes, so the EDID's preferred detailed
-  timing — frozen at `IddCxMonitorCreate` and not reissuable on a live
-  monitor — keeps describing the mode the driver still calls preferred,
-  and `PreferredMonitorModeIdx = 0` keeps its meaning.
-- The mode the OS has *committed* can never disappear. The driver cannot
-  identify it (`EvtIddCxMonitorCommitModes2` stores nothing), so "never
-  drop anything" is the only way to guarantee an update cannot invalidate
-  the active mode and force a modeset mid-stream.
-- Appended modes are reported as `IDDCX_MONITOR_MODE_ORIGIN_DRIVER`, not
-  `..._MONITORDESCRIPTOR`: they demonstrably did not come from the frozen
-  EDID, and the OS validates descriptor-origin modes against the
-  description it holds.
+- The request is the complete target list to publish. Each entry is
+  checked against the create-time superset; an entry with no counterpart
+  there is REJECTED WITH DETAIL (count + index of the first) rather than
+  published — it could never surface through the intersection anyway.
+- **`targets ⊆ superset` is the invariant.** Every list the driver ever
+  hands the OS is a subset of a description the monitor really has, so
+  the intersection is non-empty and every mode in it is activatable.
+- **The target list can be replaced but never emptied**: IddCx.h:3594
+  states `TargetModeCount` "cannot be zero". `mode_count == 0` and a
+  request whose entries are all outside the superset are both refused with
+  `err::BAD_MODE`, changing nothing. A refused REQUEST is never a failed
+  session.
+- The monitor-mode list is untouched, so `modes[0]` stays the EDID's
+  preferred detailed timing and `PreferredMonitorModeIdx = 0` keeps its
+  meaning for the life of the monitor. Every monitor mode is reported
+  `IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR`, which is now simply true.
+- Gating is REVERSIBLE — a later request republishes the wider subset —
+  which an append-only merge structurally could not express. The OS may
+  re-select when the committed mode stops being offered; that is what
+  asking for gating means.
 
-Application rules (DESIGN.md §3.3): the IOCTL only merges and validates,
+Application rules (DESIGN.md §3.3): the IOCTL only validates and selects,
 then queues an `Effect::UpdateModes`; the OS call happens on the effects
 worker with **no lock held**, because `IddCxMonitorUpdateModes2` makes the
 OS re-enter `EvtIddCxMonitorQueryTargetModes2` /
 `EvtIddCxParseMonitorDescription2` synchronously on the calling thread and
-`std::sync::Mutex` is not reentrant. The new list is published into the
-monitor runtime *before* the call (the re-entrant query must see it) and
-restored on failure. A failed update degrades to "keep the current modes"
-— never a departure, never a refused session — and surfaces as
-`err::UPDATE_FAILED` in the monitor's sticky `GET_STATUS` last error plus
-an ETW event carrying stage and status.
+`std::sync::Mutex` is not reentrant. The new target list is published into
+the monitor runtime *before* the call (the re-entrant query must see it)
+and restored on failure. A failed update degrades to "target modes
+unchanged, carry on" — never a departure, never an empty target list,
+never a refused session — and surfaces as `err::UPDATE_FAILED` in the
+monitor's sticky `GET_STATUS` last error plus an ETW event carrying stage
+and status. `Reason` is `IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS`
+(IddCx.h:327).
 
 **Commit ordering — nothing is committed until the OS takes it.** There
-are three copies of a mode list (the session table's durable one, the
-shell's runtime one, and a TDR-parked spec) and the reply is written on a
-different thread from the push, so the ordering is the whole correctness
-argument:
+are three copies of the published list (the session table's durable one,
+the shell's runtime one, and a TDR-parked spec) and the reply is written
+on a different thread from the push, so the ordering is the whole
+correctness argument:
 
-- `SessionTable::update_modes` validates and merges but writes the result
-  to `Monitor.pending_modes`, **not** `Monitor.modes`. The effect carries
-  the merge plus a table-wide monotonic `update_seq`.
+- `SessionTable::update_modes` validates and selects but writes the result
+  to `Monitor.pending_targets`, **not** `Monitor.target_modes`. The effect
+  carries the selection plus a table-wide monotonic `update_seq`.
 - `monitors::update_modes` (effects worker) is the only caller of
   `IddCxMonitorUpdateModes2` and owes the table exactly one
   `settle_modes(session_id, update_seq, …)`. `Applied` — and only
-  `Applied` — commits `Monitor.modes`.
+  `Applied` — commits `Monitor.target_modes`.
 - A push that FAILED (the OS refused; the runtime list is rolled back) or
   was DEFERRED (a TDR duck in flight, the adapter torn down, the session
-  parked) settles `NotApplied`: the pending list is discarded, every copy
-  keeps the pre-update list, and the monitor's sticky last error becomes
-  `err::UPDATE_FAILED`. The **next identical request therefore merges,
-  queues and pushes for real** — a retry is a retry, not a no-op.
+  parked) settles `NotApplied`: the pending selection is discarded, every
+  copy keeps the pre-update list, and the monitor's sticky last error
+  becomes `err::UPDATE_FAILED`. The **next identical request therefore
+  selects, queues and pushes for real** — a retry is a retry, not a no-op.
 - A stale settle (superseded by a newer update, or its session destroyed)
-  commits nothing; the newer update's list is a superset, since a merge
-  in flight stacks onto the pending list rather than the live one.
+  commits nothing; the newer update's own settle decides, and both lists
+  are non-empty subsets of the same frozen superset, so either is safe.
 
 Committing at IOCTL time instead — as build 17 first shipped — made the
-durable state assert modes the OS had refused, and turned the identical
-retry into a silent no-op that returned `OK`: the caller was told it
-succeeded, the monitor advertised the old list, and there was no way back.
+durable state assert a publish the OS had refused, and turned the
+identical retry into a silent no-op that returned `OK`: the caller was
+told it succeeded, the monitor offered the old list, and there was no way
+back.
 
-**Partial application is reported, not swallowed.** The merge keeps every
-requested mode that fits and counts the ones that do not (`accepted` /
-`dropped`). The reply carries `accepted`, `requested` and a flags word in
-`UpdateModesReply.reserved` — the struct may never grow, both sides
-length-check it — where `update_status::PARTIAL` means "the list was at
-`MAX_MODES_PER_MONITOR` and the rest did not fit" and
-`update_status::PENDING` means "queued at the OS, not in force yet".
-Partial is success with detail: nothing that fit is discarded and the
-session is never failed (constraint 1). `result == OK` with neither flag
-set is the only shape that means "everything you asked for is advertised
-right now" (`UpdateModesReply::fully_in_force`).
+**Partial application is reported, not swallowed.** The selection keeps
+every requested mode the monitor really has and counts the rest
+(`accepted` / `rejected` / `first_rejected`). The reply carries them plus
+a flags word in `UpdateModesReply.reserved` — the struct may never grow,
+both sides length-check it — where `update_status::PARTIAL` means "some
+requested modes are not in the monitor's create-time list and can never be
+offered" and `update_status::PENDING` means "queued at the OS, not in
+force yet". Partial is success with detail: everything that exists is
+published and the session is never failed (constraint 1). `result == OK`
+with neither flag set is the only shape that means "everything you asked
+for is offered right now" (`UpdateModesReply::fully_in_force`).
 
 **Open empirical question (build 17's first traced install must answer
-it).** `IDARG_IN_UPDATEMODES2` carries TARGET modes only. The OS skips
-`EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION2` only for remote drivers that set
-`IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE`, which we
-are not and cannot be — so the presented list stays the intersection of
-the monitor-mode list with the target-mode list, and an ADDED mode
-surfaces only if the OS re-solicits the parse DDI after the update. No
-IddCx 1.10 entry point updates a monitor description (verified against the
-whole 36-entry table). Our parse/query handlers already read the live
-list, so a re-parse is sufficient; nothing in the headers says whether one
-happens. The `ParseDescription2` / `QueryTargetModes2` ETW events carry a
-`dynamic` count for exactly this, and `vgd-probe --add-mode` exercises it
-standalone. Likewise undocumented: whether an update broadcasts a devnode
-change. Do not assert either way in code or docs until measured.
+it), and why it cannot break anything.** Nothing in the 1.10 headers or on
+the reference page says whether `IddCxMonitorUpdateModes2` REPLACES the
+monitor's target list or APPENDS to it — the Remarks say only "update the
+mode list previously reported for a monitor". The code assumes REPLACE and
+says so at `shell::monitors::push_targets`, but it is safe either way
+*because* of `targets ⊆ superset`: under replace the OS holds `targets`,
+under append `previous ∪ targets`, and under a re-solicit exactly
+`targets` — in all three a non-empty subset of the frozen superset, so
+nothing unactivatable and no monitor left with no targets. Only
+effectiveness differs (an append would fail to remove a rate, and the host
+can see that). **How to tell:** publish a strict subset, then read
+`UpdateModesApplied(modes, superset)`, whether `QueryTargetModes2`
+reappears with the pushed count, and finally how many rates Display
+Settings offers — `published` ⇒ replace or re-query, `superset` ⇒ append
+or no re-solicit. `vgd-probe --target-mode` exercises it standalone.
+Likewise undocumented: whether an update broadcasts a devnode change. Do
+not assert either way in code or docs until measured.
 
 ### 3.3 Recovery-first driver design (the WUDFHost-hang killer)
 
