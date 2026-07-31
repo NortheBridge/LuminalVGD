@@ -447,6 +447,35 @@ or no re-solicit. `vgd-probe --target-mode` exercises it standalone.
 Likewise undocumented: whether an update broadcasts a devnode change. Do
 not assert either way in code or docs until measured.
 
+#### MEASURED 2026-07-31 (build 17, Insider 29617, RTX 5080) — three facts
+
+Run: `vgd-probe 3840x1600@120 3840x1600@60 --hold 90 --target-mode
+3840x1600@120 --target-after 20`, watching Display Settings.
+
+1. **A console-session driver CAN advertise a multi-mode superset, and
+   Windows presents all of it.** Both 60 Hz and 120 Hz appeared in the
+   refresh dropdown at CREATE_MONITOR, before any update. This is the
+   precondition the whole superset/subset model rests on, and it holds —
+   `REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE` being remote-only does NOT
+   stop a console driver publishing several monitor modes; it only stops it
+   publishing TARGET modes that no monitor mode covers.
+2. **`IddCxMonitorUpdateModes2` REPLACES the target list.** Publishing
+   `{120}` left 120 as the only rate offered; an append would have kept 60.
+   This settles the question the 1.10/1.11 headers, the Learn reference and
+   the VirtualDrivers reference driver all leave open.
+3. **An update costs a swapchain reassign and a visible brief blank —
+   EVEN when the committed mode is preserved in the published set.** The
+   ring generation went 1 → 3 (unassign + assign) ~2 s after the push, and
+   the screen blanked momentarily. It is a MODESET, not a monitor cycle:
+   no departure, no arrival, so no `DBT_DEVNODES_CHANGED` and no exposure
+   to the GTA V device-change fault. But it is not free.
+
+**Consequence for callers.** `UPDATE_MODES` is not a per-session or
+speculative call. Where the need is "this display should be able to run at
+2x for frame generation", advertise both rates at CREATE_MONITOR and change
+nothing afterwards — zero display events. Reach for `UPDATE_MODES` only when
+a mode genuinely must stop being offered and a brief blank is acceptable.
+
 ### 3.3 Recovery-first driver design (the WUDFHost-hang killer)
 
 The reason LuminalVGD exists is SudoVDA wedging WUDFHost on current
