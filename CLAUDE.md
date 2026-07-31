@@ -319,6 +319,35 @@ Cursor bring-up lessons (each cost one traced signing round — the
   signature to remember: 0x1b8 storms in WER = one of our callbacks is
   not returning.
 
+  > **⚠ REFUTED ON BUILD 29617 (corrected 2026-07-30 by debugging 25 dumps
+  > with cdb). Do not reason from the rule above on current Windows.**
+  > On this build `0x1b8` is `VIDEO_MINIPORT_BLACK_SCREEN_LIVEDUMP`, not a
+  > win32k callout watchdog. All 25 dumps across 2026-07-29/30 carry Arg1=0xa
+  > and a byte-identical stack:
+  > `dwm.exe → NtGdiDdDDIEscape → dxgkrnl!DxgkEscape →
+  > win32kbase!xxxDisplayDiagBlackScreenDetected → dxgkrnl!DxgkCheckDisplayState
+  > → dxgkrnl!DxgCreateLiveDumpWithDriverBlob → watchdog!WdDbgReportCreate`.
+  > `watchdog.sys` appears **only as the report writer**, called *by* dxgkrnl
+  > with `0x1b8` passed as an ordinary argument — there is no watchdog wait
+  > anywhere, and the single captured thread is dwm.exe **running**, not
+  > blocked. dwm is voluntarily reporting a black screen.
+  >
+  > So on 29617 a `0x1b8` storm counts **black-screen symptoms, not hung
+  > callbacks**. The rule was true when `0x1b8` genuinely was a callout
+  > watchdog on an older OS; it is a false lead now, and it sent one
+  > investigation looking for a hung IddCx callback that did not exist.
+  >
+  > Two further corrections from the same session:
+  > - The `4400/4401/4402/4403` in `WATCHDOG*.dmp` filenames are **rotating
+  >   WER slots, not bugcheck subcodes** (caught live: `4403` at 20:23:02.260
+  >   followed by `4400` at 20:23:02.801 — 541 ms apart, same process, same
+  >   stack).
+  > - These are 256 KB kernel **triage** dumps: one process record, one
+  >   thread, one call stack. `!process 0 0` fails and `!stacks 2` returns
+  >   nothing. They can neither implicate nor exonerate this driver, and any
+  >   claim in either direction from them is unsupported. Driver-side ground
+  >   truth comes from our own ETW provider, not from these.
+
 ### Phase 7 — packaging & first release (2026-07-23, build 8)
 
 **Control-surface ACL (the §6 release blocker) shipped**: the control
