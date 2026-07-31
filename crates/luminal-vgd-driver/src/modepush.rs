@@ -25,11 +25,42 @@
 //! 3. **Which monitor mode is preferred?** [`preferred_monitor_mode_idx`] —
 //!    the answer stopped being a constant 0 the moment the published
 //!    target subset could exclude `monitor_modes[0]`.
+//! 4. **Is this refusal worth retrying?** [`PushOutcome::retryable`]. Every
+//!    other way a push can fail to apply is transient; a refusal to evict
+//!    the committed mode is not, and reporting the two the same way put a
+//!    retrying host in a loop it could never leave. The permanent one
+//!    carries the blocking mode's index in the monitor's create-time list
+//!    all the way out to `UpdateModesReply` (`update_status::BLOCKED` +
+//!    `err::MODE_COMMITTED`), so the host can pick a different subset
+//!    rather than guess.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use luminal_vgd_core::modes::Mode;
 use luminal_vgd_core::session::ModeUpdateResult;
+
+/// The paths the OS last committed, per IddCx monitor object.
+///
+/// Lives here rather than in `shell::monitors` — where it was born —
+/// because two layers now read it: the shell writes it from
+/// `EvtIddCxAdapterCommitModes2` and consults it before a push, and
+/// `dispatch` reads [`committed_token`] on every `UPDATE_MODES` to decide
+/// whether a remembered refusal is still evidence of anything. A process
+/// global like the rest of the shell's state (one root-enumerated devnode),
+/// const-constructible so the modeset callback that writes it never depends
+/// on any initialisation having run. On a non-Windows build nothing writes
+/// it, so every reader sees "nothing committed" — the fail-open answer.
+pub static COMMITTED: CommittedPaths = CommittedPaths::new();
+
+/// The current "what has the OS committed" version stamp.
+///
+/// Handed to `SessionTable::update_modes` as the validity token for a
+/// remembered [`stage::GATES_COMMITTED`] refusal: the refusal is an answer
+/// about the mode the OS is running, so it stays good exactly as long as no
+/// commit has happened since. Every modeset bumps it.
+pub fn committed_token() -> u64 {
+    COMMITTED.generation()
+}
 
 // ---------------------------------------------------------------------
 // Stages
@@ -94,8 +125,25 @@ pub enum PushOutcome {
     /// No OS call was made and NOTHING was left changed. Retryable — the
     /// host's next identical request resolves and pushes for real.
     Deferred { stage: u32, count: u32 },
-    /// The OS refused, or there was nothing to push at, or the push was
-    /// refused before it could disturb a committed mode.
+    /// The push was refused before it was made because the list would have
+    /// gated out the mode the OS has COMMITTED (see [`live_gate`]).
+    ///
+    /// A separate variant from [`Failed`](Self::Failed) because it is the
+    /// one refusal a RETRY CANNOT FIX. Everything else that lands in
+    /// `Failed` — the OS refusing the DDI, a rollback race, an empty list —
+    /// is either transient or a caller bug the caller can see; this one is
+    /// a statement about what the display is currently running, and it
+    /// stands until that changes. Folding it into `Failed` is what made it
+    /// indistinguishable from a transient failure on the wire: both settled
+    /// `NotApplied`, both left the sticky `UPDATE_FAILED` that means "send
+    /// it again", and the host obligingly did, forever.
+    ///
+    /// It carries what the host needs to act instead of retry:
+    /// `superset_idx` names the committed mode inside the monitor's
+    /// create-time list, and `token` says how long that answer is good for.
+    Blocked { committed: CommittedMode, superset_idx: u32, token: u64, count: u32 },
+    /// The OS refused, or there was nothing to push at, or the request
+    /// named modes this monitor was never created with.
     Failed { stage: u32, code: i32, count: u32, rolled_back: bool },
 }
 
@@ -106,11 +154,26 @@ impl PushOutcome {
     /// or a parked spec's) commits, and any outcome that changed nothing
     /// does not.
     pub fn settle_result(self) -> ModeUpdateResult {
-        if self.commits() {
-            ModeUpdateResult::Applied
-        } else {
-            ModeUpdateResult::NotApplied
+        match self {
+            _ if self.commits() => ModeUpdateResult::Applied,
+            // The one not-applied outcome that must not be reported as an
+            // ordinary not-applied: it is permanent, and the table carries
+            // that fact (plus the blocking mode) into the answer the host's
+            // next request gets.
+            PushOutcome::Blocked { superset_idx, token, .. } => {
+                ModeUpdateResult::Blocked { superset_idx, token }
+            }
+            _ => ModeUpdateResult::NotApplied,
         }
+    }
+
+    /// Is the host's identical retry worth anything? False only for
+    /// [`Blocked`](Self::Blocked) — see that variant. This is the single
+    /// definition behind both the `retryable` field on the ETW events and
+    /// the wire's `update_status::BLOCKED`, so a trace and a host can never
+    /// disagree about whether a refusal was worth repeating.
+    pub fn retryable(self) -> bool {
+        !matches!(self, PushOutcome::Blocked { .. })
     }
 
     /// True when this outcome means "the published list really changed",
@@ -244,25 +307,61 @@ const READ_RETRIES: u32 = 4;
 /// So the writer does a fixed number of atomic stores into a fixed array —
 /// no allocation, no lock, no syscall — and the reader (the effects
 /// worker, immediately before an `IddCxMonitorUpdateModes2`) does a
-/// bounded seqlock-style read keyed on the monitor field.
+/// bounded seqlock read.
 ///
-/// Each slot publishes its payload BEFORE its key with release ordering,
-/// and the reader re-reads the key after the payload: a slot being
-/// rewritten under a reader yields either the old pairing or the new one,
-/// never a mixture of the two.
+/// # The two races, and why neither is allowed to produce a phantom mode
+///
+/// What this record decides is whether to REFUSE a host's push, so a value
+/// that never existed is worse than no value at all: "no committed mode"
+/// fails open (push, as the driver always did), while a phantom mode can
+/// refuse a legitimate request or — the other direction — wave through the
+/// mid-stream modeset the gate exists to prevent.
+///
+/// 1. **Reader vs writer, within one slot.** Handled by a real seqlock:
+///    [`CommittedSlot::version`], even/odd, written around every payload
+///    change and validated by the reader before and after. The version is a
+///    counter and NOT the monitor handle, which is what the first cut used:
+///    a slot rewritten with the same handle (the same display committing
+///    again — the commonest case there is) passes a handle-based
+///    before/after check while the payload changes underneath it, pairing a
+///    size from one commit with a refresh rate from the next.
+/// 2. **Writer vs writer.** [`apply`](Self::apply) and
+///    [`forget`](Self::forget) both rewrite the array, and they run on
+///    unrelated threads: modeset callbacks, `evt_d0_exit`'s power callback,
+///    the effects worker's plug/unplug. Two of them interleaving would
+///    leave a mixture of two path sets that no commit ever produced. A
+///    lock is not available here (callback frame), so they take a
+///    non-blocking writer token instead, and a writer that cannot get it
+///    does not wait, does not write, and marks the record CONTENDED — the
+///    holder then clears everything rather than publishing a maybe-mixture.
+///    Clearing is the fail-open direction, so the worst case of losing this
+///    race is a push that goes through exactly as it did in build 16.
 pub struct CommittedPaths {
     slots: [CommittedSlot; MAX_COMMITTED_PATHS],
-    /// Active paths in the last commit (may exceed the slots recorded).
+    /// Active paths in the last commit, which MAY exceed the number of
+    /// slots recorded — `evt_commit_modes2` counts every active path it was
+    /// handed and passes that total, so a commit wider than the array is
+    /// reported honestly instead of silently truncated.
     active: AtomicU32,
-    /// Commits observed. Diagnostics only — a trace showing a push
-    /// refused at [`stage::GATES_COMMITTED`] can be read against the
-    /// commit that set it.
+    /// Commits observed. Two jobs: diagnostics (a trace showing a push
+    /// refused at [`stage::GATES_COMMITTED`] can be read against the commit
+    /// that set it), and the validity token behind
+    /// [`committed_token`] — a remembered refusal is only evidence while
+    /// this has not moved.
     generation: AtomicU64,
+    /// Writer token: true while a writer owns the array.
+    writing: AtomicBool,
+    /// A writer arrived while the token was held and dropped its update.
+    /// The token holder clears the record on its way out rather than leave
+    /// a state that may be a mixture of two path sets.
+    contended: AtomicBool,
 }
 
 struct CommittedSlot {
-    /// The `IDDCX_MONITOR` handle as an integer. 0 = empty. Written LAST
-    /// (release) and re-read by the reader to validate the payload.
+    /// Seqlock version: even = stable, odd = a write in progress. Read by
+    /// [`CommittedPaths::get`] before and after the payload.
+    version: AtomicU32,
+    /// The `IDDCX_MONITOR` handle as an integer. 0 = empty.
     monitor: AtomicU64,
     /// `(width << 32) | height`.
     size: AtomicU64,
@@ -272,10 +371,70 @@ struct CommittedSlot {
 impl CommittedSlot {
     const fn new() -> Self {
         Self {
+            version: AtomicU32::new(0),
             monitor: AtomicU64::new(0),
             size: AtomicU64::new(0),
             refresh_millihz: AtomicU32::new(0),
         }
+    }
+
+    /// Publish one (monitor, mode) pairing, or clear the slot when
+    /// `monitor` is 0. Caller holds the writer token, so this is the only
+    /// writer; the odd/even fence pair is what a concurrent READER needs.
+    fn publish(&self, monitor: u64, mode: CommittedMode) {
+        let v = self.version.load(Ordering::Relaxed);
+        // Odd: readers that see this discard whatever they read.
+        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        // Release fence: the odd version is visible before any payload
+        // store that follows, so a reader can never see new payload under
+        // an even version.
+        fence(Ordering::Release);
+        self.monitor.store(monitor, Ordering::Relaxed);
+        self.size.store((u64::from(mode.width) << 32) | u64::from(mode.height), Ordering::Relaxed);
+        self.refresh_millihz.store(mode.refresh_millihz, Ordering::Relaxed);
+        // Even again, with release ordering so the payload above
+        // happens-before any reader that observes this version.
+        self.version.store(v.wrapping_add(2), Ordering::Release);
+    }
+
+    fn clear(&self) {
+        self.publish(0, CommittedMode { width: 0, height: 0, refresh_millihz: 0 });
+    }
+
+    /// One bounded seqlock read. `None` means "empty, or being written" —
+    /// both of which the caller treats as no committed mode.
+    fn read(&self) -> Option<(u64, CommittedMode)> {
+        for _ in 0..READ_RETRIES {
+            let before = self.version.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                // A write is in progress. Try again rather than reading a
+                // half-written slot; bounded, because nothing in a driver
+                // spins without a limit.
+                continue;
+            }
+            let monitor = self.monitor.load(Ordering::Relaxed);
+            let size = self.size.load(Ordering::Relaxed);
+            let refresh_millihz = self.refresh_millihz.load(Ordering::Relaxed);
+            // Acquire fence: the payload loads above are ordered before the
+            // version load below, so an equal version really does mean
+            // nothing changed while they happened.
+            fence(Ordering::Acquire);
+            if self.version.load(Ordering::Relaxed) != before {
+                continue;
+            }
+            if monitor == 0 {
+                return None;
+            }
+            return Some((
+                monitor,
+                CommittedMode {
+                    width: (size >> 32) as u32,
+                    height: size as u32,
+                    refresh_millihz,
+                },
+            ));
+        }
+        None
     }
 }
 
@@ -285,13 +444,63 @@ impl Default for CommittedPaths {
     }
 }
 
+/// The writer token of a [`CommittedPaths`], released on drop so every
+/// return path (and any future `?`) puts it back.
+struct WriteToken<'a>(&'a CommittedPaths);
+
+impl Drop for WriteToken<'_> {
+    fn drop(&mut self) {
+        self.0.writing.store(false, Ordering::Release);
+    }
+}
+
 impl CommittedPaths {
     pub const fn new() -> Self {
         Self {
             slots: [const { CommittedSlot::new() }; MAX_COMMITTED_PATHS],
             active: AtomicU32::new(0),
             generation: AtomicU64::new(0),
+            writing: AtomicBool::new(false),
+            contended: AtomicBool::new(false),
         }
+    }
+
+    /// Take the writer token, or record that we could not and give up.
+    ///
+    /// Never waits: the callers include a modeset callback frame, where a
+    /// wait of any length is a display change we might wedge. A writer that
+    /// loses simply does not write — its update is dropped, and the flag it
+    /// leaves makes the winner clear the record instead of publishing
+    /// something that might be half of each.
+    fn begin_write(&self) -> Option<WriteToken<'_>> {
+        if self
+            .writing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.contended.store(true, Ordering::Release);
+            // Bump anyway: the record is now known to be unreliable, and
+            // the generation is what expires cached refusals built on it.
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(WriteToken(self))
+    }
+
+    /// Finish a write: if anyone was turned away while we held the token,
+    /// clear the whole record rather than serve a path set that may be a
+    /// mixture. Returns the number of paths still recorded.
+    fn end_write(&self, recorded: u32) -> u32 {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if self.contended.swap(false, Ordering::AcqRel) {
+            for slot in &self.slots {
+                slot.clear();
+            }
+            self.active.store(0, Ordering::Release);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            return 0;
+        }
+        recorded
     }
 
     /// Replace the whole record with the ACTIVE paths of one commit.
@@ -301,44 +510,58 @@ impl CommittedPaths {
     /// monitor with no committed mode, and remembering a stale one would
     /// refuse pushes forever after a display was turned off.
     ///
-    /// Returns the number of paths recorded.
-    pub fn apply(&self, paths: &[(u64, CommittedMode)]) -> u32 {
-        // Invalidate every key first: a reader racing this sees "no
-        // committed mode" for an instant, which allows a push it might
-        // otherwise refuse. That is the safe direction to lose (it is what
-        // the driver did for its whole life before this) and it is the only
-        // way to clear departed monitors without a second pass.
-        for slot in &self.slots {
-            slot.monitor.store(0, Ordering::Release);
-        }
-        let recorded = paths.len().min(MAX_COMMITTED_PATHS);
-        for (slot, (monitor, mode)) in self.slots.iter().zip(&paths[..recorded]) {
-            if *monitor == 0 {
-                continue;
+    /// `active_total` is how many ACTIVE paths that commit carried, which
+    /// may be more than fits: the count is reported (and traced) honestly
+    /// while only `MAX_COMMITTED_PATHS` are recorded.
+    ///
+    /// Every slot is visited exactly once, whether it is being written or
+    /// cleared. The first cut cleared all the keys and then filled the
+    /// front of the array, which meant a slot could be written twice per
+    /// commit and left a window in which a monitor that WAS committed read
+    /// as uncommitted for no reason.
+    ///
+    /// Returns the number of paths recorded (0 if the write was abandoned).
+    pub fn apply(&self, paths: &[(u64, CommittedMode)], active_total: u32) -> u32 {
+        let Some(_token) = self.begin_write() else {
+            return 0;
+        };
+        let mut recorded = 0u32;
+        for (i, slot) in self.slots.iter().enumerate() {
+            match paths.get(i) {
+                Some(&(monitor, mode)) if monitor != 0 => {
+                    slot.publish(monitor, mode);
+                    recorded += 1;
+                }
+                _ => slot.clear(),
             }
-            slot.size
-                .store((u64::from(mode.width) << 32) | u64::from(mode.height), Ordering::Release);
-            slot.refresh_millihz.store(mode.refresh_millihz, Ordering::Release);
-            // Key LAST: the payload above happens-before any reader that
-            // observes this store.
-            slot.monitor.store(*monitor, Ordering::Release);
         }
-        self.active.store(paths.len() as u32, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        recorded as u32
+        self.active.store(active_total, Ordering::Release);
+        self.end_write(recorded)
     }
 
     /// Forget one monitor — it departed, so whatever it had committed is
     /// gone with it and the handle may be reissued to a different monitor.
+    ///
+    /// Takes the writer token like [`apply`](Self::apply): it is a
+    /// read-modify-write of the same array, and interleaving it with a
+    /// commit could clear a slot the commit had just refilled with a
+    /// DIFFERENT monitor's mode.
     pub fn forget(&self, monitor: u64) {
         if monitor == 0 {
             return;
         }
+        let Some(_token) = self.begin_write() else {
+            return;
+        };
+        let mut recorded = 0u32;
         for slot in &self.slots {
-            if slot.monitor.load(Ordering::Acquire) == monitor {
-                slot.monitor.store(0, Ordering::Release);
+            match slot.read() {
+                Some((m, _)) if m == monitor => slot.clear(),
+                Some(_) => recorded += 1,
+                None => {}
             }
         }
+        self.end_write(recorded);
     }
 
     /// The mode the OS has committed on `monitor`, if any.
@@ -346,33 +569,29 @@ impl CommittedPaths {
         if monitor == 0 {
             return None;
         }
-        for slot in &self.slots {
-            for _ in 0..READ_RETRIES {
-                if slot.monitor.load(Ordering::Acquire) != monitor {
-                    break;
-                }
-                let size = slot.size.load(Ordering::Acquire);
-                let refresh_millihz = slot.refresh_millihz.load(Ordering::Acquire);
-                // Re-read the key: if the slot was rewritten under us, the
-                // payload above may belong to two different commits.
-                if slot.monitor.load(Ordering::Acquire) == monitor {
-                    return Some(CommittedMode {
-                        width: (size >> 32) as u32,
-                        height: size as u32,
-                        refresh_millihz,
-                    });
-                }
-            }
-        }
-        None
+        self.slots.iter().find_map(|slot| match slot.read() {
+            Some((m, mode)) if m == monitor => Some(mode),
+            _ => None,
+        })
     }
 
-    /// Active paths in the last commit. Diagnostics.
+    /// The committed mode plus the token that says how long the answer is
+    /// good for. The generation is read FIRST, so a commit racing this read
+    /// can only make the token look OLDER than the mode it accompanies —
+    /// which expires a refusal built on it early (one extra push, and the
+    /// truth is re-derived) instead of keeping a stale refusal alive.
+    pub fn get_with_token(&self, monitor: u64) -> (Option<CommittedMode>, u64) {
+        let token = self.generation();
+        (self.get(monitor), token)
+    }
+
+    /// Active paths in the last commit, which may exceed the number of
+    /// slots recorded. Diagnostics.
     pub fn active(&self) -> u32 {
         self.active.load(Ordering::Acquire)
     }
 
-    /// Commits observed. Diagnostics.
+    /// Commits observed, and the validity token for a remembered refusal.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -387,14 +606,33 @@ impl CommittedPaths {
 pub enum LiveGate {
     /// Publish it.
     Push,
+    /// Publish it — but the OS has committed a mode this monitor's superset
+    /// does not describe, so the committed-mode rule could not be applied.
+    /// This is the deliberate FAIL-OPEN case (see [`live_gate`]); it is a
+    /// distinct variant purely so the push site can say so in a trace,
+    /// because a gate silently declining to fire looks exactly like a gate
+    /// that had nothing to do.
+    PushCommittedUnrecognised(CommittedMode),
     /// A target has no counterpart in this monitor's frozen description.
     /// The OS could never surface it (Windows offers the INTERSECTION), and
     /// publishing it would be invisible to the user and inexplicable in a
     /// trace.
     NotInSuperset,
     /// The list would gate out the mode the OS has COMMITTED on this
-    /// monitor.
-    EvictsCommitted(CommittedMode),
+    /// monitor. `superset_idx` is that mode's index in the monitor's frozen
+    /// description — the same list, in the same order, the host sent at
+    /// `CREATE_MONITOR` — which is how the refusal tells the host WHICH
+    /// mode is in the way instead of only that something is.
+    EvictsCommitted { committed: CommittedMode, superset_idx: u32 },
+}
+
+impl LiveGate {
+    /// Does this verdict allow the push? True for both push variants, so a
+    /// call site cannot accidentally treat the fail-open case as a refusal
+    /// (or forget it exists when a new variant is added).
+    pub fn pushes(self) -> bool {
+        matches!(self, LiveGate::Push | LiveGate::PushCommittedUnrecognised(_))
+    }
 }
 
 /// Decide whether a validated target list may be pushed at a live monitor.
@@ -425,8 +663,11 @@ pub enum LiveGate {
 /// superset actually describes. If the OS committed something we cannot
 /// recognise — a decoding mismatch, a mode from a monitor object we are
 /// not tracking — the push proceeds exactly as it did before this gate
-/// existed, and the trace says so. A gate that fired on an unrecognised
-/// commit would silently turn the whole feature off.
+/// existed, and the trace says so
+/// ([`PushCommittedUnrecognised`](LiveGate::PushCommittedUnrecognised),
+/// which the push site emits: the claim that it is traced was in this
+/// comment one review pass before the event was). A gate that fired on an
+/// unrecognised commit would silently turn the whole feature off.
 pub fn live_gate(
     superset: &[Mode],
     targets: &[Mode],
@@ -441,12 +682,29 @@ pub fn live_gate(
         return LiveGate::NotInSuperset;
     }
     if let Some(committed) = committed {
-        let ours = superset.iter().any(|m| committed.is(m));
-        if ours && !targets.iter().any(|m| committed.is(m)) {
-            return LiveGate::EvictsCommitted(committed);
+        match superset_index_of(superset, committed) {
+            Some(superset_idx) => {
+                if !targets.iter().any(|m| committed.is(m)) {
+                    return LiveGate::EvictsCommitted { committed, superset_idx };
+                }
+            }
+            // Fail open, and say so.
+            None => return LiveGate::PushCommittedUnrecognised(committed),
         }
     }
     LiveGate::Push
+}
+
+/// Where `committed` sits in the monitor's frozen description, if it is one
+/// of its modes.
+///
+/// The index — not the mode — is what travels to the host, because
+/// `UpdateModesReply` may never grow and has exactly one spare word. It
+/// costs nothing in precision: the superset IS the list the host sent at
+/// `CREATE_MONITOR`, in that order, so an index names a mode the host
+/// already has in hand.
+pub fn superset_index_of(superset: &[Mode], committed: CommittedMode) -> Option<u32> {
+    superset.iter().position(|m| committed.is(m)).map(|i| i as u32)
 }
 
 /// The `PreferredMonitorModeIdx` to report from the parse-description DDIs.
@@ -485,6 +743,11 @@ mod tests {
     const CAPS: u32 = caps::MULTI_MODE | caps::DYNAMIC_MODES;
     const BASE: u32 = 120_000;
     const DOUBLED: u32 = 240_000;
+    /// A stand-in commit generation. These tests drive the table directly,
+    /// so nothing is committing anything; what matters is that a request
+    /// and the refusal it is measured against carry the SAME token, which
+    /// is exactly the field's contract.
+    const TOKEN: u64 = 7;
 
     fn mode(refresh_millihz: u32) -> Mode {
         Mode {
@@ -555,7 +818,7 @@ mod tests {
 
         // The host gates down to the doubled rate while the session is
         // parked in a TDR duck-out.
-        let update = t.update_modes(1, &[spec(DOUBLED)], CAPS).expect("accepted");
+        let update = t.update_modes(1, &[spec(DOUBLED)], CAPS, TOKEN).expect("accepted");
         let seq = update.queued.expect("a real change queues a push");
 
         // The shell's parked arm: decide, patch the parked spec, settle.
@@ -579,7 +842,8 @@ mod tests {
         // queues a real push; with it left behind, `update_modes` matches
         // the stale durable list, returns "already published", emits no
         // effect — and the monitor offers the gated subset forever.
-        let rescind = t.update_modes(1, &[spec(BASE), spec(DOUBLED)], CAPS).expect("accepted");
+        let rescind =
+            t.update_modes(1, &[spec(BASE), spec(DOUBLED)], CAPS, TOKEN).expect("accepted");
         assert!(
             rescind.queued.is_some(),
             "rescinding a gate the driver applied must push, not short-circuit"
@@ -597,6 +861,7 @@ mod tests {
     /// what the monitor publishes.
     #[test]
     fn outcomes_that_changed_nothing_do_not_commit() {
+        let committed = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
         for outcome in [
             PushOutcome::Deferred { stage: stage::DUCK_PENDING, count: 1 },
             PushOutcome::Deferred { stage: stage::NO_ADAPTER, count: 1 },
@@ -607,7 +872,7 @@ mod tests {
                 rolled_back: true,
             },
             PushOutcome::Failed {
-                stage: stage::GATES_COMMITTED,
+                stage: stage::NOT_IN_SUPERSET,
                 code: luminal_driver_proto::err::BAD_MODE,
                 count: 1,
                 rolled_back: false,
@@ -615,7 +880,19 @@ mod tests {
         ] {
             assert!(!outcome.commits(), "{outcome:?}");
             assert_eq!(outcome.settle_result(), ModeUpdateResult::NotApplied, "{outcome:?}");
+            assert!(outcome.retryable(), "{outcome:?}");
         }
+        // The refusal changes nothing either — but it is the one outcome
+        // that must NOT settle as an ordinary not-applied, because that is
+        // the state the host is told to retry out of.
+        let blocked =
+            PushOutcome::Blocked { committed, superset_idx: 3, token: 9, count: 1 };
+        assert!(!blocked.commits());
+        assert!(!blocked.retryable());
+        assert_eq!(
+            blocked.settle_result(),
+            ModeUpdateResult::Blocked { superset_idx: 3, token: 9 }
+        );
         for outcome in [
             PushOutcome::Applied { published: 1, superset: 2 },
             PushOutcome::AppliedParked { published: 1, superset: 2 },
@@ -666,10 +943,13 @@ mod tests {
         let superset = vec![mode(BASE), mode(DOUBLED)];
         let committed = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
 
-        // Gating down to the doubled rate alone would evict it.
+        // Gating down to the doubled rate alone would evict it — and the
+        // verdict names WHERE the blocking mode sits in the create-time
+        // list, which is what the host is told so it can pick a different
+        // subset instead of retrying the same one.
         assert_eq!(
             live_gate(&superset, &[mode(DOUBLED)], Some(committed)),
-            LiveGate::EvictsCommitted(committed),
+            LiveGate::EvictsCommitted { committed, superset_idx: 0 },
             "gating out the committed mode must be refused, not pushed blind"
         );
 
@@ -682,17 +962,140 @@ mod tests {
         // Nothing committed (never activated, or the path went inactive):
         // gating is unconstrained.
         assert_eq!(live_gate(&superset, &[mode(DOUBLED)], None), LiveGate::Push);
+        // The index is of the committed mode, wherever it sits.
+        let doubled_committed =
+            CommittedMode { width: 2560, height: 1440, refresh_millihz: DOUBLED };
+        assert_eq!(
+            live_gate(&superset, &[mode(BASE)], Some(doubled_committed)),
+            LiveGate::EvictsCommitted { committed: doubled_committed, superset_idx: 1 }
+        );
     }
 
     /// Fail-open: a committed mode this monitor's superset does not
     /// describe cannot be reasoned about, so the push proceeds exactly as
     /// it did before the gate existed. A gate that fired here would turn
     /// the feature off system-wide on any decoding mismatch.
+    ///
+    /// It is REPORTED as its own verdict, though. "Gate declined to fire
+    /// because it could not read the commit" and "gate had nothing to do"
+    /// are the same push with completely different diagnoses, and the push
+    /// site traces the difference.
     #[test]
-    fn an_unrecognised_committed_mode_never_refuses_a_push() {
+    fn an_unrecognised_committed_mode_never_refuses_a_push_but_is_still_reported() {
         let superset = vec![mode(BASE), mode(DOUBLED)];
         let alien = CommittedMode { width: 1920, height: 1080, refresh_millihz: 60_000 };
-        assert_eq!(live_gate(&superset, &[mode(DOUBLED)], Some(alien)), LiveGate::Push);
+        let gate = live_gate(&superset, &[mode(DOUBLED)], Some(alien));
+        assert_eq!(gate, LiveGate::PushCommittedUnrecognised(alien));
+        assert!(gate.pushes(), "fail-open: the push still goes ahead");
+        assert!(LiveGate::Push.pushes());
+        assert!(!LiveGate::NotInSuperset.pushes());
+        assert!(!LiveGate::EvictsCommitted { committed: alien, superset_idx: 0 }.pushes());
+        assert_eq!(superset_index_of(&superset, alien), None);
+    }
+
+    /// THE REGRESSION TEST for the retry loop.
+    ///
+    /// The refusal is asynchronous — the IRP completes long before the
+    /// effects worker pushes — so the ONLY request that can ever be told
+    /// about it is a later one. Build 17 settled it as an ordinary
+    /// `NotApplied`: sticky `UPDATE_FAILED`, whose documented meaning is
+    /// "the previous list is still in force and this request is fully
+    /// retryable — resending it really does push again". A host doing
+    /// exactly that got its request queued, refused for the same reason,
+    /// and told the same thing, forever.
+    ///
+    /// What the fix owes the host is two facts the wire could not carry:
+    /// that the refusal is PERMANENT while that mode stays committed, and
+    /// WHICH mode it is, so a different subset can be chosen instead of
+    /// guessed at.
+    #[test]
+    fn a_refused_push_tells_the_host_it_is_permanent_and_which_mode_blocked_it() {
+        let mut t = table_with_both_rates();
+        let superset: Vec<Mode> = t.get(1).unwrap().modes.clone();
+        // The OS is running the base rate on this display.
+        let committed = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+
+        // The host gates down to the doubled rate. Accepted and queued —
+        // the driver cannot know yet, and says so with `pending`.
+        let first = t.update_modes(1, &[spec(DOUBLED)], CAPS, TOKEN).expect("accepted");
+        let seq = first.queued.expect("a real change queues a push");
+        assert_eq!(first.blocked, None, "nothing has been tried yet");
+
+        // The effects worker gets there and the gate refuses: publishing
+        // {240} would evict the committed 120 and make Windows re-select on
+        // the only active display, mid-stream.
+        let gate = live_gate(&superset, &first.targets, Some(committed));
+        let LiveGate::EvictsCommitted { committed, superset_idx } = gate else {
+            panic!("expected a refusal, got {gate:?}");
+        };
+        let outcome = PushOutcome::Blocked { committed, superset_idx, token: TOKEN, count: 1 };
+        assert!(!outcome.retryable(), "THE property the wire has to carry");
+        assert!(!outcome.commits(), "and a refusal still changes nothing");
+        assert!(t.settle_modes(1, seq, outcome.settle_result()));
+
+        // Constraint 1: the PUSH was refused, not the session. The list in
+        // force is untouched and the monitor carries on.
+        let m = t.get(1).unwrap();
+        assert_eq!(m.target_modes, vec![mode(BASE), mode(DOUBLED)]);
+        // The sticky code a host polling GET_STATUS reads is distinct from
+        // the retryable one — the first of the two channels.
+        assert_eq!(m.last_error, luminal_driver_proto::err::MODE_COMMITTED);
+        assert_ne!(
+            luminal_driver_proto::err::MODE_COMMITTED,
+            luminal_driver_proto::err::UPDATE_FAILED
+        );
+
+        // THE CONSEQUENCE. The host retries the identical request — the one
+        // thing `UPDATE_FAILED` told it to do. Before the fix this queued a
+        // second push, which was refused identically, which told it to
+        // retry: the loop. Now it is answered from the refusal itself.
+        let retry = t.update_modes(1, &[spec(DOUBLED)], CAPS, TOKEN).expect("answered");
+        assert_eq!(retry.blocked, Some(0), "and names create-time mode 0 as the blocker");
+        assert_eq!(
+            superset[retry.blocked.unwrap() as usize],
+            mode(BASE),
+            "which is the mode the OS is running — the host can now ask for a subset with it"
+        );
+        assert!(retry.queued.is_none(), "no second push: it could only be refused again");
+        assert_eq!(retry.targets, vec![mode(BASE), mode(DOUBLED)], "still what is in force");
+
+        // And the way out is open: a subset that KEEPS the committed mode
+        // is a different question, and pushes for real.
+        let narrower = t.update_modes(1, &[spec(BASE)], CAPS, TOKEN).expect("accepted");
+        assert_eq!(narrower.blocked, None);
+        assert!(narrower.queued.is_some(), "gating is still possible — just not over the OS");
+        assert_eq!(live_gate(&superset, &narrower.targets, Some(committed)), LiveGate::Push);
+    }
+
+    /// A remembered refusal is evidence about what the OS is running, so it
+    /// expires the moment anything commits. Otherwise the loop-breaker
+    /// becomes its own bug: a host that legitimately moved the display onto
+    /// the mode it wanted (`SetDisplayConfig`, which is the documented way
+    /// out) would be refused for a mode that is no longer committed.
+    #[test]
+    fn a_remembered_refusal_expires_when_anything_commits() {
+        let mut t = table_with_both_rates();
+        let seq = t
+            .update_modes(1, &[spec(DOUBLED)], CAPS, TOKEN)
+            .expect("accepted")
+            .queued
+            .expect("queued");
+        assert!(t.settle_modes(
+            1,
+            seq,
+            ModeUpdateResult::Blocked { superset_idx: 0, token: TOKEN }
+        ));
+        assert_eq!(
+            t.update_modes(1, &[spec(DOUBLED)], CAPS, TOKEN).unwrap().blocked,
+            Some(0),
+            "same world, same answer"
+        );
+
+        // A modeset happened: the token moves, so the cached refusal is no
+        // longer evidence of anything and the request pushes for real.
+        let after = t.update_modes(1, &[spec(DOUBLED)], CAPS, TOKEN + 1).expect("accepted");
+        assert_eq!(after.blocked, None);
+        assert!(after.queued.is_some(), "re-derive the truth rather than trust a stale refusal");
     }
 
     /// The superset check still comes first: it is the invariant that keeps
@@ -736,21 +1139,76 @@ mod tests {
         let b = CommittedMode { width: 3840, height: 2160, refresh_millihz: 60_000 };
         assert_eq!(paths.get(0x11), None, "nothing committed yet");
 
-        assert_eq!(paths.apply(&[(0x11, a), (0x22, b)]), 2);
+        assert_eq!(paths.apply(&[(0x11, a), (0x22, b)], 2), 2);
         assert_eq!(paths.get(0x11), Some(a));
         assert_eq!(paths.get(0x22), Some(b));
         assert_eq!(paths.active(), 2);
 
         // Second display turned off: only one path comes back.
-        paths.apply(&[(0x11, b)]);
+        paths.apply(&[(0x11, b)], 1);
         assert_eq!(paths.get(0x11), Some(b), "same monitor, new mode");
         assert_eq!(paths.get(0x22), None, "a monitor that left the path set has nothing committed");
 
         // Every path inactive: the whole record clears.
-        paths.apply(&[]);
+        paths.apply(&[], 0);
         assert_eq!(paths.get(0x11), None);
         assert_eq!(paths.active(), 0);
-        assert_eq!(paths.generation(), 3);
+        assert!(paths.generation() >= 3, "every commit moves the token");
+    }
+
+    /// A monitor re-committing the SAME handle with a DIFFERENT mode is the
+    /// commonest write there is (a rate change on the one active display),
+    /// and it is exactly the case the first cut's validation could not
+    /// catch: the handle was both key and sequence, so a reader that saw it
+    /// before and after a rewrite concluded nothing had changed while the
+    /// payload had. Whatever a read returns must be a pairing some commit
+    /// actually made.
+    #[test]
+    fn a_rewrite_that_restores_the_same_key_is_still_detected() {
+        let paths = CommittedPaths::new();
+        let a = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+        let b = CommittedMode { width: 3840, height: 2160, refresh_millihz: DOUBLED };
+        paths.apply(&[(0x11, a)], 1);
+        for _ in 0..64 {
+            paths.apply(&[(0x11, b)], 1);
+            assert_eq!(paths.get(0x11), Some(b));
+            paths.apply(&[(0x11, a)], 1);
+            let read = paths.get(0x11).expect("committed");
+            // Never a mixture: 2560x1440@240 or 3840x2160@120 would both be
+            // modes nobody ever committed, and both would be compared
+            // against the superset to decide whether to refuse a push.
+            assert!(read == a || read == b, "torn read: {read:?}");
+            assert_eq!(read, a);
+        }
+    }
+
+    /// Two writers must never interleave into one record. They cannot be
+    /// serialised by waiting (a commit is a callback frame), so the loser
+    /// drops its update and the record is CLEARED rather than left as a
+    /// possible mixture of two path sets — the fail-open direction, i.e.
+    /// exactly the pre-gate behaviour.
+    #[test]
+    fn a_lost_writer_clears_the_record_instead_of_mixing_two_commits() {
+        let paths = CommittedPaths::new();
+        let a = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+        let b = CommittedMode { width: 3840, height: 2160, refresh_millihz: 60_000 };
+        paths.apply(&[(0x11, a)], 1);
+        assert_eq!(paths.get(0x11), Some(a));
+
+        // Simulate the interleave the token prevents: enter a write, and
+        // have a second writer arrive while it is held.
+        let token = paths.begin_write().expect("uncontended");
+        assert_eq!(paths.apply(&[(0x22, b)], 1), 0, "the loser writes nothing");
+        let recorded = paths.end_write(1);
+        drop(token);
+        assert_eq!(recorded, 0, "and the holder clears rather than publish a mixture");
+        assert_eq!(paths.get(0x11), None, "no committed mode ⇒ pushes proceed as before");
+        assert_eq!(paths.get(0x22), None, "and the loser's paths never landed either");
+        assert_eq!(paths.active(), 0);
+
+        // Recovery is the next commit, like every other clear.
+        paths.apply(&[(0x11, b)], 1);
+        assert_eq!(paths.get(0x11), Some(b));
     }
 
     /// A departed monitor's handle can be reissued to a different monitor
@@ -761,7 +1219,7 @@ mod tests {
         let paths = CommittedPaths::new();
         let a = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
         let b = CommittedMode { width: 3840, height: 2160, refresh_millihz: 60_000 };
-        paths.apply(&[(0x11, a), (0x22, b)]);
+        paths.apply(&[(0x11, a), (0x22, b)], 2);
         paths.forget(0x11);
         assert_eq!(paths.get(0x11), None);
         assert_eq!(paths.get(0x22), Some(b));
@@ -775,14 +1233,24 @@ mod tests {
     /// More paths than slots records what fits and never writes out of
     /// bounds — unreachable while the session cap equals the slot count,
     /// which is exactly why it is asserted here rather than assumed.
+    ///
+    /// The count of ACTIVE paths is reported in full even so. It is the
+    /// caller's count, not the array's: `active()` is what
+    /// `UpdateModesGatesCommitted` reports as `active_paths`, and the fact
+    /// that a refusal happened while N displays were active is the whole
+    /// point of the field. Deriving it from the truncated record — which is
+    /// what the first cut did, making the documented "may exceed the slots
+    /// recorded" unreachable — would understate exactly the case worth
+    /// seeing.
     #[test]
-    fn more_paths_than_slots_is_bounded() {
+    fn more_paths_than_slots_is_bounded_but_the_active_count_is_not_truncated() {
         let paths = CommittedPaths::new();
         let m = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
         let many: Vec<(u64, CommittedMode)> =
             (1..=(MAX_COMMITTED_PATHS as u64 + 4)).map(|i| (i, m)).collect();
-        assert_eq!(paths.apply(&many), MAX_COMMITTED_PATHS as u32);
+        assert_eq!(paths.apply(&many, many.len() as u32), MAX_COMMITTED_PATHS as u32);
         assert_eq!(paths.active(), many.len() as u32);
+        assert!(paths.active() > MAX_COMMITTED_PATHS as u32);
         assert_eq!(paths.get(1), Some(m));
         assert_eq!(paths.get(MAX_COMMITTED_PATHS as u64), Some(m));
         assert_eq!(paths.get(MAX_COMMITTED_PATHS as u64 + 1), None);

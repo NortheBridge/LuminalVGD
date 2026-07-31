@@ -85,6 +85,19 @@ pub struct Monitor {
     /// [`settle_modes`](SessionTable::settle_modes) confirms the push is
     /// what makes a retry re-push.
     pub pending_targets: Option<PendingTargets>,
+    /// The last target selection this monitor's push was PERMANENTLY
+    /// refused for, because publishing it would have gated out the mode the
+    /// OS has committed (build 17, review pass 2).
+    ///
+    /// Kept so the refusal can be answered on the wire. The push happens on
+    /// the effects worker long after the IRP completed, so the request that
+    /// caused it can only ever be told "queued"; without this the host's
+    /// retry looks exactly like the first attempt, gets queued again,
+    /// refused again, and loops forever. With it, the retry is answered
+    /// immediately with `err::MODE_COMMITTED` and the index of the mode in
+    /// the way. Cleared the moment anything could change the answer — see
+    /// [`BlockedPush::token`].
+    pub blocked: Option<BlockedPush>,
     pub adapter_luid: u64,
     pub physical_width_mm: u32,
     pub physical_height_mm: u32,
@@ -142,6 +155,31 @@ pub struct PendingTargets {
     pub targets: Vec<Mode>,
 }
 
+/// A target selection whose push was refused because it would have evicted
+/// the mode the OS has COMMITTED, kept so the next request for the same
+/// list can be answered instead of re-refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedPush {
+    /// The selection that was refused. Only a request resolving to exactly
+    /// this list is answered from here — anything else is a different
+    /// question (it may well keep the committed mode) and gets a real push.
+    pub targets: Vec<Mode>,
+    /// Index into [`Monitor::modes`] — the create-time superset, in the
+    /// order the host sent it — of the committed mode that blocked it.
+    /// This is what the host needs in order to ask for a subset that keeps
+    /// that mode, rather than guessing.
+    pub superset_idx: u32,
+    /// Opaque validity token from the layer that knows what the OS has
+    /// committed (the driver passes its commit generation). A block is
+    /// honoured ONLY while the token still matches what the caller sees
+    /// now: the instant anything commits a mode anywhere, the answer might
+    /// have changed, so the block expires and the next request pushes for
+    /// real and finds out. Expiring early is the safe direction — it costs
+    /// one push, whereas an over-long block would refuse a request that is
+    /// now perfectly legal.
+    pub token: u64,
+}
+
 /// What the shell's `IddCxMonitorUpdateModes2` push did, reported back to
 /// the table by [`SessionTable::settle_modes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,7 +192,28 @@ pub enum ModeUpdateResult {
     /// discarded and the next identical request merges — and pushes —
     /// again. The distinction between "refused" and "never attempted" is
     /// an ETW stage, not a state change here: both mean *not applied*.
+    ///
+    /// **Retryable.** [`Blocked`](Self::Blocked) is the one outcome that is
+    /// not, and it is a separate variant for exactly that reason.
     NotApplied,
+    /// The push was refused before it was made, because the list would have
+    /// gated out the mode the OS has COMMITTED on this monitor — a modeset
+    /// on a live display, which is the one thing this feature must never
+    /// cause.
+    ///
+    /// Like `NotApplied` in every state sense: the pending list is
+    /// discarded and the previous list stays in force (constraint 1 — a
+    /// refused PUSH, never a refused session). Unlike it in the one sense
+    /// the host cares about: retrying the same list cannot help, so the
+    /// refusal is remembered in [`Monitor::blocked`] and the next request
+    /// for it is answered with `err::MODE_COMMITTED` and the blocking
+    /// mode's index instead of being queued into the same loop again.
+    Blocked {
+        /// Index into [`Monitor::modes`] of the committed mode.
+        superset_idx: u32,
+        /// Validity token — see [`BlockedPush::token`].
+        token: u64,
+    },
 }
 
 /// Driver-side outcome of an `UPDATE_MODES` request, everything the reply
@@ -192,6 +251,17 @@ pub struct ModeUpdate {
     /// nothing to activate. It is a refused REQUEST, never a failed
     /// session.
     pub refused: bool,
+    /// `Some(idx)` when this exact list has already been refused because it
+    /// would evict the mode the OS committed, and nothing has happened
+    /// since that could change that. `idx` indexes [`Monitor::modes`] — the
+    /// create-time list — and names the mode in the way.
+    ///
+    /// The caller answers `err::MODE_COMMITTED` with
+    /// `update_status::BLOCKED`, emits NO effect, and changes nothing:
+    /// pushing again would produce the same refusal and one more pointless
+    /// trip through the effects worker. `targets` is the list still in
+    /// force, as with every other refusal.
+    pub blocked: Option<u32>,
 }
 
 /// The monitor table plus its policy knobs.
@@ -383,6 +453,7 @@ impl SessionTable {
             target_modes: modes.clone(),
             modes,
             pending_targets: None,
+            blocked: None,
             adapter_luid,
             physical_width_mm: req.physical_width_mm,
             physical_height_mm: req.physical_height_mm,
@@ -450,12 +521,40 @@ impl SessionTable {
     /// resolved to "already published", produced no effect, and returned
     /// success — a permanent silent no-op with no way for the caller to
     /// recover.
+    ///
+    /// # Answering a refusal the caller already knows about
+    ///
+    /// Because the push is asynchronous, the ONLY request that can be told
+    /// about a refused push is a later one. A push refused for gating out
+    /// the OS's committed mode is remembered in [`Monitor::blocked`], and a
+    /// request resolving to that same list is answered from it —
+    /// `blocked: Some(idx)`, no effect, nothing changed — instead of being
+    /// queued into a push that would be refused for the same reason. That
+    /// is the difference between a host that stops (or asks for a different
+    /// subset) and a host that retries forever.
+    ///
+    /// `commit_token` is the caller's "what the OS has committed" version
+    /// stamp (the driver passes its commit generation, which every modeset
+    /// bumps). A remembered refusal is honoured only while the token still
+    /// matches the one it was recorded under; on any change it is dropped
+    /// and the request pushes for real. Callers with no such notion pass a
+    /// constant — the block then simply persists until superseded.
     pub fn update_modes(
         &mut self,
         session_id: u64,
         specs: &[ModeSpec],
         drv_caps: u32,
+        commit_token: u64,
     ) -> Result<ModeUpdate, CoreError> {
+        // Expire a stale block BEFORE anything reads it: it is a cached
+        // answer about a state of the world that has since moved on, and a
+        // cached refusal outliving its evidence is exactly the failure mode
+        // this whole mechanism exists to prevent, in mirror image.
+        if let Some(m) = self.monitors.get_mut(&session_id) {
+            if m.blocked.as_ref().is_some_and(|b| b.token != commit_token) {
+                m.blocked = None;
+            }
+        }
         let m = self.monitors.get(&session_id).ok_or(CoreError::NoSuchSession)?;
         // Monitor-wide depth/range, from the frozen superset — never from
         // the request, and never from the published subset (which is a
@@ -485,7 +584,29 @@ impl SessionTable {
                 queued: None,
                 pending: m.pending_targets.is_some(),
                 refused: true,
+                blocked: None,
             });
+        }
+        // Already refused, and nothing has committed since. Answer from the
+        // refusal rather than queueing a push that would be refused again:
+        // the list in force is unchanged, and the caller gets a code that
+        // says "permanent" plus the index of the mode in the way. Checked
+        // before the already-published short-circuit below only for
+        // ordering clarity — a blocked list can never BE the list in force,
+        // since the push that would have put it there is the one refused.
+        if let Some(b) = &m.blocked {
+            if b.targets == selection.targets {
+                return Ok(ModeUpdate {
+                    targets: m.target_modes.clone(),
+                    accepted: selection.accepted,
+                    rejected: selection.rejected,
+                    first_rejected: selection.first_rejected,
+                    queued: None,
+                    pending: m.pending_targets.is_some(),
+                    refused: false,
+                    blocked: Some(b.superset_idx),
+                });
+            }
         }
         if selection.targets == m.target_base() {
             // Already published (or already pending): pushing an
@@ -502,16 +623,20 @@ impl SessionTable {
                 queued: None,
                 pending: m.pending_targets.is_some(),
                 refused: false,
+                blocked: None,
             });
         }
         // Only mutate after every fallible step has passed, so a rejected
         // request leaves the session exactly as it was.
         self.update_seq += 1;
         let seq = self.update_seq;
-        self.monitors
-            .get_mut(&session_id)
-            .expect("looked up above")
-            .pending_targets = Some(PendingTargets { seq, targets: selection.targets.clone() });
+        let m = self.monitors.get_mut(&session_id).expect("looked up above");
+        m.pending_targets = Some(PendingTargets { seq, targets: selection.targets.clone() });
+        // A different list is being pushed, so whatever the last refusal
+        // was about is no longer the question being asked. Dropping it here
+        // (rather than only on expiry) keeps at most one remembered
+        // refusal, always the newest.
+        m.blocked = None;
         Ok(ModeUpdate {
             targets: selection.targets,
             accepted: selection.accepted,
@@ -520,6 +645,7 @@ impl SessionTable {
             queued: Some(seq),
             pending: true,
             refused: false,
+            blocked: None,
         })
     }
 
@@ -534,6 +660,10 @@ impl SessionTable {
     /// the monitor's sticky last error, which is what makes the next
     /// identical request resolve, queue, and genuinely re-push instead of
     /// collapsing into a success that means nothing.
+    /// [`Blocked`](ModeUpdateResult::Blocked) discards it too, but records
+    /// `err::MODE_COMMITTED` and remembers the selection: re-pushing THAT
+    /// list is precisely what must not keep happening, because the refusal
+    /// stands as long as the OS keeps running the mode it names.
     ///
     /// A stale `seq` — the session was destroyed and recreated, or a newer
     /// update superseded this one — settles nothing and is reported false.
@@ -562,9 +692,25 @@ impl SessionTable {
         match result {
             // Never empty: `update_modes` refuses an empty selection and
             // is the only producer of a pending list.
-            ModeUpdateResult::Applied => m.target_modes = pending.targets,
+            ModeUpdateResult::Applied => {
+                m.target_modes = pending.targets;
+                // Whatever was blocked, this monitor's published list just
+                // changed under it; the remembered refusal describes a
+                // question nobody is asking any more.
+                m.blocked = None;
+            }
             ModeUpdateResult::NotApplied => {
                 m.last_error = luminal_driver_proto::err::UPDATE_FAILED
+            }
+            // Same state change as NotApplied — previous list still in
+            // force — plus the two things that make the refusal answerable
+            // rather than merely repeatable: a distinct sticky code, so a
+            // host polling GET_STATUS can tell "permanent" from "try
+            // again", and the selection + blocking mode, so the next
+            // request for that same list is answered instead of re-pushed.
+            ModeUpdateResult::Blocked { superset_idx, token } => {
+                m.last_error = luminal_driver_proto::err::MODE_COMMITTED;
+                m.blocked = Some(BlockedPush { targets: pending.targets, superset_idx, token });
             }
         }
         true
@@ -713,6 +859,11 @@ mod tests {
     use luminal_driver_proto::{caps, ModeSpec, DEFAULT_MAX_MONITORS, DEFAULT_WATCHDOG_SECS};
 
     const CAPS: u32 = caps::HDR10 | caps::SDR10_BIT | caps::MULTI_MODE;
+    /// The commit token for tests that are not about the committed mode.
+    /// A constant is the honest value here: nothing is committing anything,
+    /// so "what the OS is running" never changes, and any remembered
+    /// refusal stays valid until something supersedes it.
+    const NO_COMMIT: u64 = 0;
 
     fn adapters() -> Vec<AdapterInfo> {
         vec![
@@ -931,7 +1082,7 @@ mod tests {
         // The motivating case: a framegen title launches, so publish ONLY
         // the doubled rate — which the monitor description already
         // describes, because the host created it that way.
-        let u = t.update_modes(1, &[DOUBLED], CAPS).unwrap();
+        let u = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
         assert_eq!((u.accepted, u.rejected, u.refused), (1, 0, false));
         assert_eq!(u.targets.len(), 1);
         let seq = u.queued.expect("a push is required");
@@ -951,12 +1102,12 @@ mod tests {
 
         // Idempotent: resending the published list is a no-op, not a
         // second push at the OS.
-        let u = t.update_modes(1, &[DOUBLED], CAPS).unwrap();
+        let u = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
         assert_eq!((u.targets.len(), u.queued, u.pending), (1, None, false));
 
         // ...and gating is reversible, which an append-only merge could
         // never be: publish the base rate again.
-        let u = t.update_modes(1, &[BASE], CAPS).unwrap();
+        let u = t.update_modes(1, &[BASE], CAPS, NO_COMMIT).unwrap();
         let seq = u.queued.expect("a real change");
         assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied));
         assert_eq!(t.get(1).unwrap().target_modes, vec![t.get(1).unwrap().modes[0]]);
@@ -975,7 +1126,7 @@ mod tests {
         let before = t.get(1).unwrap().target_modes.clone();
 
         // Partial: one entry exists, one does not.
-        let u = t.update_modes(1, &[DOUBLED, OUTSIDE], CAPS).unwrap();
+        let u = t.update_modes(1, &[DOUBLED, OUTSIDE], CAPS, NO_COMMIT).unwrap();
         assert_eq!((u.accepted, u.rejected, u.first_rejected), (1, 1, Some(1)));
         assert!(!u.refused, "what exists is still published");
         assert_eq!(u.targets.len(), 1);
@@ -989,7 +1140,7 @@ mod tests {
         // may never be emptied (IddCx.h:3594 TargetModeCount "cannot be
         // zero") and a monitor is never left with no targets.
         let published = t.get(1).unwrap().target_modes.clone();
-        let u = t.update_modes(1, &[OUTSIDE], CAPS).unwrap();
+        let u = t.update_modes(1, &[OUTSIDE], CAPS, NO_COMMIT).unwrap();
         assert!(u.refused);
         assert_eq!((u.accepted, u.rejected, u.first_rejected), (0, 1, Some(0)));
         assert_eq!(u.queued, None, "nothing may reach the OS");
@@ -1013,7 +1164,7 @@ mod tests {
         // Refused by the OS and never attempted (deferred) are the SAME
         // state change here — the ETW stage is what tells them apart —
         // which is exactly why a deferral is as retryable as a failure.
-        let first = t.update_modes(1, &[DOUBLED], CAPS).unwrap();
+        let first = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
         let seq = first.queued.expect("first request queues a push");
         assert!(t.settle_modes(1, seq, ModeUpdateResult::NotApplied));
         assert_eq!(t.get(1).unwrap().target_modes, before, "targets unchanged, carry on");
@@ -1025,7 +1176,7 @@ mod tests {
         );
 
         // The retry: a REAL second push, with a fresh id.
-        let retry = t.update_modes(1, &[DOUBLED], CAPS).unwrap();
+        let retry = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
         let retry_seq = retry.queued.expect("the retry must actually re-push");
         assert_ne!(retry_seq, seq);
         assert!(retry.pending);
@@ -1047,11 +1198,11 @@ mod tests {
         r.modes[2] = ModeSpec { width: 1280, height: 720, refresh_millihz: 60_000 };
         t.create(0, &r, CAPS, &adapters(), 0).unwrap();
 
-        let first = t.update_modes(1, &[DOUBLED], CAPS).unwrap().queued.unwrap();
+        let first = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap().queued.unwrap();
         // A second request SUPERSEDES the pending one (replace semantics):
         // the effects worker is serialized, so push #1 completes before
         // push #2 starts, and only the later settle decides the list.
-        let second = t.update_modes(1, &[BASE, DOUBLED], CAPS).unwrap();
+        let second = t.update_modes(1, &[BASE, DOUBLED], CAPS, NO_COMMIT).unwrap();
         let second_seq = second.queued.unwrap();
         assert_eq!(second.targets.len(), 2);
         assert_eq!(t.pending_targets(1).unwrap().len(), 2, "the pending selection was replaced");
@@ -1063,7 +1214,7 @@ mod tests {
 
         // Destroy + recreate the same session id, then settle the dead
         // update: the ids are table-wide and never reused, so it misses.
-        let third = t.update_modes(1, &[BASE], CAPS).unwrap().queued.unwrap();
+        let third = t.update_modes(1, &[BASE], CAPS, NO_COMMIT).unwrap().queued.unwrap();
         t.destroy(1).unwrap();
         t.create(0, &superset_req(1), CAPS, &adapters(), 0).unwrap();
         assert!(!t.settle_modes(1, third, ModeUpdateResult::Applied));
@@ -1081,18 +1232,18 @@ mod tests {
         let before = t.get(1).unwrap().target_modes.clone();
 
         // Unknown session.
-        assert_eq!(t.update_modes(99, &[DOUBLED], CAPS).err(), Some(CoreError::NoSuchSession));
+        assert_eq!(t.update_modes(99, &[DOUBLED], CAPS, NO_COMMIT).err(), Some(CoreError::NoSuchSession));
         // EMPTY LIST. `IDARG_IN_UPDATEMODES2.TargetModeCount` "cannot be
         // zero" (IddCx.h:3594): the target list can be replaced, never
         // emptied. Refused here, at the first gate, so nothing downstream
         // ever has to decide what an empty push means.
-        assert_eq!(t.update_modes(1, &[], CAPS).err(), Some(CoreError::BadMode));
+        assert_eq!(t.update_modes(1, &[], CAPS, NO_COMMIT).err(), Some(CoreError::BadMode));
         // Out-of-envelope entry: the whole request fails, nothing partial.
         let bad = [DOUBLED, ModeSpec { width: 3, height: 3, refresh_millihz: 1 }];
-        assert_eq!(t.update_modes(1, &bad, CAPS).err(), Some(CoreError::BadMode));
+        assert_eq!(t.update_modes(1, &bad, CAPS, NO_COMMIT).err(), Some(CoreError::BadMode));
         // Over the cap.
         let many = [ModeSpec { width: 1920, height: 1080, refresh_millihz: 30_000 }; 5];
-        assert_eq!(t.update_modes(1, &many, CAPS).err(), Some(CoreError::BadMode));
+        assert_eq!(t.update_modes(1, &many, CAPS, NO_COMMIT).err(), Some(CoreError::BadMode));
         assert_eq!(
             t.get(1).unwrap().target_modes,
             before,
@@ -1112,7 +1263,7 @@ mod tests {
         hdr.bit_depth = 110;
         hdr.hdr = 1;
         t.create(0, &hdr, CAPS, &adapters(), 0).unwrap();
-        let u = t.update_modes(1, &[DOUBLED], CAPS).unwrap();
+        let u = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
         assert_eq!(u.accepted, 1);
         assert!(u.queued.is_some());
         assert!(u.targets.iter().all(|m| m.hdr && m.bit_depth.as_raw() == 110));
@@ -1121,7 +1272,7 @@ mod tests {
         // longer validates, so the update fails cleanly instead of
         // downgrading the monitor's depth behind the host's back.
         assert_eq!(
-            t.update_modes(1, &[BASE], caps::MULTI_MODE).err(),
+            t.update_modes(1, &[BASE], caps::MULTI_MODE, NO_COMMIT).err(),
             Some(CoreError::HdrUnsupported)
         );
     }

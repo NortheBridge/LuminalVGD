@@ -309,6 +309,15 @@ pub struct VgdUpdateModesReply {
     /// [`VGD_NO_REJECTED_INDEX`] — so a caller can name the mode it
     /// cannot have instead of only counting it.
     pub first_rejected: u32,
+    /// With [`VGD_UPDATE_BLOCKED`] set: index into the mode list this
+    /// monitor was CREATED with, naming the mode the OS is currently
+    /// running and that this request would have taken away. Otherwise
+    /// [`VGD_NO_MODE_INDEX`].
+    ///
+    /// This is the one field that turns "no" into something actionable:
+    /// ask again with a subset that KEEPS this mode, or move the display
+    /// onto the mode you want first and gate afterwards.
+    pub blocking_mode: u32,
 }
 
 /// [`VgdUpdateModesReply::first_rejected`] when nothing was rejected.
@@ -328,8 +337,25 @@ pub const VGD_UPDATE_PENDING: u32 = 1;
 /// and can never be offered. Success with detail — everything that exists
 /// was published. See [`VgdUpdateModesReply::rejected`].
 pub const VGD_UPDATE_PARTIAL: u32 = 2;
+/// [`VgdUpdateModesReply::flags`]: **the request was refused permanently —
+/// do not retry it.** The list would have taken away the mode the OS is
+/// currently running on this display, which would force a mode change on a
+/// live monitor mid-stream, so the driver refused the push and left the
+/// previously offered list in force (`result` = `-14`).
+///
+/// Retrying is the one response that cannot work: the answer depends on
+/// what the display is running, not on the attempt. Read
+/// [`VgdUpdateModesReply::blocking_mode`] and either include that mode in
+/// the next request or change the display mode first.
+pub const VGD_UPDATE_BLOCKED: u32 = 4;
 const _: () = assert!(VGD_UPDATE_PENDING == luminal_driver_proto::update_status::PENDING);
 const _: () = assert!(VGD_UPDATE_PARTIAL == luminal_driver_proto::update_status::PARTIAL);
+const _: () = assert!(VGD_UPDATE_BLOCKED == luminal_driver_proto::update_status::BLOCKED);
+
+/// [`VgdUpdateModesReply::blocking_mode`] when nothing is blocking.
+/// Distinct from index 0, which names the monitor's first create-time mode.
+pub const VGD_NO_MODE_INDEX: u32 = u32::MAX;
+const _: () = assert!(VGD_NO_MODE_INDEX == luminal_driver_proto::NO_MODE_INDEX);
 
 /// Change WHICH of a LIVE monitor's create-time modes it currently
 /// offers — no destroy/create cycle, so no `DBT_DEVNODES_CHANGED`
@@ -360,6 +386,15 @@ const _: () = assert!(VGD_UPDATE_PARTIAL == luminal_driver_proto::update_status:
 /// - **Degrade, never refuse.** Treat both `VGD_ERR_IO` and any negative
 ///   `result` as "the offered modes are unchanged, carry on with the
 ///   session". A failed update is never a reason to tear a stream down.
+/// - **Do not retry a [`VGD_UPDATE_BLOCKED`] refusal** (`result` = `-14`).
+///   Every other failure here leaves the previous list in force and really
+///   does push again on the next attempt, so retrying is reasonable. This
+///   one is a statement about the mode the display is RUNNING: the driver
+///   refused to take that mode away mid-stream, and will refuse again until
+///   the display is on something else. `blocking_mode` indexes your own
+///   `vgd_create_monitor` list and names it — either include that mode in
+///   the next request, or change the display mode yourself first (the
+///   modeset is then yours, at a moment you chose) and gate afterwards.
 /// - **`result == 0` means ACCEPTED, not applied.** The driver completes
 ///   the request before it calls the OS. The applied/failed outcome shows
 ///   up in ETW and as the monitor's sticky `last_error` in the status
@@ -409,6 +444,7 @@ pub unsafe extern "C" fn vgd_update_modes(
                     flags: reply.flags(),
                     rejected: reply.rejected(),
                     first_rejected: reply.first_rejected(),
+                    blocking_mode: reply.blocking_mode_idx(),
                 };
                 0
             }

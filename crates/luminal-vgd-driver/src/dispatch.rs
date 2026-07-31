@@ -568,7 +568,15 @@ pub fn dispatch(
                 // future flag that changes semantics ships with its own
                 // caps bit instead.
                 let specs = &req.modes[..req.mode_count as usize];
-                match dev.table.update_modes(req.session_id, specs, dev.cfg.caps) {
+                // The commit token: "what has the OS committed" as a
+                // version stamp. It decides whether a refusal this monitor
+                // already collected is still evidence — see
+                // `SessionTable::update_modes`. Read here, on the IOCTL
+                // frame, because it is a single relaxed load of a global
+                // the modeset callback bumps; nothing is locked and nothing
+                // can block.
+                let commit_token = crate::modepush::committed_token();
+                match dev.table.update_modes(req.session_id, specs, dev.cfg.caps, commit_token) {
                     Ok(update) => {
                         reply.mode_count = update.targets.len() as u32;
                         reply.set_rejected(
@@ -596,7 +604,28 @@ pub fn dispatch(
                             flags |= update_status::PENDING;
                         }
                         reply.set_detail(update.accepted as u32, req.mode_count, flags);
-                        if update.refused {
+                        if let Some(blocking_mode_idx) = update.blocked {
+                            // PERMANENT refusal: this exact list was
+                            // already refused because it would gate out the
+                            // mode the OS has committed, and nothing has
+                            // committed since. Say so on the wire — a
+                            // distinct code AND the BLOCKED flag, plus the
+                            // blocking mode's index in the list the host
+                            // created the monitor with.
+                            //
+                            // Reported as its own outcome rather than as
+                            // `UPDATE_FAILED`, which means "not applied,
+                            // send it again": this one cannot succeed on a
+                            // resend, and a host that resends it is in a
+                            // loop with nothing on the other side. No
+                            // effect is emitted — a second push would be
+                            // refused by the same gate for the same reason.
+                            // Constraint 1 holds throughout: the session,
+                            // the monitor and the published list are all
+                            // untouched.
+                            reply.result = err::MODE_COMMITTED;
+                            reply.set_blocked(blocking_mode_idx);
+                        } else if update.refused {
                             // NOTHING requested exists on this monitor.
                             // Publishing the empty result would break
                             // IddCx.h:3594 and leave the monitor with no
@@ -1529,6 +1558,96 @@ mod tests {
         assert!(reply.is_pending() && !reply.fully_in_force());
         assert!(d.table.settle_modes(8, retry_seq, ModeUpdateResult::Applied));
         assert_eq!(d.table.get(8).unwrap().target_modes.len(), 1);
+    }
+
+    /// THE REGRESSION TEST for the retry loop, at the wire.
+    ///
+    /// A push refused because it would gate out the OS's COMMITTED mode is
+    /// PERMANENT for as long as that mode stays committed. Build 17 settled
+    /// it exactly like an OS-call failure — sticky `UPDATE_FAILED`, which
+    /// the protocol documents as "the previous list is still in force and
+    /// resending really does push again" — so a retrying host queued a
+    /// push, had it refused for the same reason, was told to retry, and did,
+    /// with no state anywhere converging.
+    ///
+    /// Against the pre-fix code this test fails on the retry, in the two
+    /// places the loop is visible without any new API: the reply's `result`
+    /// is `err::OK` (it was accepted for application) and an
+    /// `Effect::UpdateModes` is emitted (it really is about to be pushed
+    /// again). The reply carries no way to tell that from a transient
+    /// failure, and no way to learn which mode is in the way.
+    #[test]
+    fn a_retry_after_a_committed_mode_refusal_is_answered_not_re_pushed() {
+        use crate::modepush::{live_gate, CommittedMode, LiveGate, PushOutcome};
+
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(0xC0));
+        let superset = d.table.get(0xC0).unwrap().modes.clone();
+        // The OS has committed the BASE rate on this display: under
+        // `virtual_display_layout=exclusive` it is the only active one.
+        let committed = CommittedMode { width: 2560, height: 1440, refresh_millihz: 120_000 };
+
+        // The host gates down to the framegen rate. Accepted and queued —
+        // as it must be, the push has not happened yet.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xC0, &[FG_240]));
+        assert_eq!(reply.result, err::OK);
+        assert!(reply.is_pending() && !reply.is_blocked());
+        assert_eq!(reply.blocking_mode_idx(), luminal_driver_proto::NO_MODE_INDEX);
+        let (seq, targets) = queued_update(&effects).expect("first request queues a push");
+
+        // The effects worker reaches the gate and refuses: publishing
+        // {240} without the committed 120 would make Windows re-select
+        // mid-stream on the only active display.
+        let gate = live_gate(&superset, &targets, Some(committed));
+        let LiveGate::EvictsCommitted { committed, superset_idx } = gate else {
+            panic!("expected the committed-mode refusal, got {gate:?}");
+        };
+        let outcome = PushOutcome::Blocked {
+            committed,
+            superset_idx,
+            token: crate::modepush::committed_token(),
+            count: 1,
+        };
+        assert!(!outcome.retryable());
+        assert!(d.table.settle_modes(0xC0, seq, outcome.settle_result()));
+
+        // Constraint 1: the PUSH was refused, never the session. The
+        // published list is untouched and the sticky code is the distinct
+        // one, so even a host that only polls GET_STATUS can tell.
+        let m = d.table.get(0xC0).unwrap();
+        assert_eq!(m.target_modes.len(), 2, "target modes unchanged, carry on");
+        assert_eq!(m.last_error, err::MODE_COMMITTED);
+        assert_ne!(err::MODE_COMMITTED, err::UPDATE_FAILED);
+
+        // THE CONSEQUENCE, and the whole point: the identical retry.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xC0, &[FG_240]));
+        assert_eq!(reply.result, err::MODE_COMMITTED, "not OK: this cannot be applied");
+        assert!(reply.is_blocked(), "and the flag says the refusal is permanent");
+        assert!(!reply.worth_retrying(), "which is the predicate a retry loop reads");
+        assert!(
+            effects.is_empty(),
+            "and it is NOT pushed again — the same gate would refuse it identically"
+        );
+        // WHICH mode blocked it, as an index into the list this host used
+        // at CREATE_MONITOR, so it can choose a different subset.
+        assert_eq!(reply.blocking_mode_idx(), 0);
+        assert_eq!(superset_req(0xC0).modes[reply.blocking_mode_idx() as usize], BASE_120);
+        assert_eq!(reply.mode_count, 2, "the list still in force is reported as always");
+        assert!(!reply.is_pending(), "nothing is outstanding — this is the final answer");
+        assert!(!reply.fully_in_force());
+        assert_eq!(d.table.get(0xC0).unwrap().target_modes.len(), 2);
+
+        // The way out is open, and it is the one the reply pointed at: a
+        // subset that KEEPS the blocking mode pushes normally.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xC0, &[BASE_120]));
+        assert_eq!(reply.result, err::OK);
+        assert!(!reply.is_blocked() && reply.worth_retrying());
+        let (seq, targets) = queued_update(&effects).expect("a different subset really pushes");
+        assert_eq!(live_gate(&superset, &targets, Some(committed)), LiveGate::Push);
+        assert!(d.table.settle_modes(0xC0, seq, ModeUpdateResult::Applied));
+        assert_eq!(d.table.get(0xC0).unwrap().target_modes.len(), 1);
     }
 
     /// While a push is outstanding, a second request replaces the PENDING

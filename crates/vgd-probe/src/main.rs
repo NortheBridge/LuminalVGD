@@ -501,9 +501,29 @@ fn main() -> ExitCode {
                         );
                     }
                 }
+                // A refusal the driver can answer definitively. The one
+                // worth calling out is the committed-mode block: it is the
+                // only refusal here that a retry cannot fix, and the reply
+                // names the create-time mode standing in the way so the
+                // measurement can be re-run against a subset that keeps it.
+                Ok(r) if r.is_blocked() => {
+                    eprintln!(
+                        "    driver refused PERMANENTLY (result {}): this list would gate out \
+                         the mode the OS has COMMITTED on the display, which would force a \
+                         modeset mid-stream. Blocking mode: create-list index {}. {} modes \
+                         still published. Retrying this exact list cannot help — publish a \
+                         subset that keeps that mode, or change the display mode first \
+                         (SetDisplayConfig) and gate afterwards.",
+                        r.result,
+                        r.blocking_mode_idx(),
+                        r.mode_count,
+                    );
+                    debug_assert!(!r.worth_retrying());
+                }
                 Ok(r) => {
                     eprintln!(
-                        "    driver refused: result {} ({} published, {} rejected, first at {})",
+                        "    driver refused: result {} ({} published, {} rejected, first at {}) \
+                         — retryable",
                         r.result,
                         r.mode_count,
                         r.rejected(),

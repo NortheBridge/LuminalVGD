@@ -14,8 +14,18 @@ use wdk_sys::{NTSTATUS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 use super::bindings::{self, ffi};
 use super::PROVIDER;
 use super::{MonitorRt, OsHandle, Shell};
+// `COMMITTED` is the paths the OS last committed, per monitor object:
+// written from `evt_commit_modes2` (a CALLBACK FRAME — lock-free,
+// allocation-free, fixed work) and read by the effects worker immediately
+// before an `IddCxMonitorUpdateModes2`. A process global like the rest of
+// the shell's state (one root-enumerated devnode), and deliberately not a
+// field of `Shell`: the modeset callback that writes it must not depend on
+// `Shell::get()` having run. It is DEFINED in `modepush`, not here, because
+// `dispatch` reads its generation on every `UPDATE_MODES` — the validity
+// token for a remembered refusal — and nothing below the shell line may
+// reach up into the shell.
 use crate::modepush::{
-    self, stage, CommittedMode, CommittedPaths, LiveGate, PushOutcome, MAX_COMMITTED_PATHS,
+    self, stage, CommittedMode, LiveGate, PushOutcome, COMMITTED, MAX_COMMITTED_PATHS,
 };
 use luminal_vgd_core::modes::Mode;
 
@@ -474,17 +484,6 @@ const MONITOR_MODE_ORIGIN: ffi::IDDCX_MONITOR_MODE_ORIGIN =
 // publishes, within the monitor-mode superset fixed at create.
 // ---------------------------------------------------------------------
 
-/// The paths the OS last committed, per monitor object — written from
-/// `evt_commit_modes2` (a CALLBACK FRAME: lock-free, allocation-free,
-/// fixed work) and read by the effects worker immediately before an
-/// `IddCxMonitorUpdateModes2`. See [`crate::modepush::CommittedPaths`].
-///
-/// A process global like the rest of the shell's state (one
-/// root-enumerated devnode), and deliberately NOT a field of `Shell`: it
-/// is written from a modeset callback that must not depend on
-/// `Shell::get()` having run, and it is const-constructible.
-static COMMITTED: CommittedPaths = CommittedPaths::new();
-
 /// `IddCxMonitorUpdateModes2` calls in flight (0 or 1 in practice — only
 /// the effects worker pushes). Read by `evt_d0_exit` through
 /// [`drain_mode_pushes`], which is the D3Final half of the handshake that
@@ -510,7 +509,7 @@ fn forget_committed(monitor: OsHandle) {
 /// Forget every committed path: the adapter is going away and every
 /// monitor object with it (`evt_d0_exit`).
 pub(super) fn forget_all_committed() {
-    COMMITTED.apply(&[]);
+    COMMITTED.apply(&[], 0);
 }
 
 /// Publish a validated target subset on a live monitor.
@@ -614,6 +613,32 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
                 i32("status", &STATUS_SUCCESS)
             );
         }
+        PushOutcome::Blocked { committed, superset_idx, token, count } => {
+            // The refusal, with everything needed to read it without
+            // guessing: which mode the OS is running, where that mode sits
+            // in this monitor's frozen description (the index the host is
+            // handed on the wire), how many paths were active when it was
+            // refused, and — the field that separates this event from every
+            // other deny in the feature — that it is NOT worth retrying.
+            // Before, this settled as an ordinary not-applied and a
+            // retrying host looped on it forever.
+            tracelogging::write_event!(
+                PROVIDER,
+                "UpdateModesGatesCommitted",
+                level(Warning),
+                u64("session", &session_id),
+                u32("stage", &stage::GATES_COMMITTED),
+                i32("code", &luminal_driver_proto::err::MODE_COMMITTED),
+                u32("modes", &count),
+                u32("committed_w", &committed.width),
+                u32("committed_h", &committed.height),
+                u32("committed_mhz", &committed.refresh_millihz),
+                u32("blocking_mode", &superset_idx),
+                u32("active_paths", &COMMITTED.active()),
+                u64("commit_token", &token),
+                u32("retryable", &u32::from(push.retryable()))
+            );
+        }
         PushOutcome::Deferred { stage, count } => {
             tracelogging::write_event!(
                 PROVIDER,
@@ -625,7 +650,7 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
                 // The half of a deferral that used to be missing: the host
                 // is being told, through GET_STATUS, that the modes are NOT
                 // in force and the request is worth sending again.
-                u32("retryable", &1u32)
+                u32("retryable", &u32::from(push.retryable()))
             );
         }
         PushOutcome::Failed { stage, code, count, rolled_back } => {
@@ -637,7 +662,11 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
                 u32("stage", &stage),
                 i32("code", &code),
                 u32("modes", &count),
-                u32("rolled_back", &u32::from(rolled_back))
+                u32("rolled_back", &u32::from(rolled_back)),
+                // Every failure here IS retryable — the field exists so a
+                // capture never has to infer that from the absence of the
+                // committed-mode event.
+                u32("retryable", &u32::from(push.retryable()))
             );
         }
     }
@@ -799,12 +828,37 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
         // safe under both replace and append semantics), and "does this
         // gate out the mode the OS has COMMITTED". See `modepush::live_gate`
         // for why the second one refuses rather than proceeds.
-        match modepush::live_gate(
-            &rt.monitor_modes,
-            &targets,
-            COMMITTED.get(monitor.0 as u64),
-        ) {
+        //
+        // The token is read WITH the committed mode and travels with the
+        // refusal: it is what tells a later request whether that refusal is
+        // still evidence of anything (`SessionTable::update_modes`).
+        let (committed, commit_token) = COMMITTED.get_with_token(monitor.0 as u64);
+        match modepush::live_gate(&rt.monitor_modes, &targets, committed) {
             LiveGate::Push => {}
+            LiveGate::PushCommittedUnrecognised(committed) => {
+                // FAIL-OPEN, and this is the event that says so. The OS
+                // committed a mode this monitor's frozen description does
+                // not contain, so the committed-mode rule cannot be applied
+                // to it and the push proceeds exactly as it did before the
+                // gate existed. Untraced — as it was when the gate landed —
+                // it is indistinguishable from a monitor with nothing
+                // committed, which is the difference between "the feature
+                // is working" and "the feature has quietly stopped
+                // deciding anything", e.g. after a signal-decoding change.
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "UpdateModesCommittedUnrecognised",
+                    level(Warning),
+                    u64("session", &session_id),
+                    u32("stage", &stage::GATES_COMMITTED),
+                    u32("modes", &count),
+                    u32("superset", &(rt.monitor_modes.len() as u32)),
+                    u32("committed_w", &committed.width),
+                    u32("committed_h", &committed.height),
+                    u32("committed_mhz", &committed.refresh_millihz),
+                    u32("active_paths", &COMMITTED.active())
+                );
+            }
             LiveGate::NotInSuperset => {
                 return PushOutcome::Failed {
                     stage: stage::NOT_IN_SUPERSET,
@@ -813,32 +867,27 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
                     rolled_back: false,
                 };
             }
-            LiveGate::EvictsCommitted(committed) => {
+            LiveGate::EvictsCommitted { committed, superset_idx } => {
                 // The one scenario this feature must not cause: under
                 // `virtual_display_layout=exclusive` this is the only
                 // active display, and publishing a subset without its
                 // committed mode makes Windows re-select — a modeset in
                 // the middle of the stream. Refuse the PUSH, never the
-                // session: the previously published list stays in force,
-                // the monitor and the stream carry on, and the sticky
-                // `err::UPDATE_FAILED` tells the host to re-ask.
-                tracelogging::write_event!(
-                    PROVIDER,
-                    "UpdateModesGatesCommitted",
-                    level(Warning),
-                    u64("session", &session_id),
-                    u32("stage", &stage::GATES_COMMITTED),
-                    u32("modes", &count),
-                    u32("committed_w", &committed.width),
-                    u32("committed_h", &committed.height),
-                    u32("committed_mhz", &committed.refresh_millihz),
-                    u32("active_paths", &COMMITTED.active())
-                );
-                return PushOutcome::Failed {
-                    stage: stage::GATES_COMMITTED,
-                    code: luminal_driver_proto::err::BAD_MODE,
+                // session: the previously published list stays in force and
+                // the monitor and the stream carry on.
+                //
+                // Reported as `Blocked`, not `Failed`: it is the one
+                // refusal a retry cannot fix, and the host is told so
+                // (`err::MODE_COMMITTED` + `update_status::BLOCKED`) along
+                // with `superset_idx` — which mode is in the way — so it
+                // can publish a subset that keeps it, or do the modeset
+                // itself first. The trace is emitted by the single trace
+                // site in `update_modes`, from this outcome.
+                return PushOutcome::Blocked {
+                    committed,
+                    superset_idx,
+                    token: commit_token,
                     count,
-                    rolled_back: false,
                 };
             }
         }
@@ -1233,28 +1282,6 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         );
         return STATUS_INVALID_PARAMETER;
     };
-    // `modes` here is the SUPERSET and is expected to be constant for the
-    // life of the monitor — an `UPDATE_MODES` can never move it, so a
-    // trace where it changes means something re-created the monitor.
-    // `published` rides along so one line of a capture shows the gate
-    // this monitor is currently under: published < modes means a subset
-    // is being offered.
-    tracelogging::write_event!(
-        PROVIDER,
-        "ParseDescription2",
-        level(Informational),
-        u32("modes", &(snapshot.monitor.len() as u32)),
-        u32("published", &(snapshot.targets.len() as u32)),
-        u32("buffer", &inp.MonitorModeBufferInputCount),
-        // Moves with the gate since build 17's second pass — a trace where
-        // `preferred` is nonzero says entry 0 is currently gated out.
-        u32(
-            "preferred",
-            &modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, usize::MAX)
-        )
-    );
-
-    out.MonitorModeBufferOutputCount = snapshot.monitor.len() as u32;
     // THE PREFERRED INDEX MOVES WITH THE GATE. It was a constant 0 — the
     // EDID's preferred detailed timing, `monitor_modes[0]` — which stopped
     // being right the moment `UPDATE_MODES` could publish a target subset
@@ -1264,12 +1291,52 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
     // why. Report the first monitor mode that is actually being offered.
     // (`targets ⊆ superset` makes a match certain; the helper falls back
     // to 0 rather than ever returning an out-of-range index.)
-    out.PreferredMonitorModeIdx =
-        modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, usize::MAX);
-    if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
+    //
+    // Computed ONCE, before the trace, because the index depends on how
+    // much of the list is being reported: a count-only query names an entry
+    // from the whole list, while a filled query may only name one inside
+    // the buffer the OS gave us. The first cut traced the whole-list answer
+    // and then reported the truncated one — so the field a reader would use
+    // to explain the OS's default choice was, in exactly the truncated case
+    // worth investigating, not the value the OS was given.
+    let count = snapshot.monitor.len();
+    let fill = if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
+        None
+    } else {
+        Some(count.min(inp.MonitorModeBufferInputCount as usize))
+    };
+    let preferred = modepush::preferred_monitor_mode_idx(
+        &snapshot.monitor,
+        &snapshot.targets,
+        fill.unwrap_or(usize::MAX),
+    );
+
+    // `modes` here is the SUPERSET and is expected to be constant for the
+    // life of the monitor — an `UPDATE_MODES` can never move it, so a
+    // trace where it changes means something re-created the monitor.
+    // `published` rides along so one line of a capture shows the gate
+    // this monitor is currently under: published < modes means a subset
+    // is being offered. `filled` is how many modes this call actually
+    // wrote, which is what `preferred` indexes into.
+    tracelogging::write_event!(
+        PROVIDER,
+        "ParseDescription2",
+        level(Informational),
+        u32("modes", &(count as u32)),
+        u32("published", &(snapshot.targets.len() as u32)),
+        u32("buffer", &inp.MonitorModeBufferInputCount),
+        u32("filled", &(fill.unwrap_or(0) as u32)),
+        // Moves with the gate since build 17's second pass — a trace where
+        // `preferred` is nonzero says entry 0 is currently gated out. This
+        // is the value REPORTED, not a second computation of it.
+        u32("preferred", &preferred)
+    );
+
+    out.MonitorModeBufferOutputCount = count as u32;
+    out.PreferredMonitorModeIdx = preferred;
+    let Some(fill) = fill else {
         return STATUS_SUCCESS;
-    }
-    let fill = snapshot.monitor.len().min(inp.MonitorModeBufferInputCount as usize);
+    };
     let slots = core::slice::from_raw_parts_mut(inp.pMonitorModes, fill);
     for (slot, mode) in slots.iter_mut().zip(snapshot.monitor.iter()) {
         slot.Size = size_of::<ffi::IDDCX_MONITOR_MODE2>() as u32;
@@ -1278,11 +1345,6 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         slot.BitsPerComponent = wire_bpc_for(mode);
     }
     out.MonitorModeBufferOutputCount = fill as u32;
-    // Re-taken against what was actually written: the index must name a
-    // mode inside the buffer the OS was given, and a truncated fill can
-    // exclude the offered entry the full list would have named.
-    out.PreferredMonitorModeIdx =
-        modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, fill);
     STATUS_SUCCESS
 }
 
@@ -1364,6 +1426,14 @@ pub unsafe extern "C" fn evt_commit_modes2(
         [(0, CommittedMode { width: 0, height: 0, refresh_millihz: 0 }); MAX_COMMITTED_PATHS];
     let mut active = 0usize;
     let mut skipped = 0u32;
+    // ACTIVE paths in this commit, counted before the array runs out.
+    // `CommittedPaths::active()` is what `UpdateModesGatesCommitted`
+    // reports, and "how many displays were active when this push was
+    // refused" must not be silently capped at the slot count: deriving it
+    // from the recorded entries (as the first cut did) made the documented
+    // "may exceed the slots recorded" unreachable and would understate
+    // exactly the configuration worth looking at.
+    let mut active_total = 0u32;
     if !inp.pPaths.is_null() {
         let paths = core::slice::from_raw_parts(inp.pPaths, count as usize);
         for path in paths {
@@ -1396,6 +1466,7 @@ pub unsafe extern "C" fn evt_commit_modes2(
             if !is_active || path.MonitorObject.is_null() {
                 continue;
             }
+            active_total = active_total.saturating_add(1);
             if active < MAX_COMMITTED_PATHS {
                 recorded[active] = (path.MonitorObject as u64, mode);
                 active += 1;
@@ -1407,7 +1478,7 @@ pub unsafe extern "C" fn evt_commit_modes2(
     // REPLACE, not merge: this call carries the complete path set for the
     // adapter, so a monitor absent from it has nothing committed. Keeping a
     // stale entry would refuse that monitor's pushes forever.
-    COMMITTED.apply(&recorded[..active]);
+    COMMITTED.apply(&recorded[..active], active_total);
     // Path-commit visibility (cold-boot instrumentation, 2026-07-25): a
     // monitor that never activates never gets a commit — this event's
     // absence after MonitorArrival localizes an activation failure to

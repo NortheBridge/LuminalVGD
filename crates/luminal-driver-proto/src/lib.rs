@@ -215,12 +215,46 @@ pub mod err {
     /// the PREVIOUS list is still in force. This is the constraint-1
     /// degrade signal — never a departed monitor, never a refused session.
     ///
+    /// **Retryable.** It means "not applied, for a reason that may not
+    /// apply next time" — the OS refused the call, a TDR duck was in
+    /// flight, the adapter was being torn down. Resending the identical
+    /// request really does push again. The one non-retryable refusal has
+    /// its own code, [`MODE_COMMITTED`], precisely so a retry loop can
+    /// tell the two apart.
+    ///
     /// Note where it can appear: the `UPDATE_MODES` reply completes before
     /// the driver calls the OS, so the reply carries driver-side
     /// validation only. This code surfaces afterwards, as the affected
     /// monitor's sticky `MonitorStatus.last_error` in `GET_STATUS`
     /// (plus an ETW event with stage and status).
     pub const UPDATE_FAILED: i32 = -13;
+    /// `UPDATE_MODES`: the requested target list would have gated out the
+    /// mode the OS has COMMITTED on that monitor, so the push was refused
+    /// and the previously published list is still in force.
+    ///
+    /// **NOT retryable while that mode stays committed.** Publishing a
+    /// subset without the committed mode forces Windows to re-select on a
+    /// display that — under an exclusive virtual-display layout — is the
+    /// only active one, i.e. a modeset in the middle of the stream. The
+    /// driver refuses the PUSH (never the session, never the monitor), and
+    /// resending the same list produces the same refusal every time.
+    ///
+    /// A host that gets this has two ways forward, and retrying is neither:
+    ///
+    /// 1. publish a subset that KEEPS the committed mode — read
+    ///    [`UpdateModesReply::blocking_mode_idx`], which indexes the mode
+    ///    list the monitor was CREATED with, to find out which one that is;
+    ///    or
+    /// 2. move the display onto the mode it wants FIRST (`SetDisplayConfig`
+    ///    — the modeset is then the host's own, deliberate one), and gate
+    ///    afterwards.
+    ///
+    /// Appears both as the `UPDATE_MODES` reply `result` (alongside
+    /// [`update_status::BLOCKED`], on a request the driver can answer from
+    /// the refusal it already made) and as the monitor's sticky
+    /// `MonitorStatus.last_error` in `GET_STATUS` after the push it
+    /// refused.
+    pub const MODE_COMMITTED: i32 = -14;
     /// Unspecified driver-internal failure; details in `GET_STATUS`.
     pub const INTERNAL: i32 = -100;
 }
@@ -490,8 +524,17 @@ pub struct DestroyMonitorRequest {
 /// - A refusal is a refused REQUEST. The previously published list stays
 ///   in force, the monitor is never departed, and the session never fails.
 /// - Gating is REVERSIBLE: a later request can publish the wider subset
-///   again. (Note the OS may re-select a mode when the one it committed
-///   stops being offered — that is what asking for gating means.)
+///   again.
+/// - **Gating never evicts the mode the OS has COMMITTED.** A request whose
+///   list would leave out the mode the display is currently running is
+///   refused ([`err::MODE_COMMITTED`] with [`update_status::BLOCKED`]),
+///   because publishing it would force Windows to re-select on a live
+///   display — a mode change in the middle of the stream, which is the one
+///   thing this opcode exists to avoid. The refusal names the blocking mode
+///   ([`UpdateModesReply::blocking_mode_idx`], an index into this monitor's
+///   create-time list) and does NOT go away on a retry: publish a subset
+///   that keeps that mode, or change the display mode first and gate
+///   afterwards.
 ///
 /// The bit depth / dynamic range are monitor-wide and fixed at create —
 /// they are derived from the EDID, which cannot be reissued on a live
@@ -550,6 +593,23 @@ pub mod update_status {
     /// with; the fix is a create-time superset that includes it, not a
     /// retry.
     pub const PARTIAL: u32 = 1 << 1;
+    /// **The request was refused permanently — do not retry it.** The
+    /// target list asked for would have gated out the mode the OS has
+    /// COMMITTED on this monitor, which would force a modeset on a live
+    /// display, so the driver refused the push and left the previous list
+    /// in force ([`err::MODE_COMMITTED`](super::err::MODE_COMMITTED)).
+    ///
+    /// This bit exists because a retry loop cannot otherwise tell a
+    /// PERMANENT refusal from a transient one: both leave the modes
+    /// unchanged and both leave a sticky error behind, but one clears on
+    /// the next attempt and this one cannot — it is a property of what the
+    /// OS is currently running, not of the attempt. Resending the same
+    /// list re-refuses it for as long as that mode stays committed.
+    ///
+    /// [`UpdateModesReply::blocking_mode_idx`] names the offending mode,
+    /// as an index into the list the monitor was CREATED with, so the host
+    /// can publish a different subset instead of guessing.
+    pub const BLOCKED: u32 = 1 << 2;
 }
 
 /// `UPDATE_MODES` reply.
@@ -567,6 +627,16 @@ pub mod update_status {
 /// [`first_rejected`](Self::first_rejected) naming what it could not) —
 /// so `result == OK` with neither flag set is the one shape that means
 /// "exactly what you asked for is offered right now".
+///
+/// It can also say the opposite precisely: `result ==
+/// [`err::MODE_COMMITTED`] with [`update_status::BLOCKED`] set is the one
+/// shape that means **stop retrying this list** — the driver refused the
+/// push because it would have gated out the mode the OS is running, and it
+/// will refuse it again for as long as that stays true.
+/// [`blocking_mode_idx`](Self::blocking_mode_idx) names the mode in the
+/// way, so the host can pick a different subset. Use
+/// [`worth_retrying`](Self::worth_retrying) rather than open-coding the
+/// test.
 ///
 /// This struct can never grow: the driver writes replies all-or-nothing
 /// and hosts reject a reply whose length differs from what they expect,
@@ -587,8 +657,9 @@ pub struct UpdateModesReply {
     /// 0 only when the session does not exist.
     pub mode_count: u32,
     /// `[0]` accepted, `[1]` requested, `[2]` flags, `[3]` rejected,
-    /// `[4]` first-rejected index (or [`NO_REJECTED_INDEX`]), `[5]` must
-    /// be 0. Read through the accessors, never by index.
+    /// `[4]` first-rejected index (or [`NO_REJECTED_INDEX`]), `[5]`
+    /// blocking-mode index (or [`NO_MODE_INDEX`]). Read through the
+    /// accessors, never by index.
     pub reserved: [u32; 6],
 }
 
@@ -597,15 +668,23 @@ pub struct UpdateModesReply {
 /// requested mode — the case a bare 0 would silently mislabel.
 pub const NO_REJECTED_INDEX: u32 = u32::MAX;
 
+/// [`UpdateModesReply::blocking_mode_idx`] when no mode is blocking. Same
+/// sentinel as [`NO_REJECTED_INDEX`] and for the same reason: index 0 is a
+/// real answer (the monitor's first create-time mode), so "none" needs a
+/// value that cannot be one.
+pub const NO_MODE_INDEX: u32 = u32::MAX;
+
 impl UpdateModesReply {
-    /// A zeroed reply for `session_id`, with the rejection index already
-    /// at [`NO_REJECTED_INDEX`]. Use this rather than a struct literal:
-    /// a literal's `reserved: [0; 6]` would read back as "the FIRST
-    /// requested mode was rejected", which is a real and different
-    /// outcome.
+    /// A zeroed reply for `session_id`, with the rejection and blocking
+    /// indices already at their sentinels. Use this rather than a struct
+    /// literal: a literal's `reserved: [0; 6]` would read back as "the
+    /// FIRST requested mode was rejected, and your monitor's FIRST
+    /// create-time mode is blocking you" — two real and completely
+    /// different outcomes.
     pub fn new(session_id: u64) -> Self {
         let mut reserved = [0u32; 6];
         reserved[Self::IDX_FIRST_REJECTED] = NO_REJECTED_INDEX;
+        reserved[Self::IDX_BLOCKING] = NO_MODE_INDEX;
         Self { session_id, result: err::OK, mode_count: 0, reserved }
     }
 
@@ -614,6 +693,7 @@ impl UpdateModesReply {
     const IDX_FLAGS: usize = 2;
     const IDX_REJECTED: usize = 3;
     const IDX_FIRST_REJECTED: usize = 4;
+    const IDX_BLOCKING: usize = 5;
 
     /// Requested modes the driver published: those with a compatible entry
     /// in the monitor's create-time list. Never >
@@ -655,6 +735,38 @@ impl UpdateModesReply {
         self.flags() & update_status::PARTIAL != 0
     }
 
+    /// The refusal is PERMANENT while the OS keeps running the mode named
+    /// by [`blocking_mode_idx`](Self::blocking_mode_idx): resending this
+    /// list cannot succeed. See [`update_status::BLOCKED`].
+    pub fn is_blocked(&self) -> bool {
+        self.flags() & update_status::BLOCKED != 0
+    }
+
+    /// Index into the monitor's `CREATE_MONITOR` mode list of the mode the
+    /// OS has COMMITTED and this request would have gated out, or
+    /// [`NO_MODE_INDEX`]. Only meaningful with
+    /// [`is_blocked`](Self::is_blocked) set.
+    ///
+    /// An index into the create-time list — not into the request — because
+    /// the blocking mode is by definition one the request left out. The
+    /// host chose that list, so the index names the mode exactly, in the
+    /// one word the reply has left (it may never grow).
+    pub fn blocking_mode_idx(&self) -> u32 {
+        self.reserved[Self::IDX_BLOCKING]
+    }
+
+    /// Is sending this exact request again worth anything?
+    ///
+    /// THE predicate for a retry loop. `false` only for a
+    /// [`BLOCKED`](update_status::BLOCKED) refusal, which is the one
+    /// outcome that cannot change until something other than the driver
+    /// does — every other failure here (`UPDATE_FAILED`, a deferral, an
+    /// I/O error) leaves the previous list in force and re-pushes on the
+    /// next attempt.
+    pub fn worth_retrying(&self) -> bool {
+        !self.is_blocked()
+    }
+
     /// True only when every requested mode is offered by the monitor
     /// **right now** — accepted in full, with no push still outstanding.
     /// The one predicate a host should use before telling a client a mode
@@ -679,6 +791,19 @@ impl UpdateModesReply {
         self.reserved[Self::IDX_REJECTED] = rejected;
         self.reserved[Self::IDX_FIRST_REJECTED] =
             first_rejected.unwrap_or(NO_REJECTED_INDEX);
+    }
+
+    /// Mark this reply as the PERMANENT refusal described by
+    /// [`err::MODE_COMMITTED`], naming the committed mode that blocks it by
+    /// its index in the monitor's `CREATE_MONITOR` list.
+    ///
+    /// Sets the flag and the index together — they are one fact, and a
+    /// caller that set only the flag would tell a host "stop retrying"
+    /// without telling it what to ask for instead, which is the state the
+    /// host cannot act on.
+    pub fn set_blocked(&mut self, blocking_mode_idx: u32) {
+        self.reserved[Self::IDX_FLAGS] |= update_status::BLOCKED;
+        self.reserved[Self::IDX_BLOCKING] = blocking_mode_idx;
     }
 }
 
@@ -1249,7 +1374,8 @@ mod tests {
             ]
         );
         assert!(!shipped.contains(&ioctl::IOCTL_UPDATE_MODES));
-        // And the appended error code did not renumber an existing one.
+        // And the appended error codes did not renumber an existing one.
+        assert_eq!(err::MODE_COMMITTED, -14);
         assert_eq!(err::UPDATE_FAILED, -13);
         assert_eq!(err::BAD_POOL, -12);
         assert_eq!(err::NOT_HANDSHAKEN, -10);
@@ -1265,14 +1391,20 @@ mod tests {
         assert_eq!((r.session_id, r.result, r.mode_count), (7, err::OK, 0));
         assert_eq!(r.rejected(), 0);
         assert_eq!(r.first_rejected(), NO_REJECTED_INDEX, "not index 0");
+        assert_eq!(r.blocking_mode_idx(), NO_MODE_INDEX, "not create-time mode 0");
         assert_eq!(NO_REJECTED_INDEX, u32::MAX);
+        assert_eq!(NO_MODE_INDEX, u32::MAX);
 
         r.set_detail(2, 3, update_status::PARTIAL | update_status::PENDING);
         r.set_rejected(1, Some(2));
-        assert_eq!(r.reserved, [2, 3, update_status::PARTIAL | update_status::PENDING, 1, 2, 0]);
+        assert_eq!(
+            r.reserved,
+            [2, 3, update_status::PARTIAL | update_status::PENDING, 1, 2, NO_MODE_INDEX]
+        );
         assert_eq!((r.accepted(), r.requested(), r.rejected(), r.first_rejected()), (2, 3, 1, 2));
         assert!(r.is_partial() && r.is_pending() && !r.fully_in_force());
         assert_eq!(r.accepted() + r.rejected(), r.requested());
+        assert!(!r.is_blocked() && r.worth_retrying(), "partial+pending is retryable");
 
         // A rejection of the very first requested mode is index 0, and
         // must be distinguishable from "nothing rejected".
@@ -1318,9 +1450,47 @@ mod tests {
         assert_eq!(reply.result, err::OK, "partial is success-with-detail, not an error");
         assert!(reply.accepted() < reply.requested());
 
-        // The tail is still untouched growth budget.
+        // The rejection/blocking words are untouched by the counts.
         assert_eq!(reply.reserved[3..], [0, 0, 0]);
         assert_eq!(update_status::PENDING & update_status::PARTIAL, 0);
+    }
+
+    /// The PERMANENT refusal has to be readable as such on the wire, and it
+    /// has to name the mode in the way. Before it existed, a host that
+    /// asked for a subset excluding the committed mode got the same answer
+    /// as a transient OS failure — modes unchanged, sticky
+    /// `UPDATE_FAILED`, "resend it" — and resending re-refused it forever.
+    #[test]
+    fn a_blocked_refusal_is_distinguishable_from_a_retryable_failure() {
+        // Transient: the OS refused the push, or it was deferred. Nothing
+        // is in force yet, but the request is worth sending again.
+        let mut transient = UpdateModesReply::new(9);
+        transient.result = err::UPDATE_FAILED;
+        transient.set_detail(1, 1, update_status::PENDING);
+        assert!(transient.worth_retrying());
+        assert!(!transient.is_blocked());
+        assert_eq!(transient.blocking_mode_idx(), NO_MODE_INDEX);
+
+        // Permanent: the list would evict the mode the OS is running.
+        let mut blocked = UpdateModesReply::new(9);
+        blocked.result = err::MODE_COMMITTED;
+        blocked.mode_count = 2; // the list still in force, untouched
+        blocked.set_detail(1, 1, 0);
+        blocked.set_blocked(0);
+        assert!(!blocked.worth_retrying(), "THE loop-breaker");
+        assert!(blocked.is_blocked());
+        assert_eq!(blocked.blocking_mode_idx(), 0, "create-time mode 0 is committed");
+        assert!(!blocked.fully_in_force());
+        // And the two are told apart by BOTH channels, so a host that
+        // reads only the code or only the flags still gets it right.
+        assert_ne!(blocked.result, transient.result);
+        assert_ne!(blocked.flags(), transient.flags());
+        // Blocking is orthogonal to the partial/pending words: a refusal
+        // still reports how much of the request was even publishable.
+        assert_eq!(update_status::BLOCKED & (update_status::PENDING | update_status::PARTIAL), 0);
+        assert_eq!(blocked.accepted() + blocked.rejected(), blocked.requested());
+        // It rides in the reserved words; the reply still may not grow.
+        assert_eq!(core::mem::size_of::<UpdateModesReply>(), 40);
     }
 
     #[test]

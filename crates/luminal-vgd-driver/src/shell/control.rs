@@ -1551,16 +1551,35 @@ unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out
                 // description reads identically to a malformed request
                 // without them, and the two need completely different
                 // fixes (create with a wider superset vs fix the caller).
+                //
+                // `blocked` / `blocking_mode` are the same argument for the
+                // other refusal: a request answered from a committed-mode
+                // refusal the effects worker already made (stage
+                // GATES_COMMITTED, the same stage that refusal traced) is
+                // NOT a caller bug and NOT retryable, and a capture that
+                // showed only "denied, BAD_MODE-ish" would send the reader
+                // looking for one in the host.
+                let blocked = reply.is_blocked();
                 tracelogging::write_event!(
                     PROVIDER,
                     "UpdateModesDenied",
                     level(Warning),
                     u64("session", &reply.session_id),
-                    u32("stage", &UPD_DISPATCH_STAGE_VALIDATE),
+                    u32(
+                        "stage",
+                        &if blocked {
+                            crate::modepush::stage::GATES_COMMITTED
+                        } else {
+                            UPD_DISPATCH_STAGE_VALIDATE
+                        }
+                    ),
                     i32("code", &reply.result),
                     u32("modes", &reply.mode_count),
                     u32("rejected", &reply.rejected()),
-                    u32("first_rejected", &reply.first_rejected())
+                    u32("first_rejected", &reply.first_rejected()),
+                    u32("blocked", &u32::from(blocked)),
+                    u32("blocking_mode", &reply.blocking_mode_idx()),
+                    u32("retryable", &u32::from(reply.worth_retrying()))
                 );
             }
         }
@@ -1574,7 +1593,10 @@ unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out
                 i32("code", &luminal_driver_proto::err::INTERNAL),
                 u32("modes", &0u32),
                 u32("rejected", &0u32),
-                u32("first_rejected", &luminal_driver_proto::NO_REJECTED_INDEX)
+                u32("first_rejected", &luminal_driver_proto::NO_REJECTED_INDEX),
+                u32("blocked", &0u32),
+                u32("blocking_mode", &luminal_driver_proto::NO_MODE_INDEX),
+                u32("retryable", &1u32)
             );
         }
     }
