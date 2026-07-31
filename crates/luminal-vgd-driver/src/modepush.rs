@@ -558,15 +558,13 @@ mod tests {
         let update = t.update_modes(1, &[spec(DOUBLED)], CAPS).expect("accepted");
         let seq = update.queued.expect("a real change queues a push");
 
-        // The shell's parked arm: decide, patch, settle. `commits()` is
-        // what tells the caller to write the parked spec at all.
+        // The shell's parked arm: decide, patch the parked spec, settle.
+        // Build 17 patched it and settled `NotApplied`; the fix makes
+        // `commits()` both the authorisation to patch and the settle, so
+        // the two halves cannot drift apart. Either way the parked spec
+        // ends up holding `targets`, so the assertions below are about the
+        // OTHER copy — the durable one — agreeing with it.
         let outcome = parked_push(&superset, &update.targets);
-        assert_eq!(
-            outcome,
-            PushOutcome::AppliedParked { published: 1, superset: 2 },
-            "a patched parked spec is an application, not a deferral"
-        );
-        assert!(outcome.commits(), "the caller is being told to write the parked spec");
         assert!(t.settle_modes(1, seq, outcome.settle_result()));
 
         // Durable now agrees with what the re-arrival will publish.
@@ -587,6 +585,11 @@ mod tests {
             "rescinding a gate the driver applied must push, not short-circuit"
         );
         assert_eq!(rescind.targets.len(), 2);
+
+        // And the shape, last: a patched parked spec is an APPLICATION,
+        // reported separately from `Applied` because no OS call happened.
+        assert_eq!(outcome, PushOutcome::AppliedParked { published: 1, superset: 2 });
+        assert!(outcome.commits(), "which is also what authorises the patch");
     }
 
     /// The other direction of the same discipline: an outcome that changed
