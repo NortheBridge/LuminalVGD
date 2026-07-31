@@ -75,32 +75,35 @@ pub unsafe fn monitor_departure(monitor: IDDCX_MONITOR) -> NTSTATUS {
     iddcx_call!(_IDDFUNCENUM_IddCxMonitorDepartureTableIndex as PFN_IDDCXMONITORDEPARTURE, monitor)
 }
 
-/// Push a new TARGET-mode list for a monitor that is already ARRIVED
-/// (build 17, proto `UPDATE_MODES`). Table index 6 — a 1.0-era entry
-/// present in every IddCx version, so unlike the *2 variants there is no
-/// availability question at all.
-///
-/// Bound for symmetry with the query DDIs (both variants are registered),
-/// but the driver CALLS ONLY [`monitor_update_modes2`]: the v1
-/// `IDDCX_TARGET_MODE` has no `BitsPerComponent`, and our wire depth is
-/// per-mode (`monitors::wire_bpc_for`), so a v1 push would silently drop
-/// the 10/12-bit and HDR wire information `evt_query_target_modes2`
-/// reports for the very same modes. Calling both would push the list
-/// twice.
-pub unsafe fn monitor_update_modes(
-    monitor: IDDCX_MONITOR,
-    in_args: *const IDARG_IN_UPDATEMODES,
-) -> NTSTATUS {
-    iddcx_call!(
-        _IDDFUNCENUM_IddCxMonitorUpdateModesTableIndex as PFN_IDDCXMONITORUPDATEMODES,
-        monitor,
-        in_args
-    )
-}
+// -------------------------------------------------------------------
+// `IddCxMonitorUpdateModes` (function-table index 6) IS DELIBERATELY NOT
+// BOUND, AND MUST NOT BE RE-ADDED.
+//
+// Verbatim, from the IddCxMonitorUpdateModes2 reference page (Remarks):
+//
+//     "drivers reporting IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 can only
+//      call IddCxMonitorUpdateModes2; calling IddCxMonitorUpdateModes is
+//      an error."
+//
+// We report CAN_PROCESS_FP16 — it is the ONLY adapter flag
+// `shell::entry` sets (`caps.Flags = ...CAN_PROCESS_FP16`, the HDR10
+// contract), and clearing it would take advanced color off every
+// LuminalVGD monitor. So index 6 is forbidden for this driver for as
+// long as it does HDR at all.
+//
+// Build 17 originally bound it anyway, "for symmetry, never called".
+// A wrapper that must never be called is a wrapper someone eventually
+// calls: the deletion is the enforcement. The one legal entry is
+// [`monitor_update_modes2`] below. (The v1 arg struct is unusable for us
+// regardless — `IDDCX_TARGET_MODE` has no `BitsPerComponent`, which our
+// per-mode wire depth needs — but that is a second reason, not the rule.)
+// -------------------------------------------------------------------
 
 /// v1.10 variant, table index 34 — THE entry build 17 calls. Carries
 /// `IDDCX_TARGET_MODE2` (with `BitsPerComponent`), matching what
-/// `evt_query_target_modes2` reports.
+/// `evt_query_target_modes2` reports. It is also the ONLY update entry a
+/// CAN_PROCESS_FP16 driver may call at all — see the block above index
+/// 6's absence.
 ///
 /// Safe to call unconditionally: IddMinimumVersionRequired = 10 means the
 /// OS only loads us with a ≥1.10 function table (index 34 is inside the
