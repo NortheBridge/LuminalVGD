@@ -1265,10 +1265,120 @@ against the pre-fix behaviour
   measure replace-vs-append by gating out the rate the OS is NOT running
   (create three rates, or commit the one you intend to keep first).
 
+#### Second review pass (2026-07-31, build 17 still UNSIGNED)
+
+Six findings, all verified against the code before being fixed; none was
+misdiagnosed. One MAJOR, and it is about what the HOST can see.
+
+- **A permanent refusal that reads as a transient one is a retry loop.**
+  The `GATES_COMMITTED` refusal above settled as an ordinary
+  `NotApplied`: sticky `err::UPDATE_FAILED`, which proto 0.5 documents as
+  "the previous list is still in force and this request is fully
+  retryable — resending it really does push again". So a retrying host
+  queued a push, had it refused for the same reason, was told to retry,
+  and never converged. The refusal is PERMANENT while that mode stays
+  committed — retrying is the one response that cannot work — and the
+  wire now says exactly that, in the reserved words the reply already had
+  (still 40 bytes, no IOCTL value touched, `const_assert` unchanged):
+  - `err::MODE_COMMITTED = -14` — appended, nothing renumbered. Appears as
+    the `UPDATE_MODES` reply `result` AND as the monitor's sticky
+    `MonitorStatus.last_error`, so a host that only polls `GET_STATUS`
+    learns it too. `UPDATE_FAILED` keeps its meaning and is now documented
+    as the RETRYABLE one.
+  - `update_status::BLOCKED = 1 << 2` in `flags` (`reserved[2]`), read as
+    `is_blocked()` / `worth_retrying()`.
+  - `reserved[5]` (was "must be 0") = the blocking mode's index in the
+    monitor's CREATE_MONITOR list, read as `blocking_mode_idx()`,
+    sentinel `NO_MODE_INDEX` = `u32::MAX` — a bare 0 would read as "your
+    first create-time mode", exactly the trap `NO_REJECTED_INDEX` exists
+    for. An INDEX because the reply may never grow and one u32 is all
+    there is; it costs no precision, because the superset IS the list the
+    host sent at create.
+  - FFI: `VgdUpdateModesReply.blocking_mode`, `VGD_UPDATE_BLOCKED`,
+    `VGD_NO_MODE_INDEX` (safe to grow — nothing ships `vgd_update_modes`
+    yet; the pinned submodule is still proto 0.4).
+- **How the answer reaches a request at all.** The push is asynchronous —
+  the IRP completes before the effects worker calls IddCx — so the only
+  request that can be told about a refusal is a LATER one. The refusal is
+  remembered in `Monitor.blocked` (`BlockedPush { targets, superset_idx,
+  token }`) and a request resolving to that same list is answered from it
+  with no effect emitted. `ModeUpdateResult::Blocked` is a third settle
+  variant, and `PushOutcome::Blocked` its shell counterpart, so the
+  distinction cannot be lost in the mapping (`retryable()` is the single
+  definition behind both the ETW `retryable` field and the wire flag).
+  **The block is evidence, so it expires like evidence**: it is honoured
+  only while `modepush::committed_token()` — the `CommittedPaths`
+  generation, bumped by every commit — still matches. Any modeset drops
+  it and the next request pushes for real. A different selection also
+  drops it (it is a different question, and may well keep the committed
+  mode). Expiring early costs one push; expiring late would refuse a
+  request that has become legal, which is the same bug in mirror image.
+- **`CommittedPaths` is now a real seqlock.** The key WAS the sequence:
+  publish payload, publish monitor handle, re-read the handle. Defeated by
+  the commonest write there is — the same monitor committing again — which
+  restores the same key while the payload changes underneath, pairing a
+  size from one commit with a refresh rate from the next. A phantom mode is
+  worse than none here, because it is compared against the superset to
+  decide whether to refuse. Slots now carry an even/odd `version`
+  (`fence(Release)` after the odd store, `fence(Acquire)` before the
+  re-read), and `apply` visits every slot exactly once instead of clearing
+  all keys and then filling the front.
+- **Two writers can no longer interleave.** `apply` (modeset callback) and
+  `forget` (effects worker) both rewrite the array. No lock is available on
+  a callback frame, so they take a non-blocking token: the loser writes
+  NOTHING and sets `contended`, and the holder then CLEARS the record
+  rather than publish a mixture of two path sets. Clearing is the
+  fail-open direction — "nothing committed" is exactly the pre-gate
+  behaviour — so losing this race can only ever allow a push, never invent
+  a refusal.
+- **`active()` really can exceed the slots recorded now**, as it always
+  claimed: `evt_commit_modes2` counts every active path and passes the
+  total to `apply(paths, active_total)`. Deriving it from the truncated
+  record made the documented case unreachable and understated the one
+  number `UpdateModesGatesCommitted.active_paths` exists to report.
+- **The fail-open eviction path traces.** `live_gate` returns a distinct
+  `PushCommittedUnrecognised` verdict when the committed mode is not in the
+  monitor's superset (a decoding mismatch), the push site emits
+  `UpdateModesCommittedUnrecognised`, and `LiveGate::pushes()` keeps a call
+  site from mistaking it for a refusal. Untraced, "the gate declined to
+  fire because it could not read the commit" and "the gate had nothing to
+  do" were the same silence — i.e. the whole feature could switch itself
+  off invisibly.
+- **`ParseDescription2.preferred` is the value REPORTED.** It was computed
+  with `usize::MAX` for the trace and re-computed with `fill` for the OS,
+  so on a truncated buffer the trace showed a number the OS never got.
+  Computed once now, before the event; the event also carries `filled`.
+- New/changed ETW (settle before signing — task #58's autologger keys on
+  these): `UpdateModesGatesCommitted` gains `code`, `blocking_mode`,
+  `commit_token`, `retryable`; `UpdateModesCommittedUnrecognised(stage,
+  modes,superset,committed_w,committed_h,committed_mhz,active_paths)` is
+  new; `UpdateModesDeferred`/`UpdateModesFailed` carry `retryable` from
+  the one definition; `UpdateModesDenied` (dispatch layer) gains
+  `blocked`, `blocking_mode`, `retryable` and reports stage
+  `GATES_COMMITTED` for an answered-from-refusal reply;
+  `ParseDescription2` gains `filled`. No new stage numbers.
+- Regression tests that fail against the pre-fix behaviour (verified by
+  reverting the settle arm and re-running):
+  `dispatch::tests::a_retry_after_a_committed_mode_refusal_is_answered_not_re_pushed`
+  (the wire: pre-fix gives `result == OK`, `PENDING`, and another queued
+  push), `modepush::tests::a_refused_push_tells_the_host_it_is_permanent_
+  and_which_mode_blocked_it`, and
+  `modepush::tests::a_remembered_refusal_expires_when_anything_commits`.
+  Plus `a_rewrite_that_restores_the_same_key_is_still_detected` and
+  `a_lost_writer_clears_the_record_instead_of_mixing_two_commits` for the
+  record's two races.
+- Traced-install measurement, updated again: the refused push now prints
+  its own diagnosis in `vgd-probe` ("refused PERMANENTLY … blocking mode:
+  create-list index N"), so the run that gates out the committed rate is
+  self-explaining rather than a silent no-op to be read out of ETW.
+
 Host-side work remaining (LuminalShine, NOT done here): the pinned submodule
 `src/drivers/luminal-display` is at da0349b = build 15 / proto 0.4, so it cannot
 even see build 16 — any host work needs that pointer advanced first. Then the
 call site at `virtual_display_vgd.cpp:361` (which today can only advertise the
 base rate at CREATE time, and only if framegen is already known active) gains an
 `UPDATE_MODES` path gated on `VGD_CAP_DYNAMIC_MODES`, degrading silently in the
-style of the existing `proto_minor < 4` nits log.
+style of the existing `proto_minor < 4` nits log. When it does, the one rule it
+must honour is `worth_retrying()`: retry an `UPDATE_FAILED`, never a
+`MODE_COMMITTED` — for the latter, either keep `blocking_mode` in the list or do
+the `SetDisplayConfig` first.
