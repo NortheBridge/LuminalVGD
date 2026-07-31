@@ -356,6 +356,19 @@ unsafe extern "C" fn evt_d0_exit(
     // PersistState from touching a destroyed WDFDEVICE handle.
     shell.clear_adapter();
     shell.clear_wdf_device();
+    // Then WAIT (bounded) for any IddCxMonitorUpdateModes2 already in
+    // flight on the effects worker. Order is the whole handshake: the
+    // clear above happens first, so a push starting from here on sees no
+    // adapter and defers, and this drain catches the one push that could
+    // otherwise have been holding a monitor object we are about to let the
+    // framework destroy. `monitors::push_targets` re-checks the adapter
+    // epoch after publishing and before its DDI call, so the teardown only
+    // has to avoid losing the race silently. Bounded per §3.3 rule 5, and
+    // it sits inside the multi-second worker drain below.
+    monitors::drain_mode_pushes();
+    // The paths the OS had committed die with the adapter; the handles
+    // could otherwise be reissued to a replacement device's monitors.
+    monitors::forget_all_committed();
     let drained: Vec<(u64, super::MonitorRt)> = {
         let mut monitors = shell.monitors.lock().unwrap();
         monitors.drain().collect()

@@ -396,6 +396,16 @@ impl Shell {
         self.adapter.lock().unwrap().epoch
     }
 
+    /// Handle and epoch from ONE acquisition. Reading them apart lets a
+    /// `clear_adapter` land in between and hand back a live-looking handle
+    /// with the epoch that already invalidated it — which is exactly the
+    /// pair `monitors::push_targets` re-checks against before calling the
+    /// OS, so it must be a single observation.
+    pub fn adapter_with_epoch(&self) -> Option<(OsHandle, u64)> {
+        let slot = self.adapter.lock().unwrap();
+        slot.handle.map(|handle| (handle, slot.epoch))
+    }
+
     /// Publish the adapter only if no clear_adapter intervened since
     /// `epoch` was captured — a stale (pre-teardown) AdapterReady task
     /// must never republish a destroyed adapter. Returns false when stale.

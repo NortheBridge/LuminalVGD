@@ -6,14 +6,18 @@
 //! our generator embeds — bytes 8..16 (vendor id, product code, serial).
 
 use core::mem::{size_of, zeroed};
+use core::sync::atomic::{fence, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use wdk_sys::{NTSTATUS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 
 use super::bindings::{self, ffi};
 use super::PROVIDER;
 use super::{MonitorRt, OsHandle, Shell};
+use crate::modepush::{
+    self, stage, CommittedMode, CommittedPaths, LiveGate, PushOutcome, MAX_COMMITTED_PATHS,
+};
 use luminal_vgd_core::modes::Mode;
-use luminal_vgd_core::session::ModeUpdateResult;
 
 /// Deterministic container GUID for a display identity: same display_id
 /// → same GUID across reconnects and reboots (identity retention).
@@ -128,6 +132,7 @@ pub fn plug(
                 cursor.stop();
             }
             prev.mark_ring_dead();
+            forget_committed(prev.monitor);
         }
 
         let mut arrival: ffi::IDARG_OUT_MONITORARRIVAL = zeroed();
@@ -192,6 +197,7 @@ pub fn unplug(session_id: u64) {
         cursor.stop();
     }
     rt.mark_ring_dead();
+    forget_committed(rt.monitor);
     unsafe {
         let status = bindings::monitor_departure(rt.monitor.0.cast());
         tracelogging::write_event!(
@@ -288,6 +294,7 @@ fn duck_selected(expected_epoch: u64, only: Option<&[u64]>) -> usize {
             shell.monitors.lock().unwrap().insert(session_id, rt);
             continue;
         }
+        forget_committed(rt.monitor);
         shell.ducked.lock().unwrap().push(super::DuckedMonitor {
             session_id,
             display_id: rt.display_id,
@@ -410,6 +417,7 @@ pub fn replug_ducked() {
                     cursor.stop();
                 }
                 prev.mark_ring_dead();
+                forget_committed(prev.monitor);
             }
 
             let mut arrival: ffi::IDARG_OUT_MONITORARRIVAL = zeroed();
@@ -424,6 +432,7 @@ pub fn replug_ducked() {
             if status != STATUS_SUCCESS {
                 if let Some(rt) = shell.monitors.lock().unwrap().remove(&d.session_id) {
                     rt.mark_ring_dead();
+                    forget_committed(rt.monitor);
                 }
                 continue;
             }
@@ -465,28 +474,43 @@ const MONITOR_MODE_ORIGIN: ffi::IDDCX_MONITOR_MODE_ORIGIN =
 // publishes, within the monitor-mode superset fixed at create.
 // ---------------------------------------------------------------------
 
-/// Stages for the `UpdateModes*` ETW events (constraint 4: every deny/fail
-/// path carries stage + code). Numbering is append-only, like STAGE_* in
-/// control.rs.
-const UPD_STAGE_NO_MONITOR: u32 = 0; // session has no live or parked monitor
-const UPD_STAGE_EMPTY: u32 = 1; // empty list — the DDI forbids count 0
-const UPD_STAGE_PARKED: u32 = 2; // applied to a TDR-parked spec, no OS call
-const UPD_STAGE_DUCK_PENDING: u32 = 3; // stored, OS push skipped (duck in flight)
-const UPD_STAGE_OS_CALL: u32 = 4; // IddCxMonitorUpdateModes2 returned failure
-const UPD_STAGE_ROLLBACK_RACED: u32 = 5; // monitor changed under a failed push
-const UPD_STAGE_NO_ADAPTER: u32 = 8; // adapter torn down before the push (6/7 are control.rs's)
-const UPD_STAGE_NOT_IN_SUPERSET: u32 = 9; // a target the live monitor cannot describe
+/// The paths the OS last committed, per monitor object — written from
+/// `evt_commit_modes2` (a CALLBACK FRAME: lock-free, allocation-free,
+/// fixed work) and read by the effects worker immediately before an
+/// `IddCxMonitorUpdateModes2`. See [`crate::modepush::CommittedPaths`].
+///
+/// A process global like the rest of the shell's state (one
+/// root-enumerated devnode), and deliberately NOT a field of `Shell`: it
+/// is written from a modeset callback that must not depend on
+/// `Shell::get()` having run, and it is const-constructible.
+static COMMITTED: CommittedPaths = CommittedPaths::new();
 
-/// What the OS push did with a pending target list. Every variant is
-/// reported to `SessionTable::settle_modes`, and only `Applied` commits.
-enum UpdatePush {
-    /// `IddCxMonitorUpdateModes2` returned success: the list is in force.
-    Applied { published: u32, superset: u32 },
-    /// No OS call was made and nothing was left changed. RETRYABLE — the
-    /// host's next identical request resolves and pushes for real.
-    Deferred { stage: u32, count: u32 },
-    /// The OS refused, or there was nothing to push at.
-    Failed { stage: u32, code: i32, count: u32, rolled_back: bool },
+/// `IddCxMonitorUpdateModes2` calls in flight (0 or 1 in practice — only
+/// the effects worker pushes). Read by `evt_d0_exit` through
+/// [`drain_mode_pushes`], which is the D3Final half of the handshake that
+/// keeps a teardown from destroying the adapter under a live push.
+static PUSHES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// How long a final device exit waits for an in-flight push to return.
+/// Bounded like every other teardown wait (§3.3 rule 5); the wait sits
+/// inside the multi-second worker drain D3Final already performs.
+const PUSH_DRAIN_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Forget what a DEPARTED monitor had committed.
+///
+/// The record is replaced wholesale by the next commit, so this is not
+/// what keeps it correct — but a departure is not always followed by a
+/// commit, and an `IDDCX_MONITOR` handle can be reissued to a different
+/// monitor object. A stale entry would then refuse that monitor's pushes
+/// over a mode it never committed.
+fn forget_committed(monitor: OsHandle) {
+    COMMITTED.forget(monitor.0 as u64);
+}
+
+/// Forget every committed path: the adapter is going away and every
+/// monitor object with it (`evt_d0_exit`).
+pub(super) fn forget_all_committed() {
+    COMMITTED.apply(&[]);
 }
 
 /// Publish a validated target subset on a live monitor.
@@ -549,9 +573,30 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
     let shell = Shell::get();
     let push = push_targets(shell, session_id, targets);
 
-    // Constraint 5: every deny/fail path carries stage + code.
+    // Constraint 6: every deny/fail path carries stage + code.
     match push {
-        UpdatePush::Applied { published, superset } => {
+        PushOutcome::AppliedParked { published, superset } => {
+            // Deliberately NOT `UpdateModesApplied`: no OS call happened,
+            // and that event's (modes, superset) pair is the
+            // replace-vs-append measurement. This one says the parked spec
+            // the re-arrival will plug with was patched — and, since build
+            // 17's second pass, that it COMMITS, because the re-arrival is
+            // that monitor's publication mechanism. A patch that did not
+            // commit left the durable list and the parked spec disagreeing
+            // forever, with the host's rescind short-circuited as "already
+            // published".
+            tracelogging::write_event!(
+                PROVIDER,
+                "UpdateModesParked",
+                level(Informational),
+                u64("session", &session_id),
+                u32("stage", &stage::PARKED),
+                u32("modes", &published),
+                u32("superset", &superset),
+                u32("applied", &1u32)
+            );
+        }
+        PushOutcome::Applied { published, superset } => {
             // `published` vs `superset` is THE measurement this feature
             // turns on (see push_targets' replace-vs-append note): a
             // trace showing published < superset, then QueryTargetModes2
@@ -569,7 +614,7 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
                 i32("status", &STATUS_SUCCESS)
             );
         }
-        UpdatePush::Deferred { stage, count } => {
+        PushOutcome::Deferred { stage, count } => {
             tracelogging::write_event!(
                 PROVIDER,
                 "UpdateModesDeferred",
@@ -583,7 +628,7 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
                 u32("retryable", &1u32)
             );
         }
-        UpdatePush::Failed { stage, code, count, rolled_back } => {
+        PushOutcome::Failed { stage, code, count, rolled_back } => {
             tracelogging::write_event!(
                 PROVIDER,
                 "UpdateModesFailed",
@@ -604,10 +649,13 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
     // records the sticky per-monitor `err::UPDATE_FAILED` that carries a
     // not-applied outcome back to the host in every GET_STATUS reply,
     // which is the channel a retry decision is made on.
-    let result = match push {
-        UpdatePush::Applied { .. } => ModeUpdateResult::Applied,
-        _ => ModeUpdateResult::NotApplied,
-    };
+    //
+    // `PushOutcome::settle_result` is the single mapping from outcome to
+    // commit, and it lives in the portable layer with the tests that pin
+    // it: anything that CHANGED a published list commits, anything that
+    // changed nothing does not. Deciding that here, per arm, is how the
+    // parked arm came to mutate a list it then settled `NotApplied`.
+    let result = push.settle_result();
     let settled = shell.dev.lock().unwrap().table.settle_modes(session_id, update_seq, result);
     if !settled {
         // The update was superseded by a newer one, or its session is
@@ -663,15 +711,15 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
 /// count the rates Display Settings offers. `published` ⇒ replace or
 /// re-query; `superset` ⇒ append (or no re-solicit). Do not assert either
 /// in code or docs until that is measured.
-fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> UpdatePush {
+fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutcome {
     // `IDARG_IN_UPDATEMODES2.TargetModeCount` "cannot be zero"
     // (IddCx.h:3594). The core layer refuses an empty selection before it
     // can ever become an effect, so this is the second gate, not the
     // first — but it is the one standing directly in front of the OS
     // call, and it must never be removed.
     if targets.is_empty() {
-        return UpdatePush::Failed {
-            stage: UPD_STAGE_EMPTY,
+        return PushOutcome::Failed {
+            stage: stage::EMPTY,
             code: luminal_driver_proto::err::BAD_MODE,
             count: 0,
             rolled_back: false,
@@ -684,27 +732,23 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> UpdatePus
     // parked selection so the re-arrival publishes it; without this the
     // update would be silently undone by the recovery.
     //
-    // It is still a DEFERRAL, not an application: nothing has been
-    // published to the OS, the replug may yet give up, and the durable
-    // list must not claim otherwise. The patch and the retry converge —
-    // a retry resolves from the durable superset to exactly this list.
-    // The parked superset is the same one the request was validated
-    // against (the replug recreates from the same EDID), so the subset
-    // relation still holds; re-check anyway, because it is one compare
-    // and the alternative is an unactivatable parked spec.
+    // `modepush::parked_push` decides, and `commits()` is what says the
+    // patch may be written at all — the two are one decision on purpose.
+    // Build 17 wrote the patch and then settled `NotApplied`, so the
+    // parked spec (and the monitor the replug re-arrived) published the
+    // new subset while the durable list still held the old one; the
+    // host's rescind then matched the stale durable list, was answered
+    // "already published", emitted no effect, and left the monitor gated
+    // for the life of the session. A patch changes what the monitor
+    // publishes, so it commits.
     {
         let mut ducked = shell.ducked.lock().unwrap();
         if let Some(d) = ducked.iter_mut().find(|d| d.session_id == session_id) {
-            if targets.iter().all(|m| d.monitor_modes.contains(m)) {
+            let outcome = modepush::parked_push(&d.monitor_modes, &targets);
+            if outcome.commits() {
                 d.target_modes = targets;
-                return UpdatePush::Deferred { stage: UPD_STAGE_PARKED, count };
             }
-            return UpdatePush::Failed {
-                stage: UPD_STAGE_NOT_IN_SUPERSET,
-                code: luminal_driver_proto::err::BAD_MODE,
-                count,
-                rolled_back: false,
-            };
+            return outcome;
         }
     }
 
@@ -719,43 +763,85 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> UpdatePus
     // REBUILDING and the recovery poller is judging whether the OS
     // re-assigns on its own. Do not hand that decision a mode-list change
     // mid-flight; the host retries once the duck settles.
-    if shell.tdr_duck_pending.load(std::sync::atomic::Ordering::SeqCst) {
-        return UpdatePush::Deferred { stage: UPD_STAGE_DUCK_PENDING, count };
+    if shell.tdr_duck_pending.load(Ordering::SeqCst) {
+        return PushOutcome::Deferred { stage: stage::DUCK_PENDING, count };
     }
-    // A final device exit (D3Final) clears the adapter, and the OS
-    // destroys its child monitor objects with it.
-    if shell.adapter().is_none() {
-        return UpdatePush::Deferred { stage: UPD_STAGE_NO_ADAPTER, count };
-    }
+
+    // --- The D3Final handshake (see `drain_mode_pushes`). ---
+    // A final device exit clears the adapter and the OS destroys its child
+    // monitor objects with it, so a push must never straddle one. The
+    // in-flight mark is taken FIRST and the adapter read after it, while
+    // `evt_d0_exit` clears the adapter first and reads the mark after:
+    // with a SeqCst fence on both sides at least one of the two sees the
+    // other, so either this push observes the cleared adapter and never
+    // calls, or the teardown observes this push and waits for it.
+    // Checking the adapter alone — which is all build 17 did — left the
+    // whole interval between the check and the DDI call unguarded.
+    let Some((_in_flight, epoch)) = PushInFlight::begin(shell) else {
+        return PushOutcome::Deferred { stage: stage::NO_ADAPTER, count };
+    };
 
     // --- Under the lock: validate, publish, snapshot, build. No IddCx. ---
     let (monitor, previous, pushed, superset, target_modes) = {
         let mut monitors = shell.monitors.lock().unwrap();
         let Some(rt) = monitors.get_mut(&session_id) else {
-            return UpdatePush::Failed {
-                stage: UPD_STAGE_NO_MONITOR,
+            return PushOutcome::Failed {
+                stage: stage::NO_MONITOR,
                 code: luminal_driver_proto::err::NO_SUCH_SESSION,
                 count,
                 rolled_back: false,
             };
         };
-        // THE containment check, against the LIVE monitor object's own
-        // description rather than the session table's copy. The core
-        // layer already filtered, but this is the last statement before
-        // the OS call and the two lists could in principle have been
-        // reconciled by different paths (a replug rebuilding the runtime,
-        // a session id reused). Publishing a target the monitor cannot
-        // describe would be invisible to the user and inexplicable in a
-        // trace; refusing it costs one scan of at most four entries.
-        if !targets.iter().all(|m| rt.monitor_modes.contains(m)) {
-            return UpdatePush::Failed {
-                stage: UPD_STAGE_NOT_IN_SUPERSET,
-                code: luminal_driver_proto::err::BAD_MODE,
-                count,
-                rolled_back: false,
-            };
-        }
         let monitor = rt.monitor;
+        // The two checks that stand directly in front of the OS call, both
+        // against the LIVE monitor object rather than the session table's
+        // copy of it: `targets ⊆ superset` (the invariant that keeps this
+        // safe under both replace and append semantics), and "does this
+        // gate out the mode the OS has COMMITTED". See `modepush::live_gate`
+        // for why the second one refuses rather than proceeds.
+        match modepush::live_gate(
+            &rt.monitor_modes,
+            &targets,
+            COMMITTED.get(monitor.0 as u64),
+        ) {
+            LiveGate::Push => {}
+            LiveGate::NotInSuperset => {
+                return PushOutcome::Failed {
+                    stage: stage::NOT_IN_SUPERSET,
+                    code: luminal_driver_proto::err::BAD_MODE,
+                    count,
+                    rolled_back: false,
+                };
+            }
+            LiveGate::EvictsCommitted(committed) => {
+                // The one scenario this feature must not cause: under
+                // `virtual_display_layout=exclusive` this is the only
+                // active display, and publishing a subset without its
+                // committed mode makes Windows re-select — a modeset in
+                // the middle of the stream. Refuse the PUSH, never the
+                // session: the previously published list stays in force,
+                // the monitor and the stream carry on, and the sticky
+                // `err::UPDATE_FAILED` tells the host to re-ask.
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "UpdateModesGatesCommitted",
+                    level(Warning),
+                    u64("session", &session_id),
+                    u32("stage", &stage::GATES_COMMITTED),
+                    u32("modes", &count),
+                    u32("committed_w", &committed.width),
+                    u32("committed_h", &committed.height),
+                    u32("committed_mhz", &committed.refresh_millihz),
+                    u32("active_paths", &COMMITTED.active())
+                );
+                return PushOutcome::Failed {
+                    stage: stage::GATES_COMMITTED,
+                    code: luminal_driver_proto::err::BAD_MODE,
+                    count,
+                    rolled_back: false,
+                };
+            }
+        }
         let superset = rt.monitor_modes.len() as u32;
         let pushed = targets.clone();
         let previous = core::mem::replace(&mut rt.target_modes, targets);
@@ -769,6 +855,25 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> UpdatePus
         }
         (monitor, previous, pushed, superset, target_modes)
     };
+
+    // The list is published but the OS has not been told. A teardown that
+    // landed while the lock was held (it takes the monitors lock only for
+    // its drain, which is AFTER clear_adapter) means the monitor object is
+    // being destroyed: put the runtime list back and defer, rather than
+    // calling into a dying adapter.
+    if shell.adapter_epoch() != epoch {
+        let (rolled_back, _) = restore_targets(shell, session_id, monitor, &pushed, previous);
+        tracelogging::write_event!(
+            PROVIDER,
+            "UpdateModesAdapterTornDown",
+            level(Warning),
+            u64("session", &session_id),
+            u32("stage", &stage::ADAPTER_TORN_DOWN),
+            u32("modes", &count),
+            u32("rolled_back", &u32::from(rolled_back))
+        );
+        return PushOutcome::Deferred { stage: stage::ADAPTER_TORN_DOWN, count };
+    }
 
     // --- No locks held. The OS may re-enter our DDIs inside this call. ---
     let status = unsafe {
@@ -788,39 +893,109 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> UpdatePus
     // borrows it for the duration of the call.
 
     if status == STATUS_SUCCESS {
-        return UpdatePush::Applied { published: count, superset };
+        return PushOutcome::Applied { published: count, superset };
     }
 
     // --- Failure: restore the previously published list. ---
-    // Re-verify identity first (the AssignRacedUnplug pattern): between
-    // dropping the guard and here, the session can have been destroyed,
-    // reaped, ducked, or replugged onto a NEW monitor object — and
-    // writing a stale list onto a fresh monitor would be worse than the
-    // failure being rolled back.
-    //
-    // The list comparison is the second half of that check: the restore
-    // only runs when the runtime list is still, entry for entry, the one
-    // this call published, so it can only undo its own write and never a
-    // later update's. What it puts back was itself a non-empty subset of
-    // the same frozen superset, so the rollback cannot produce an
-    // unactivatable or empty target list either.
-    let mut rolled_back = false;
-    let mut raced = false;
-    {
-        let mut monitors = shell.monitors.lock().unwrap();
-        match monitors.get_mut(&session_id) {
-            Some(rt) if rt.monitor == monitor && rt.target_modes == pushed => {
-                rt.target_modes = previous;
-                rolled_back = true;
-            }
-            _ => raced = true,
-        }
-    }
-    UpdatePush::Failed {
-        stage: if raced { UPD_STAGE_ROLLBACK_RACED } else { UPD_STAGE_OS_CALL },
+    let (rolled_back, raced) = restore_targets(shell, session_id, monitor, &pushed, previous);
+    PushOutcome::Failed {
+        stage: if raced { stage::ROLLBACK_RACED } else { stage::OS_CALL },
         code: status,
         count,
         rolled_back,
+    }
+}
+
+/// Put `previous` back as the monitor's published target list, but only if
+/// this call's own write is still there to undo. Returns
+/// `(rolled_back, raced)`.
+///
+/// Re-verifies identity first (the AssignRacedUnplug pattern): between
+/// dropping the guard and here the session can have been destroyed,
+/// reaped, ducked, or replugged onto a NEW monitor object, and writing a
+/// stale list onto a fresh monitor would be worse than the failure being
+/// rolled back. The list comparison is the second half of that check —
+/// the restore runs only when the runtime list is still, entry for entry,
+/// the one this call published, so it can undo its own write and never a
+/// later update's. What it puts back was itself a non-empty subset of the
+/// same frozen superset, so a rollback can produce neither an empty nor an
+/// unactivatable target list.
+fn restore_targets(
+    shell: &Shell,
+    session_id: u64,
+    monitor: OsHandle,
+    pushed: &[Mode],
+    previous: Vec<Mode>,
+) -> (bool, bool) {
+    let mut monitors = shell.monitors.lock().unwrap();
+    match monitors.get_mut(&session_id) {
+        Some(rt) if rt.monitor == monitor && rt.target_modes == pushed => {
+            rt.target_modes = previous;
+            (true, false)
+        }
+        _ => (false, true),
+    }
+}
+
+/// RAII mark for "an `IddCxMonitorUpdateModes2` is in flight", the push
+/// half of the D3Final handshake in [`drain_mode_pushes`].
+struct PushInFlight;
+
+impl PushInFlight {
+    /// Mark, then read the adapter. `None` when the adapter is already
+    /// gone (the mark is dropped again first).
+    ///
+    /// The ORDER is the guarantee. This stores, fences, then loads the
+    /// adapter; `evt_d0_exit` clears the adapter, fences, then loads the
+    /// mark. Two SeqCst fences between a store and a load on each side is
+    /// the standard mutual-exclusion argument: it is impossible both for
+    /// this to read a live adapter and for the teardown to read no push.
+    fn begin(shell: &Shell) -> Option<(Self, u64)> {
+        PUSHES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        // Handle and epoch together under one lock: read apart, a clear
+        // landing between them yields a live handle with the NEW epoch,
+        // and the epoch re-check before the OS call would then pass.
+        match shell.adapter_with_epoch() {
+            Some((_, epoch)) => Some((Self, epoch)),
+            None => {
+                PUSHES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for PushInFlight {
+    fn drop(&mut self) {
+        PUSHES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait (bounded) for any in-flight `IddCxMonitorUpdateModes2` to return.
+///
+/// Called from `evt_d0_exit` AFTER `clear_adapter`, which is what makes
+/// the handshake work: a push that starts from here on sees no adapter and
+/// defers, and a push already running is waited for instead of having its
+/// monitor object destroyed underneath it. `push_targets` also re-checks
+/// the adapter epoch after publishing and before calling, so the teardown
+/// never has to win the race — only to not lose it silently.
+///
+/// Bounded like every other teardown wait (§3.3 rule 5): on deadline the
+/// exit proceeds and the trace says so. That is the pre-existing exposure,
+/// not a new one.
+pub(super) fn drain_mode_pushes() {
+    fence(Ordering::SeqCst);
+    let deadline = Instant::now() + PUSH_DRAIN_DEADLINE;
+    loop {
+        if PUSHES_IN_FLIGHT.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracelogging::write_event!(PROVIDER, "UpdateModesDrainTimeout", level(Warning));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -915,10 +1090,11 @@ pub unsafe extern "C" fn evt_parse_monitor_description(
 
     // The MONITOR list: the frozen superset, never the published subset.
     // `UPDATE_MODES` cannot change what is reported here, which is what
-    // keeps index 0 naming the same mode for the life of the monitor and
-    // consistent with the frozen EDID's preferred detailed timing.
+    // keeps this list constant for the life of the monitor. The PREFERRED
+    // INDEX is not constant, though — see `evt_parse_monitor_description2`.
     out.MonitorModeBufferOutputCount = snapshot.monitor.len() as u32;
-    out.PreferredMonitorModeIdx = 0;
+    out.PreferredMonitorModeIdx =
+        modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, usize::MAX);
     if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
         return STATUS_SUCCESS;
     }
@@ -930,6 +1106,8 @@ pub unsafe extern "C" fn evt_parse_monitor_description(
         slot.MonitorVideoSignalInfo = signal_info(mode, 0);
     }
     out.MonitorModeBufferOutputCount = fill as u32;
+    out.PreferredMonitorModeIdx =
+        modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, fill);
     STATUS_SUCCESS
 }
 
@@ -1067,11 +1245,27 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         level(Informational),
         u32("modes", &(snapshot.monitor.len() as u32)),
         u32("published", &(snapshot.targets.len() as u32)),
-        u32("buffer", &inp.MonitorModeBufferInputCount)
+        u32("buffer", &inp.MonitorModeBufferInputCount),
+        // Moves with the gate since build 17's second pass — a trace where
+        // `preferred` is nonzero says entry 0 is currently gated out.
+        u32(
+            "preferred",
+            &modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, usize::MAX)
+        )
     );
 
     out.MonitorModeBufferOutputCount = snapshot.monitor.len() as u32;
-    out.PreferredMonitorModeIdx = 0;
+    // THE PREFERRED INDEX MOVES WITH THE GATE. It was a constant 0 — the
+    // EDID's preferred detailed timing, `monitor_modes[0]` — which stopped
+    // being right the moment `UPDATE_MODES` could publish a target subset
+    // that excludes entry 0: Windows offers the INTERSECTION of the two
+    // lists, so a preferred index pointing outside the published subset
+    // names a mode the OS cannot activate, and nothing in a trace says
+    // why. Report the first monitor mode that is actually being offered.
+    // (`targets ⊆ superset` makes a match certain; the helper falls back
+    // to 0 rather than ever returning an out-of-range index.)
+    out.PreferredMonitorModeIdx =
+        modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, usize::MAX);
     if inp.MonitorModeBufferInputCount == 0 || inp.pMonitorModes.is_null() {
         return STATUS_SUCCESS;
     }
@@ -1084,6 +1278,11 @@ pub unsafe extern "C" fn evt_parse_monitor_description2(
         slot.BitsPerComponent = wire_bpc_for(mode);
     }
     out.MonitorModeBufferOutputCount = fill as u32;
+    // Re-taken against what was actually written: the index must name a
+    // mode inside the buffer the OS was given, and a truncated fill can
+    // exclude the offered entry the full list would have named.
+    out.PreferredMonitorModeIdx =
+        modepush::preferred_monitor_mode_idx(&snapshot.monitor, &snapshot.targets, fill);
     STATUS_SUCCESS
 }
 
@@ -1132,20 +1331,95 @@ pub unsafe extern "C" fn evt_query_target_modes2(
     STATUS_SUCCESS
 }
 
+/// The OS committing a path set on our adapter — and, since build 17, the
+/// only place the driver can learn WHICH MODE the desktop is actually
+/// running on each of our monitors.
+///
+/// # Why the path list is captured
+///
+/// `IddCxMonitorUpdateModes2` publishes a target subset. If that subset
+/// excludes the mode the OS has committed, Windows must re-select — a
+/// modeset on what is, under `virtual_display_layout=exclusive`, the ONLY
+/// active display, in the middle of the stream the whole feature exists to
+/// avoid disturbing. Build 17 discarded `IDDCX_PATH2` entirely, so the
+/// driver could neither refuse such a push nor even say in a trace that it
+/// had made one. `push_targets` now consults [`COMMITTED`] immediately
+/// before the call (`modepush::live_gate`).
+///
+/// # Callback-frame discipline (constraint 4)
+///
+/// This is a win32k-side modeset transaction on our thread. It therefore
+/// takes NO lock, allocates nothing, and calls nothing that can block: a
+/// fixed-size stack array is filled from the path list and published into
+/// a lock-free record with a bounded number of atomic stores. It must stay
+/// that way — in particular it must never take `shell.monitors`, which
+/// `push_targets` holds while building its target array.
 pub unsafe extern "C" fn evt_commit_modes2(
     _adapter: ffi::IDDCX_ADAPTER,
     in_args: *const ffi::IDARG_IN_COMMITMODES2,
 ) -> NTSTATUS {
+    let inp = &*in_args;
+    let count = inp.PathCount;
+    let mut recorded: [(u64, CommittedMode); MAX_COMMITTED_PATHS] =
+        [(0, CommittedMode { width: 0, height: 0, refresh_millihz: 0 }); MAX_COMMITTED_PATHS];
+    let mut active = 0usize;
+    let mut skipped = 0u32;
+    if !inp.pPaths.is_null() {
+        let paths = core::slice::from_raw_parts(inp.pPaths, count as usize);
+        for path in paths {
+            let is_active = path.Flags
+                & ffi::IDDCX_PATH_FLAGS_IDDCX_PATH_FLAGS_ACTIVE
+                != 0;
+            let sig = &path.TargetVideoSignalInfo;
+            let mode = CommittedMode::from_signal(
+                sig.activeSize.cx,
+                sig.activeSize.cy,
+                u64::from(sig.vSyncFreq.Numerator),
+                u64::from(sig.vSyncFreq.Denominator),
+            );
+            // Trace EVERY path, active or not, with what it committed:
+            // "which mode is this display running" is unanswerable from a
+            // capture without it, and an inactive path is exactly how a
+            // display being turned off presents.
+            tracelogging::write_event!(
+                PROVIDER,
+                "CommitModes2Path",
+                level(Informational),
+                u64("monitor", &(path.MonitorObject as u64)),
+                u32("flags", &path.Flags),
+                u32("active", &u32::from(is_active)),
+                u32("width", &mode.map_or(0, |m| m.width)),
+                u32("height", &mode.map_or(0, |m| m.height)),
+                u32("refresh_mhz", &mode.map_or(0, |m| m.refresh_millihz))
+            );
+            let Some(mode) = mode else { continue };
+            if !is_active || path.MonitorObject.is_null() {
+                continue;
+            }
+            if active < MAX_COMMITTED_PATHS {
+                recorded[active] = (path.MonitorObject as u64, mode);
+                active += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+    // REPLACE, not merge: this call carries the complete path set for the
+    // adapter, so a monitor absent from it has nothing committed. Keeping a
+    // stale entry would refuse that monitor's pushes forever.
+    COMMITTED.apply(&recorded[..active]);
     // Path-commit visibility (cold-boot instrumentation, 2026-07-25): a
     // monitor that never activates never gets a commit — this event's
     // absence after MonitorArrival localizes an activation failure to
     // the OS side of the mode negotiation in one trace.
-    let count = (*in_args).PathCount;
     tracelogging::write_event!(
         PROVIDER,
         "CommitModes2",
         level(Informational),
-        u32("paths", &count)
+        u32("paths", &count),
+        u32("active", &(active as u32)),
+        u32("skipped", &skipped),
+        u64("generation", &COMMITTED.generation())
     );
     STATUS_SUCCESS
 }

@@ -1,0 +1,818 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! The decisions behind an `UPDATE_MODES` push, below the shell line.
+//!
+//! `shell::monitors::push_targets` is the only caller of
+//! `IddCxMonitorUpdateModes2`, and it cannot be unit-tested: it needs the
+//! eWDK, a live IddCx adapter and an arrived monitor. So everything it
+//! *decides* lives here instead — which stage a request stops at, whether
+//! an outcome commits the durable list, and whether a proposed target list
+//! would evict the mode the OS has committed — exactly as
+//! [`crate::tdr`] does for the TDR poller's recovery discriminator.
+//!
+//! Three questions are answered here, and each of them was a defect first:
+//!
+//! 1. **Does this outcome commit?** [`PushOutcome::settle_result`] is the
+//!    single mapping from "what the push did" to
+//!    [`ModeUpdateResult`]. Before it existed, the TDR-parked arm mutated
+//!    the parked target list and then settled `NotApplied`, so the durable
+//!    list and the list the re-arrival would publish disagreed forever —
+//!    see [`parked_push`].
+//! 2. **What has the OS committed?** [`CommittedPaths`] is a lock-free
+//!    record of the paths `EvtIddCxAdapterCommitModes2` last handed us.
+//!    Before it existed the driver threw `IDDCX_PATH2` away and could
+//!    neither trace nor avoid publishing a subset that excluded the mode
+//!    the only active display was running.
+//! 3. **Which monitor mode is preferred?** [`preferred_monitor_mode_idx`] —
+//!    the answer stopped being a constant 0 the moment the published
+//!    target subset could exclude `monitor_modes[0]`.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use luminal_vgd_core::modes::Mode;
+use luminal_vgd_core::session::ModeUpdateResult;
+
+// ---------------------------------------------------------------------
+// Stages
+// ---------------------------------------------------------------------
+
+/// Stages for the `UpdateModes*` ETW events (constraint 6: every deny/fail
+/// path carries stage + code). Numbering is append-only, like `STAGE_*` in
+/// `shell::control`; 6 and 7 belong to the dispatch layer
+/// (`trace_update_modes_result`) and are deliberately skipped here.
+pub mod stage {
+    /// The session has neither a live nor a parked monitor.
+    pub const NO_MONITOR: u32 = 0;
+    /// Empty list — `TargetModeCount` cannot be zero (IddCx.h:3594).
+    pub const EMPTY: u32 = 1;
+    /// Applied to a TDR-parked spec; no OS call (there is no monitor
+    /// object to push at until the re-arrival creates one).
+    pub const PARKED: u32 = 2;
+    /// Stored, OS push skipped: a TDR duck is in flight.
+    pub const DUCK_PENDING: u32 = 3;
+    /// `IddCxMonitorUpdateModes2` returned failure.
+    pub const OS_CALL: u32 = 4;
+    /// The monitor changed under a failed push, so the rollback was
+    /// declined rather than written onto a stranger.
+    pub const ROLLBACK_RACED: u32 = 5;
+    /// The adapter was already torn down when the push was attempted.
+    pub const NO_ADAPTER: u32 = 8;
+    /// A requested target has no counterpart in the LIVE monitor's frozen
+    /// description.
+    pub const NOT_IN_SUPERSET: u32 = 9;
+    /// The push would have gated out the mode the OS has COMMITTED on this
+    /// monitor. Refused: see [`live_gate`].
+    pub const GATES_COMMITTED: u32 = 10;
+    /// A D3Final teardown landed between publishing the new runtime list
+    /// and the OS call, so the call was never made and the runtime list was
+    /// put back.
+    pub const ADAPTER_TORN_DOWN: u32 = 11;
+}
+
+// ---------------------------------------------------------------------
+// Outcomes
+// ---------------------------------------------------------------------
+
+/// What a push did with a pending target list. Every variant is reported
+/// to `SessionTable::settle_modes` exactly once, through
+/// [`settle_result`](Self::settle_result).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PushOutcome {
+    /// `IddCxMonitorUpdateModes2` returned success: the list is in force.
+    Applied { published: u32, superset: u32 },
+    /// The session was parked by a TDR duck-out, so there was no monitor
+    /// object to push at and the PARKED SPEC was patched instead. The
+    /// re-arrival publishes it — through `IddCxMonitorCreate` plus the
+    /// OS's own `QueryTargetModes2` solicitation, which is that monitor's
+    /// only publication mechanism — so this commits, exactly like
+    /// [`Applied`](Self::Applied).
+    ///
+    /// It is a separate variant rather than `Applied` because no OS call
+    /// happened: `UpdateModesApplied(modes, superset)` is the
+    /// replace-vs-append measurement (CLAUDE.md build 17), and folding a
+    /// call-less application into it would corrupt that reading.
+    AppliedParked { published: u32, superset: u32 },
+    /// No OS call was made and NOTHING was left changed. Retryable — the
+    /// host's next identical request resolves and pushes for real.
+    Deferred { stage: u32, count: u32 },
+    /// The OS refused, or there was nothing to push at, or the push was
+    /// refused before it could disturb a committed mode.
+    Failed { stage: u32, code: i32, count: u32, rolled_back: bool },
+}
+
+impl PushOutcome {
+    /// THE mapping from a push outcome to the durable commit. There is
+    /// exactly one, and it is the reason a caller cannot forget half of a
+    /// state change: any outcome that CHANGED a published list (the OS's
+    /// or a parked spec's) commits, and any outcome that changed nothing
+    /// does not.
+    pub fn settle_result(self) -> ModeUpdateResult {
+        if self.commits() {
+            ModeUpdateResult::Applied
+        } else {
+            ModeUpdateResult::NotApplied
+        }
+    }
+
+    /// True when this outcome means "the published list really changed",
+    /// which is both the durable-commit condition and — for
+    /// [`AppliedParked`](Self::AppliedParked) — the caller's instruction to
+    /// write the parked spec.
+    pub fn commits(self) -> bool {
+        matches!(self, PushOutcome::Applied { .. } | PushOutcome::AppliedParked { .. })
+    }
+}
+
+/// Decide what a push that lands on a TDR-PARKED session does.
+///
+/// A parked monitor was departed by the duck-out and its re-arrival
+/// creates a NEW monitor object from the SAME EDID, so there is nothing to
+/// call `IddCxMonitorUpdateModes2` on and the only way to make the update
+/// survive the recovery is to patch the parked spec the replug plugs with.
+///
+/// # Why this returns an APPLICATION and not a deferral
+///
+/// Build 17 patched the parked spec and then settled `NotApplied`. Both
+/// halves are defensible alone and together they are a permanent split
+/// brain:
+///
+/// * the parked spec — and therefore the monitor the replug re-arrives —
+///   published the NEW subset, while
+/// * the durable `Monitor.target_modes` still held the OLD one.
+///
+/// `SessionTable::update_modes` short-circuits a request that matches the
+/// durable list ("already published, nothing to do", no effect, `OK`), so
+/// the host could never get back to the wider list: it would ask for
+/// exactly the list the table thought was in force, be told yes, and go on
+/// streaming to a monitor that offered the gated subset. The rescind
+/// direction was unreachable for the life of the session.
+///
+/// So a patch is an application: it changes what the monitor publishes, so
+/// it commits. A push that changes nothing (a duck in flight, a torn-down
+/// adapter) stays a deferral — that distinction is the whole discipline.
+pub fn parked_push(parked_superset: &[Mode], targets: &[Mode]) -> PushOutcome {
+    let count = targets.len() as u32;
+    if count == 0 {
+        return PushOutcome::Failed {
+            stage: stage::EMPTY,
+            code: luminal_driver_proto::err::BAD_MODE,
+            count: 0,
+            rolled_back: false,
+        };
+    }
+    // The parked superset is the same one the request was validated
+    // against (the replug recreates from the same EDID), so this holds
+    // already; re-checked anyway, because it is one scan of at most four
+    // entries and the alternative is an unactivatable parked spec.
+    if !targets.iter().all(|m| parked_superset.contains(m)) {
+        return PushOutcome::Failed {
+            stage: stage::NOT_IN_SUPERSET,
+            code: luminal_driver_proto::err::BAD_MODE,
+            count,
+            rolled_back: false,
+        };
+    }
+    PushOutcome::AppliedParked { published: count, superset: parked_superset.len() as u32 }
+}
+
+// ---------------------------------------------------------------------
+// The committed path
+// ---------------------------------------------------------------------
+
+/// One mode the OS has COMMITTED on a path, as recorded by
+/// `EvtIddCxAdapterCommitModes2`.
+///
+/// Deliberately not a [`Mode`]: `IDDCX_PATH2` carries a
+/// `DISPLAYCONFIG_VIDEO_SIGNAL_INFO`, which has no bit depth and no HDR
+/// flag, and inventing those to manufacture a `Mode` would let a
+/// comparison succeed or fail on fields the OS never told us about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CommittedMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
+
+impl CommittedMode {
+    /// Rebuild the committed mode from the path's signal block.
+    ///
+    /// `vSyncFreq` is a rational, and the OS is free to hand back a
+    /// REDUCED fraction of what `signal_info` reported (we always send
+    /// `refresh_millihz / 1000`), so the millihertz value is recomputed
+    /// rather than read out of the numerator. A zero denominator or a zero
+    /// dimension means the path carries nothing we can reason about —
+    /// `None`, which every caller treats as "no committed mode", i.e. as
+    /// today's behaviour.
+    pub fn from_signal(width: u32, height: u32, vsync_num: u64, vsync_den: u64) -> Option<Self> {
+        if width == 0 || height == 0 || vsync_den == 0 {
+            return None;
+        }
+        let millihz = vsync_num.checked_mul(1000)? / vsync_den;
+        if millihz == 0 || millihz > u64::from(u32::MAX) {
+            return None;
+        }
+        Some(Self { width, height, refresh_millihz: millihz as u32 })
+    }
+
+    /// Is `mode` the mode the OS committed? Compared on the three fields a
+    /// signal block actually carries.
+    pub fn is(&self, mode: &Mode) -> bool {
+        mode.width == self.width
+            && mode.height == self.height
+            && mode.refresh_millihz == self.refresh_millihz
+    }
+}
+
+/// Slots in [`CommittedPaths`]. One per monitor the adapter can have
+/// (`proto::ABI_MAX_MONITORS`); a commit carrying more paths than this
+/// records the first `MAX_COMMITTED_PATHS` and is traced, which is
+/// unreachable for a driver whose own session cap is the same number.
+pub const MAX_COMMITTED_PATHS: usize = luminal_driver_proto::ABI_MAX_MONITORS as usize;
+
+/// Bounded retries for one slot read. A read that keeps losing to a
+/// concurrent commit reports "no committed mode", which degrades to the
+/// pre-build-17 behaviour (push anyway) rather than to a spin — nothing in
+/// a driver may retry without a bound, least of all on an effects worker.
+const READ_RETRIES: u32 = 4;
+
+/// The paths the OS last committed, keyed by IddCx monitor object.
+///
+/// # Why this is lock-free rather than a `Mutex<HashMap<..>>`
+///
+/// It is written from `EvtIddCxAdapterCommitModes2`, which is a CALLBACK
+/// FRAME (DESIGN.md §3.3): the OS is inside a modeset transaction on our
+/// thread, and anything that can block there can wedge a display change.
+/// So the writer does a fixed number of atomic stores into a fixed array —
+/// no allocation, no lock, no syscall — and the reader (the effects
+/// worker, immediately before an `IddCxMonitorUpdateModes2`) does a
+/// bounded seqlock-style read keyed on the monitor field.
+///
+/// Each slot publishes its payload BEFORE its key with release ordering,
+/// and the reader re-reads the key after the payload: a slot being
+/// rewritten under a reader yields either the old pairing or the new one,
+/// never a mixture of the two.
+pub struct CommittedPaths {
+    slots: [CommittedSlot; MAX_COMMITTED_PATHS],
+    /// Active paths in the last commit (may exceed the slots recorded).
+    active: AtomicU32,
+    /// Commits observed. Diagnostics only — a trace showing a push
+    /// refused at [`stage::GATES_COMMITTED`] can be read against the
+    /// commit that set it.
+    generation: AtomicU64,
+}
+
+struct CommittedSlot {
+    /// The `IDDCX_MONITOR` handle as an integer. 0 = empty. Written LAST
+    /// (release) and re-read by the reader to validate the payload.
+    monitor: AtomicU64,
+    /// `(width << 32) | height`.
+    size: AtomicU64,
+    refresh_millihz: AtomicU32,
+}
+
+impl CommittedSlot {
+    const fn new() -> Self {
+        Self {
+            monitor: AtomicU64::new(0),
+            size: AtomicU64::new(0),
+            refresh_millihz: AtomicU32::new(0),
+        }
+    }
+}
+
+impl Default for CommittedPaths {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommittedPaths {
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { CommittedSlot::new() }; MAX_COMMITTED_PATHS],
+            active: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Replace the whole record with the ACTIVE paths of one commit.
+    ///
+    /// Replace, not merge: `EvtIddCxAdapterCommitModes2` is handed the
+    /// complete path set for the adapter, so a monitor absent from it is a
+    /// monitor with no committed mode, and remembering a stale one would
+    /// refuse pushes forever after a display was turned off.
+    ///
+    /// Returns the number of paths recorded.
+    pub fn apply(&self, paths: &[(u64, CommittedMode)]) -> u32 {
+        // Invalidate every key first: a reader racing this sees "no
+        // committed mode" for an instant, which allows a push it might
+        // otherwise refuse. That is the safe direction to lose (it is what
+        // the driver did for its whole life before this) and it is the only
+        // way to clear departed monitors without a second pass.
+        for slot in &self.slots {
+            slot.monitor.store(0, Ordering::Release);
+        }
+        let recorded = paths.len().min(MAX_COMMITTED_PATHS);
+        for (slot, (monitor, mode)) in self.slots.iter().zip(&paths[..recorded]) {
+            if *monitor == 0 {
+                continue;
+            }
+            slot.size
+                .store((u64::from(mode.width) << 32) | u64::from(mode.height), Ordering::Release);
+            slot.refresh_millihz.store(mode.refresh_millihz, Ordering::Release);
+            // Key LAST: the payload above happens-before any reader that
+            // observes this store.
+            slot.monitor.store(*monitor, Ordering::Release);
+        }
+        self.active.store(paths.len() as u32, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        recorded as u32
+    }
+
+    /// Forget one monitor — it departed, so whatever it had committed is
+    /// gone with it and the handle may be reissued to a different monitor.
+    pub fn forget(&self, monitor: u64) {
+        if monitor == 0 {
+            return;
+        }
+        for slot in &self.slots {
+            if slot.monitor.load(Ordering::Acquire) == monitor {
+                slot.monitor.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    /// The mode the OS has committed on `monitor`, if any.
+    pub fn get(&self, monitor: u64) -> Option<CommittedMode> {
+        if monitor == 0 {
+            return None;
+        }
+        for slot in &self.slots {
+            for _ in 0..READ_RETRIES {
+                if slot.monitor.load(Ordering::Acquire) != monitor {
+                    break;
+                }
+                let size = slot.size.load(Ordering::Acquire);
+                let refresh_millihz = slot.refresh_millihz.load(Ordering::Acquire);
+                // Re-read the key: if the slot was rewritten under us, the
+                // payload above may belong to two different commits.
+                if slot.monitor.load(Ordering::Acquire) == monitor {
+                    return Some(CommittedMode {
+                        width: (size >> 32) as u32,
+                        height: size as u32,
+                        refresh_millihz,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Active paths in the last commit. Diagnostics.
+    pub fn active(&self) -> u32 {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Commits observed. Diagnostics.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+// ---------------------------------------------------------------------
+// The gate
+// ---------------------------------------------------------------------
+
+/// What a proposed target list may do to a LIVE monitor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LiveGate {
+    /// Publish it.
+    Push,
+    /// A target has no counterpart in this monitor's frozen description.
+    /// The OS could never surface it (Windows offers the INTERSECTION), and
+    /// publishing it would be invisible to the user and inexplicable in a
+    /// trace.
+    NotInSuperset,
+    /// The list would gate out the mode the OS has COMMITTED on this
+    /// monitor.
+    EvictsCommitted(CommittedMode),
+}
+
+/// Decide whether a validated target list may be pushed at a live monitor.
+///
+/// # The committed-mode rule
+///
+/// `UPDATE_MODES` steers what the OS MAY select. It never evicts what the
+/// OS HAS selected.
+///
+/// Publishing a subset that excludes the committed mode forces Windows to
+/// re-select on a display that is, under `virtual_display_layout=exclusive`,
+/// the only active one — a modeset in the middle of the stream the feature
+/// exists to avoid disturbing. Since the driver now knows what is
+/// committed (`EvtIddCxAdapterCommitModes2` → [`CommittedPaths`]), it
+/// refuses that one push rather than performing it blind. A refused PUSH is
+/// not a refused session (constraint 1): the previously published list
+/// stays in force, the monitor keeps working, the stream keeps running, and
+/// the sticky `err::UPDATE_FAILED` tells the host to re-ask.
+///
+/// A host that wants the display on a DIFFERENT mode does the modeset
+/// itself — `SetDisplayConfig`, which is what LuminalShine's display helper
+/// already does for topology — and then gates, at which point the committed
+/// mode is one it is keeping and this returns [`Push`](LiveGate::Push).
+///
+/// # Fail-open, deliberately
+///
+/// The refusal fires only when the committed mode is one this monitor's
+/// superset actually describes. If the OS committed something we cannot
+/// recognise — a decoding mismatch, a mode from a monitor object we are
+/// not tracking — the push proceeds exactly as it did before this gate
+/// existed, and the trace says so. A gate that fired on an unrecognised
+/// commit would silently turn the whole feature off.
+pub fn live_gate(
+    superset: &[Mode],
+    targets: &[Mode],
+    committed: Option<CommittedMode>,
+) -> LiveGate {
+    // THE containment check, against the LIVE monitor's own description
+    // rather than the session table's copy: the two could in principle
+    // have been reconciled by different paths (a replug rebuilding the
+    // runtime, a session id reused), and this is the last statement before
+    // the OS call.
+    if !targets.iter().all(|m| superset.contains(m)) {
+        return LiveGate::NotInSuperset;
+    }
+    if let Some(committed) = committed {
+        let ours = superset.iter().any(|m| committed.is(m));
+        if ours && !targets.iter().any(|m| committed.is(m)) {
+            return LiveGate::EvictsCommitted(committed);
+        }
+    }
+    LiveGate::Push
+}
+
+/// The `PreferredMonitorModeIdx` to report from the parse-description DDIs.
+///
+/// The monitor-mode list is frozen and `monitor_modes[0]` is the EDID's
+/// preferred detailed timing, so 0 was the answer until build 17 made the
+/// published TARGET subset a moving thing. Windows offers the
+/// INTERSECTION of the two lists, so once a gate excludes
+/// `monitor_modes[0]` a preferred index of 0 names a mode that cannot be
+/// activated: the OS's default choice is unreachable, and nothing in a
+/// trace says why.
+///
+/// So: the first monitor mode that is actually being offered. Falling back
+/// to 0 when nothing matches keeps the answer in range whatever happens —
+/// `targets ⊆ superset` makes a match certain, and a preferred index out
+/// of range would be a far worse failure than a stale one. `fill` is the
+/// number of modes actually written into the OS's buffer, because the
+/// index must name one of those.
+pub fn preferred_monitor_mode_idx(monitor_modes: &[Mode], targets: &[Mode], fill: usize) -> u32 {
+    let limit = fill.min(monitor_modes.len());
+    for (i, mode) in monitor_modes.iter().take(limit).enumerate() {
+        if targets.contains(mode) {
+            return i as u32;
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luminal_driver_proto::{caps, BitDepth, CreateMonitorRequest, ModeSpec};
+    use luminal_vgd_core::adapter::AdapterInfo;
+    use luminal_vgd_core::session::SessionTable;
+
+    const CAPS: u32 = caps::MULTI_MODE | caps::DYNAMIC_MODES;
+    const BASE: u32 = 120_000;
+    const DOUBLED: u32 = 240_000;
+
+    fn mode(refresh_millihz: u32) -> Mode {
+        Mode {
+            width: 2560,
+            height: 1440,
+            refresh_millihz,
+            bit_depth: BitDepth::Sdr8,
+            hdr: false,
+        }
+    }
+
+    fn spec(refresh_millihz: u32) -> ModeSpec {
+        ModeSpec { width: 2560, height: 1440, refresh_millihz }
+    }
+
+    fn adapters() -> Vec<AdapterInfo> {
+        vec![AdapterInfo { luid: 0x20, vram_bytes: 16 << 30, name: "dGPU".into(), software: false }]
+    }
+
+    /// A table holding one monitor whose frozen superset is
+    /// `[BASE, DOUBLED]`, with the whole superset published (nothing gated
+    /// yet) — the state every session starts in.
+    fn table_with_both_rates() -> SessionTable {
+        let mut modes = [ModeSpec::default(); 4];
+        modes[0] = spec(BASE);
+        modes[1] = spec(DOUBLED);
+        let req = CreateMonitorRequest {
+            session_id: 1,
+            display_id: 0,
+            adapter_luid: 0,
+            lease_timeout_ms: luminal_driver_proto::LEASE_TIMEOUT_USE_DEFAULT,
+            bit_depth: 8,
+            hdr: 0,
+            edid_serial: 0,
+            flags: 0,
+            mode_count: 2,
+            modes,
+            physical_width_mm: 0,
+            physical_height_mm: 0,
+            friendly_name: [0; 32],
+            max_nits: 0,
+            reserved0: 0,
+        };
+        let mut t = SessionTable::new(4, 10);
+        t.create(0, &req, CAPS, &adapters(), 0).expect("create");
+        t
+    }
+
+    // -----------------------------------------------------------------
+    // MAJOR 1 — the TDR-parked patch must go through the same
+    // pending/settle discipline as every other push.
+    // -----------------------------------------------------------------
+
+    /// THE REGRESSION TEST for the parked-patch split brain.
+    ///
+    /// `parked_push` tells its caller to write the parked spec, so the
+    /// monitor the replug re-arrives WILL publish the gated subset. If that
+    /// same outcome settles `NotApplied`, the durable list keeps the old
+    /// one, the two disagree permanently, and — the part that cannot be
+    /// recovered from — the host's rescind is short-circuited by
+    /// `SessionTable::update_modes` as "already published", emits no
+    /// effect, and returns success while the monitor keeps offering the
+    /// subset the host just took back.
+    #[test]
+    fn a_parked_patch_commits_durably_so_a_rescind_still_re_pushes() {
+        let mut t = table_with_both_rates();
+        let superset: Vec<Mode> = t.get(1).unwrap().modes.clone();
+
+        // The host gates down to the doubled rate while the session is
+        // parked in a TDR duck-out.
+        let update = t.update_modes(1, &[spec(DOUBLED)], CAPS).expect("accepted");
+        let seq = update.queued.expect("a real change queues a push");
+
+        // The shell's parked arm: decide, patch, settle. `commits()` is
+        // what tells the caller to write the parked spec at all.
+        let outcome = parked_push(&superset, &update.targets);
+        assert_eq!(
+            outcome,
+            PushOutcome::AppliedParked { published: 1, superset: 2 },
+            "a patched parked spec is an application, not a deferral"
+        );
+        assert!(outcome.commits(), "the caller is being told to write the parked spec");
+        assert!(t.settle_modes(1, seq, outcome.settle_result()));
+
+        // Durable now agrees with what the re-arrival will publish.
+        assert_eq!(
+            t.get(1).unwrap().target_modes,
+            vec![mode(DOUBLED)],
+            "the durable list must match the parked spec the replug plugs with"
+        );
+
+        // THE CONSEQUENCE. The host changes its mind and rescinds the gate.
+        // With the durable list committed this is a real change, so it
+        // queues a real push; with it left behind, `update_modes` matches
+        // the stale durable list, returns "already published", emits no
+        // effect — and the monitor offers the gated subset forever.
+        let rescind = t.update_modes(1, &[spec(BASE), spec(DOUBLED)], CAPS).expect("accepted");
+        assert!(
+            rescind.queued.is_some(),
+            "rescinding a gate the driver applied must push, not short-circuit"
+        );
+        assert_eq!(rescind.targets.len(), 2);
+    }
+
+    /// The other direction of the same discipline: an outcome that changed
+    /// NOTHING must not commit, or a deferral becomes a silent lie about
+    /// what the monitor publishes.
+    #[test]
+    fn outcomes_that_changed_nothing_do_not_commit() {
+        for outcome in [
+            PushOutcome::Deferred { stage: stage::DUCK_PENDING, count: 1 },
+            PushOutcome::Deferred { stage: stage::NO_ADAPTER, count: 1 },
+            PushOutcome::Failed {
+                stage: stage::OS_CALL,
+                code: -1,
+                count: 1,
+                rolled_back: true,
+            },
+            PushOutcome::Failed {
+                stage: stage::GATES_COMMITTED,
+                code: luminal_driver_proto::err::BAD_MODE,
+                count: 1,
+                rolled_back: false,
+            },
+        ] {
+            assert!(!outcome.commits(), "{outcome:?}");
+            assert_eq!(outcome.settle_result(), ModeUpdateResult::NotApplied, "{outcome:?}");
+        }
+        for outcome in [
+            PushOutcome::Applied { published: 1, superset: 2 },
+            PushOutcome::AppliedParked { published: 1, superset: 2 },
+        ] {
+            assert!(outcome.commits(), "{outcome:?}");
+            assert_eq!(outcome.settle_result(), ModeUpdateResult::Applied, "{outcome:?}");
+        }
+    }
+
+    /// A parked spec is still checked against the parked SUPERSET, and a
+    /// refusal must not commit anything — the parked monitor keeps the
+    /// selection it was parked with (constraint 1: never a monitor left
+    /// with no targets).
+    #[test]
+    fn a_parked_push_outside_the_parked_superset_is_refused_and_commits_nothing() {
+        let superset = vec![mode(BASE), mode(DOUBLED)];
+        let outcome = parked_push(&superset, &[mode(60_000)]);
+        assert_eq!(
+            outcome,
+            PushOutcome::Failed {
+                stage: stage::NOT_IN_SUPERSET,
+                code: luminal_driver_proto::err::BAD_MODE,
+                count: 1,
+                rolled_back: false,
+            }
+        );
+        assert!(!outcome.commits());
+        // And the empty list never reaches the DDI's "cannot be zero".
+        assert!(matches!(
+            parked_push(&superset, &[]),
+            PushOutcome::Failed { stage: stage::EMPTY, .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // MAJOR 2 — the committed path.
+    // -----------------------------------------------------------------
+
+    /// THE REGRESSION TEST for publishing over the OS's committed mode.
+    ///
+    /// Under `virtual_display_layout=exclusive` the virtual display is the
+    /// ONLY active one. A push that drops the committed rate forces Windows
+    /// to re-select on it — a modeset in the middle of the stream this
+    /// whole feature exists to avoid. Before the commit capture the driver
+    /// could not even detect the case.
+    #[test]
+    fn a_push_that_would_evict_the_committed_mode_is_refused() {
+        let superset = vec![mode(BASE), mode(DOUBLED)];
+        let committed = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+
+        // Gating down to the doubled rate alone would evict it.
+        assert_eq!(
+            live_gate(&superset, &[mode(DOUBLED)], Some(committed)),
+            LiveGate::EvictsCommitted(committed),
+            "gating out the committed mode must be refused, not pushed blind"
+        );
+
+        // Keeping it is fine, gated or not.
+        assert_eq!(live_gate(&superset, &[mode(BASE)], Some(committed)), LiveGate::Push);
+        assert_eq!(
+            live_gate(&superset, &[mode(BASE), mode(DOUBLED)], Some(committed)),
+            LiveGate::Push
+        );
+        // Nothing committed (never activated, or the path went inactive):
+        // gating is unconstrained.
+        assert_eq!(live_gate(&superset, &[mode(DOUBLED)], None), LiveGate::Push);
+    }
+
+    /// Fail-open: a committed mode this monitor's superset does not
+    /// describe cannot be reasoned about, so the push proceeds exactly as
+    /// it did before the gate existed. A gate that fired here would turn
+    /// the feature off system-wide on any decoding mismatch.
+    #[test]
+    fn an_unrecognised_committed_mode_never_refuses_a_push() {
+        let superset = vec![mode(BASE), mode(DOUBLED)];
+        let alien = CommittedMode { width: 1920, height: 1080, refresh_millihz: 60_000 };
+        assert_eq!(live_gate(&superset, &[mode(DOUBLED)], Some(alien)), LiveGate::Push);
+    }
+
+    /// The superset check still comes first: it is the invariant that keeps
+    /// the design safe under BOTH replace and append semantics.
+    #[test]
+    fn the_superset_check_precedes_the_committed_check() {
+        let superset = vec![mode(BASE)];
+        let committed = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+        assert_eq!(
+            live_gate(&superset, &[mode(DOUBLED)], Some(committed)),
+            LiveGate::NotInSuperset
+        );
+    }
+
+    /// The OS may hand back a REDUCED `vSyncFreq` fraction, so the
+    /// millihertz value is recomputed from the rational rather than read
+    /// out of the numerator we happened to send.
+    #[test]
+    fn a_committed_mode_survives_a_reduced_vsync_fraction() {
+        let sent = CommittedMode::from_signal(2560, 1440, 240_000, 1000).unwrap();
+        assert_eq!(sent.refresh_millihz, 240_000);
+        // 240000/1000 reduced to 240/1, and to 24000/100.
+        assert_eq!(CommittedMode::from_signal(2560, 1440, 240, 1), Some(sent));
+        assert_eq!(CommittedMode::from_signal(2560, 1440, 24_000, 100), Some(sent));
+        assert!(sent.is(&mode(DOUBLED)));
+        assert!(!sent.is(&mode(BASE)));
+        // Degenerate blocks are "no committed mode", never a panic and
+        // never a division by zero on a callback frame.
+        assert_eq!(CommittedMode::from_signal(2560, 1440, 240, 0), None);
+        assert_eq!(CommittedMode::from_signal(0, 1440, 240, 1), None);
+        assert_eq!(CommittedMode::from_signal(2560, 1440, 0, 1), None);
+    }
+
+    /// The record is REPLACED by every commit, so a monitor that leaves the
+    /// path set stops having a committed mode. Remembering a stale one
+    /// would refuse every later push on that monitor.
+    #[test]
+    fn a_commit_replaces_the_whole_record() {
+        let paths = CommittedPaths::new();
+        let a = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+        let b = CommittedMode { width: 3840, height: 2160, refresh_millihz: 60_000 };
+        assert_eq!(paths.get(0x11), None, "nothing committed yet");
+
+        assert_eq!(paths.apply(&[(0x11, a), (0x22, b)]), 2);
+        assert_eq!(paths.get(0x11), Some(a));
+        assert_eq!(paths.get(0x22), Some(b));
+        assert_eq!(paths.active(), 2);
+
+        // Second display turned off: only one path comes back.
+        paths.apply(&[(0x11, b)]);
+        assert_eq!(paths.get(0x11), Some(b), "same monitor, new mode");
+        assert_eq!(paths.get(0x22), None, "a monitor that left the path set has nothing committed");
+
+        // Every path inactive: the whole record clears.
+        paths.apply(&[]);
+        assert_eq!(paths.get(0x11), None);
+        assert_eq!(paths.active(), 0);
+        assert_eq!(paths.generation(), 3);
+    }
+
+    /// A departed monitor's handle can be reissued to a different monitor
+    /// object, so the record must be forgettable independently of the next
+    /// commit.
+    #[test]
+    fn forgetting_a_departed_monitor_leaves_the_others_alone() {
+        let paths = CommittedPaths::new();
+        let a = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+        let b = CommittedMode { width: 3840, height: 2160, refresh_millihz: 60_000 };
+        paths.apply(&[(0x11, a), (0x22, b)]);
+        paths.forget(0x11);
+        assert_eq!(paths.get(0x11), None);
+        assert_eq!(paths.get(0x22), Some(b));
+        // A null handle is never a key, and forgetting it must not clear
+        // the empty slots' meaning.
+        paths.forget(0);
+        assert_eq!(paths.get(0x22), Some(b));
+        assert_eq!(paths.get(0), None);
+    }
+
+    /// More paths than slots records what fits and never writes out of
+    /// bounds — unreachable while the session cap equals the slot count,
+    /// which is exactly why it is asserted here rather than assumed.
+    #[test]
+    fn more_paths_than_slots_is_bounded() {
+        let paths = CommittedPaths::new();
+        let m = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+        let many: Vec<(u64, CommittedMode)> =
+            (1..=(MAX_COMMITTED_PATHS as u64 + 4)).map(|i| (i, m)).collect();
+        assert_eq!(paths.apply(&many), MAX_COMMITTED_PATHS as u32);
+        assert_eq!(paths.active(), many.len() as u32);
+        assert_eq!(paths.get(1), Some(m));
+        assert_eq!(paths.get(MAX_COMMITTED_PATHS as u64), Some(m));
+        assert_eq!(paths.get(MAX_COMMITTED_PATHS as u64 + 1), None);
+    }
+
+    // -----------------------------------------------------------------
+    // MINOR — the preferred monitor mode.
+    // -----------------------------------------------------------------
+
+    /// `PreferredMonitorModeIdx` names a mode the OS can actually pick.
+    /// With `monitor_modes[0]` gated out, a constant 0 pointed the OS's
+    /// default choice at a mode outside the published intersection.
+    #[test]
+    fn the_preferred_index_names_a_mode_that_is_actually_offered() {
+        let superset = vec![mode(BASE), mode(DOUBLED)];
+        // Nothing gated: the EDID's preferred detailed timing, as always.
+        assert_eq!(preferred_monitor_mode_idx(&superset, &superset, 2), 0);
+        // Gated to the doubled rate: entry 0 is unreachable, so name entry 1.
+        assert_eq!(preferred_monitor_mode_idx(&superset, &[mode(DOUBLED)], 2), 1);
+        // Gated to the base rate: entry 0 again.
+        assert_eq!(preferred_monitor_mode_idx(&superset, &[mode(BASE)], 2), 0);
+    }
+
+    /// The index must name a mode inside the buffer the OS was given, and
+    /// must stay in range for inputs the invariant says cannot happen.
+    #[test]
+    fn the_preferred_index_stays_inside_the_reported_buffer() {
+        let superset = vec![mode(BASE), mode(DOUBLED)];
+        // Truncated buffer: entry 1 was not reported, so it cannot be named.
+        assert_eq!(preferred_monitor_mode_idx(&superset, &[mode(DOUBLED)], 1), 0);
+        assert_eq!(preferred_monitor_mode_idx(&superset, &[mode(DOUBLED)], 0), 0);
+        // targets ⊄ superset is impossible by invariant; still in range.
+        assert_eq!(preferred_monitor_mode_idx(&superset, &[mode(60_000)], 2), 0);
+        assert_eq!(preferred_monitor_mode_idx(&[], &[mode(BASE)], 2), 0);
+    }
+}
