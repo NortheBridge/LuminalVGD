@@ -319,6 +319,35 @@ Cursor bring-up lessons (each cost one traced signing round — the
   signature to remember: 0x1b8 storms in WER = one of our callbacks is
   not returning.
 
+  > **⚠ REFUTED ON BUILD 29617 (corrected 2026-07-30 by debugging 25 dumps
+  > with cdb). Do not reason from the rule above on current Windows.**
+  > On this build `0x1b8` is `VIDEO_MINIPORT_BLACK_SCREEN_LIVEDUMP`, not a
+  > win32k callout watchdog. All 25 dumps across 2026-07-29/30 carry Arg1=0xa
+  > and a byte-identical stack:
+  > `dwm.exe → NtGdiDdDDIEscape → dxgkrnl!DxgkEscape →
+  > win32kbase!xxxDisplayDiagBlackScreenDetected → dxgkrnl!DxgkCheckDisplayState
+  > → dxgkrnl!DxgCreateLiveDumpWithDriverBlob → watchdog!WdDbgReportCreate`.
+  > `watchdog.sys` appears **only as the report writer**, called *by* dxgkrnl
+  > with `0x1b8` passed as an ordinary argument — there is no watchdog wait
+  > anywhere, and the single captured thread is dwm.exe **running**, not
+  > blocked. dwm is voluntarily reporting a black screen.
+  >
+  > So on 29617 a `0x1b8` storm counts **black-screen symptoms, not hung
+  > callbacks**. The rule was true when `0x1b8` genuinely was a callout
+  > watchdog on an older OS; it is a false lead now, and it sent one
+  > investigation looking for a hung IddCx callback that did not exist.
+  >
+  > Two further corrections from the same session:
+  > - The `4400/4401/4402/4403` in `WATCHDOG*.dmp` filenames are **rotating
+  >   WER slots, not bugcheck subcodes** (caught live: `4403` at 20:23:02.260
+  >   followed by `4400` at 20:23:02.801 — 541 ms apart, same process, same
+  >   stack).
+  > - These are 256 KB kernel **triage** dumps: one process record, one
+  >   thread, one call stack. `!process 0 0` fails and `!stacks 2` returns
+  >   nothing. They can neither implicate nor exonerate this driver, and any
+  >   claim in either direction from them is unsupported. Driver-side ground
+  >   truth comes from our own ETW provider, not from these.
+
 ### Phase 7 — packaging & first release (2026-07-23, build 8)
 
 **Control-surface ACL (the §6 release blocker) shipped**: the control
@@ -709,3 +738,736 @@ TdrDuckStart(cycle)/TdrDuckDeparted/TdrReplugged/TdrDuckAbandoned(reason)/
 TdrRecoveryProbeHung/TdrDuckTornDownMidFlight; a TDR-injection or
 driver-verifier-forced device-removal pass would exercise the duck; a
 plain stream + reconnect must show ZERO Tdr* events.
+
+### Build 16 — duck the DEVICE, not the DISPLAY (2026-07-30, branch `feat/duck-the-device-build16`; UNSIGNED, UNINSTALLED, UNVALIDATED)
+
+**Build 14's duck-out is not the root cause, but it amplifies.** Verified
+2026-07-30 incident: corrected PCIe AER on the GPU root port (09:02:15.111)
+→ AcquireBuffer = DEVICE_REMOVED, GetDeviceRemovedReason = DEVICE_RESET
+(:18.337) → the Tier-1 duck-out departs the ONLY active display under
+`virtual_display_layout=exclusive`, taking the active display count to ZERO
+by our own design (:18.421) → dwm.exe reports a BLACK SCREEN 131 ms later
+and Windows writes a 0x1b8 live dump (:18.552) → QueryDisplayConfig
+SUCCEEDS but returns ZERO paths for 7.9 s, then returns ERROR_NOT_SUPPORTED
+and never recovers (:26.569) → dwm.exe is recreated and the replacement
+inherits the wedge instantly. Only a power cycle cleared it. **Windows
+logged NO Event 4101** — the OS never ran a TDR recovery cycle at all, so
+the thing the duck existed to get out of the way of never happened. The
+driver never un-ducked (no TdrReplugged/TdrDuckAbandoned for 7 min 3 s):
+per spec, TDR_MAX_DUCK_CYCLES=3 with a 10-min budget. Net: a recoverable
+device removal became a machine-wide zero-path black screen, and the
+departure's DBT_DEVNODES_CHANGED broadcast is the documented GTA V killer.
+
+Build 16 restores DESIGN.md §3.3 rule 2 ("Monitors stay attached"), which
+builds 14/15 had deviated from. On device removal the frame worker still
+tears down the D3D device, abandons the swapchain, retires textures
+(generation bump) and marks the ring REBUILDING — all of which already
+happened at swapchain.rs:454-459 — but **the IddCx monitor stays ARRIVED**,
+so Windows keeps a display path and no departure is broadcast. Contract
+basis (three independent proofs, all verified in-tree): `evt_unassign`
+already leaves monitors arrived with no swapchain, and the OS does exactly
+that ~10 ms after every activation; `frame_loop`'s failure exit has shipped
+since build 3 leaving the monitor arrived while dropping the device; IddCx
+binds the device to the SWAPCHAIN via `IddCxSwapChainSetDevice`, never to
+monitor arrival.
+
+- **Gate (constraint 1):** `DriverConfig::tdr_duck_mode` (dispatch.rs),
+  default `TDR_DUCK_DEVICE`=0. `LuminalVgdTdrDuckMode` REG_DWORD = 1 under
+  the devnode's `Device Parameters` key restores the build-14/15 display
+  duck-out via `pnputil /restart-device`, NO reinstall. Read at device add
+  (`control::read_tdr_duck_mode` — this registry read did not exist before;
+  DriverConfig's "read from the registry" doc comment described wiring that
+  was never built), mirrored into `Shell::tdr_duck_mode` (AtomicU32) so the
+  TDR path never takes the device lock. Absent ⇒ new behaviour;
+  out-of-range clamps to default; a read FAILURE is traced with a stage so
+  "never configured" and "unreadable" are distinguishable. Deliberately NOT
+  seeded by the INF: HKR AddReg rewrites on every package update and would
+  silently stomp an operator's override mid-upgrade.
+- **Branch point:** `control::queue_tdr_duck(session_id)` — one decision for
+  both frame-loop call sites (acquire failure and publish failure), so the
+  two modes can never diverge.
+- **New path:** `TdrDeviceDuck` adds no global state beyond the existing
+  one-in-flight latch and starts a 250 ms-tick poller thread
+  (`vgd-tdr-device`). It keeps worker-less rings' heartbeats alive
+  (`ring_heartbeat_arc`, single try_lock — a detached worker pins the ring
+  mutex), probes the render LUID on throwaway 15 s-deadline threads, and has
+  exactly three exits: the OS re-assigned a swapchain on its own (the good
+  one — ZERO modesets, display never left) → `TdrDeviceReassigned`; GPU
+  healthy but no re-assign within a 10 s grace → ONE `TdrRequalify`
+  depart+re-arrive against a HEALTHY stack; 10-min budget expired →
+  `TdrDeadlineDepart`, the legacy departure as fallback. Nothing waits
+  unbounded and nothing runs on a callback frame.
+- **The RING STATE is the recovery discriminator** (`ring_tick_arc`), and
+  getting this wrong is the subtle way build 16 fails. Two rejected
+  candidates: `worker.is_some()` is useless because `rt.worker` is cleared
+  only by unassign/teardown, so the corpse of the very worker that ducked
+  reads as "recovered" on the first tick; and counting swapchain
+  ASSIGNMENTS is worse than useless, because the OS keeps
+  unassigning/reassigning while the GPU is down and each replacement worker
+  dies in `create_device_on_luid` — the poller would call that recovered,
+  exit, and leave the ring unwatched with the bounded deadline arm
+  unreachable. Only `frame_loop` sets ACTIVE, and only after
+  `IddCxSwapChainSetDevice` succeeded on a freshly created device, so
+  "state != REBUILDING" is the one signal that means the transport really
+  came back.
+- **…but WHERE that state is read decides whether build 16 works at all,
+  and the first cut got it wrong (fixed on this branch, 2026-07-30).** The
+  state was read through a `try_lock` on the FrameRing mutex — and
+  `frame_loop` PINS that mutex for the entire life of the worker (the
+  `let ring = &mut *ring` after the lock is a reborrow, not a drop; it is
+  the same invariant that forces `mark_ring_dead_arc` to be a bounded
+  try-lock poll). So a ring that had FULLY RECOVERED — new worker, SetDevice
+  succeeded, frames publishing — returned `WouldBlock`, which the poller
+  counted as pending: the zero-modeset good exit was UNREACHABLE, the
+  requalify arm departed the only active display ~10 s into a recovery that
+  had already happened, and `TdrDeviceHeartbeatBlocked` fired during healthy
+  operation. As written it was WORSE than build 15 — it converted
+  self-healing recoveries into forced departures. **Rule: any recovery
+  signal a poller reads must be publishable and readable WITHOUT the lock
+  the thing being watched owns.** The fix is `crate::tdr::RingLive` (a
+  portable, unit-tested `AtomicU32` ring-state mirror + `worker_live` flag +
+  `live_generation` counter) living in `swapchain::RingHandle` BESIDE the
+  `Mutex<FrameRing>`; `frame_loop` publishes at exactly two points (go-live,
+  right where the shared section goes ACTIVE after SetDevice succeeded — not
+  earlier, or a worker that then blocks on the ring lock would advertise a
+  transport that never starts — and exit, via an RAII `LiveMark` so every
+  return path and unwind is covered). `ring_tick_arc` consults the mirror
+  FIRST and takes the mutex only to refresh the heartbeat of a ring already
+  known to be down, so a lost lock is a lost heartbeat, never a recovery
+  verdict. `RingSection::state()` was deleted to keep the old (unreadable)
+  reader from coming back. Regression test:
+  `tdr::tests::recovered_ring_settles_even_though_its_worker_pins_the_mutex`.
+- **Nothing in device-duck mode may depart a display without re-reading the
+  mirror immediately first.** The requalify and deadline arms cross the
+  effects queue, and the OS can re-assign a swapchain in that gap;
+  `run_tdr_requalify` now skips entirely (`TdrDeviceRequalifySkipped`,
+  counts as a recovery, consumes no cycle) when nothing is still REBUILDING,
+  and both arms depart only the still-unrecovered members of the duck's
+  LUID-scoped session set via `monitors::duck_sessions` — build 16 called
+  `duck_all` there and threw the per-LUID scoping away at the one moment it
+  mattered. The poller's good exit also re-checks AFTER clearing
+  `tdr_duck_pending` and re-arms (`TdrDeviceDuckRearmed`) if a worker failed
+  inside the clear window, whose `queue_tdr_duck` CAS would otherwise have
+  been dropped.
+- **`SwapChainDeviceCreateFailed` had no duck wiring at all** and is how a
+  GPU death presents when it happens between an unassign and the next
+  assign: there is no device yet, so `maybe_queue_tdr_duck` (which
+  interrogates one) is unreachable from there. That site now marks the ring
+  REBUILDING and arms a duck, gated to device-duck mode. The REBUILDING
+  mark is load-bearing, not cosmetic — a duck armed against a still-ACTIVE
+  ring settles on its first tick and does nothing. Without this re-arm the
+  whole mode degrades into "do nothing, forever": while the GPU is down the
+  OS keeps unassigning/reassigning, every replacement worker dies at that
+  same site, and nothing would ever be watching the ring again. The re-arm
+  is idempotent — `queue_tdr_duck`'s one-in-flight CAS collapses a storm of
+  failing workers into a single duck, and the cadence is the OS's reassign
+  rate, not a spin. Gated to device-duck mode because the legacy gate must
+  restore builds 14/15 faithfully, not an improved version of them.
+- **Device-ducked monitors stay in `shell.monitors` and OUT of
+  `shell.ducked`.** That invariant is load-bearing: `unplug`'s ducked fast
+  path, `plug`'s parked-twin purge and the D3Final drain all assume "in
+  `ducked` ⇒ already departed", and a still-arrived entry there would leak
+  an arrived monitor on its connector. Keeping it meant none of those three
+  needed edits.
+- **Honest limitation — there is NO static last-good/black frame, and one is
+  not implementable here.** The ring textures were created on the removed
+  device and `retire_textures()` already dropped them;
+  `create_shared_textures` and `publish_frame` both require a live
+  `ID3D11Device`; no CPU-side copy of any frame exists anywhere in the
+  driver; and a WARP device's shared handles cannot be opened by the host's
+  hardware device. Build 16 ships "display path alive + ring REBUILDING +
+  fresh heartbeat" — which the host classifies as *coming back*, not *driver
+  gone* (`RING_HEARTBEAT_STALE_MS` = 2000, and before this change NOTHING
+  outside `frame_loop` ever called `heartbeat()`). A black-frame publisher is
+  a tracked follow-up, not part of this build.
+- **New ETW** (existing provider; every legacy Tdr* name kept so legacy-mode
+  traces stay comparable): `TdrDuckConfig(mode,source,build)` at device add —
+  THE event that makes "which policy is this signed binary running"
+  answerable from one trace — plus `TdrDuckConfigReadFailed(stage,code)`,
+  `TdrLegacyDuck`, `TdrDeviceDuckStart`, `TdrDeviceDuckStale`,
+  `TdrDeviceDuckNoMonitors`, `TdrDeviceReassigned`, `TdrDeviceRecovered`,
+  `TdrDeviceHeartbeatBlocked`, `TdrDeviceRequalifyQueued`,
+  `TdrDeviceRequalify`, `TdrRequalifyCapped`, `TdrRequalifyStale`,
+  `TdrDeviceDuckSessionsGone`, `TdrDevicePollerStale`,
+  `TdrDevicePollerSpawnFailed`, `TdrDeviceDuckGaveUp(reason)`,
+  `TdrDeadlineDepartStale`, `TdrDeviceTaskQueueFailed(task)` (a poller exit
+  arm that could not reach the effects worker — it leaves the monitor
+  ARRIVED and deliberately does NOT depart inline, because an IddCx call
+  from a poller thread is exactly what §3.3 forbids; silent, it would be
+  indistinguishable from an arm never taken), and `RingRebuildMarkTimeout`.
+  Note `TdrDeviceReassigned` carries `gpu_confirmed`: whether our own probe
+  ever saw the GPU answer, as opposed to the ring merely going ACTIVE
+  first — without it, a genuine recovery and a re-assign-into-a-dead-GPU
+  read identically in a capture. Added with the lock-free discriminator
+  fix: `TdrDeviceRequalifySkipped(covered,publishing)` — the requalify arm
+  declining to depart a display that came back, i.e. the acceptance bar
+  being met the quiet way — and `TdrDeviceDuckRearmed(session)`; plus
+  `TdrDeviceReassigned.live_gens` (go-live transitions, so "a worker really
+  came back" is distinguishable from "these rings were never in trouble"),
+  `TdrDeviceDuckStart.hresult` / `TdrLegacyDuck.hresult` (the arming
+  HRESULT, 0 = poller re-arm), and `kept` counts on `TdrDeviceRequalify` /
+  `TdrDeviceDuckGaveUp`.
+  Settle these names BEFORE signing — task #58's
+  autologger keys on them.
+- The dev-fallback `DRIVER_BUILD` was STALE at 14 (build 15 shipped stamped
+  by env only), so unstamped dev builds self-reported alpha.4 in ETW and the
+  handshake. Bumped to 16 in the same commit.
+
+Acceptance bar for this round: a forced device removal (driver-verifier /
+TDR injection) with a live session under `virtual_display_layout=exclusive`
+must show `TdrDeviceDuckStart`, ring REBUILDING, and **NO TdrDuckDeparted /
+NO MonitorDeparture**; QueryDisplayConfig must keep returning non-zero paths
+across the whole window; no dwm.exe black-screen report and no 0x1b8 live
+dump. Then the standing checklist: warm stream, COLD BOOT + stream,
+sleep/resume, update-over-running-service, `per_client` create/destroy during
+an active duck, and ZERO Tdr* events on a plain uneventful stream. Finally
+flip the registry gate to 1 and confirm the build-14 behaviour returns
+without reinstalling. Validation must run through the SYSTEM service path,
+not an elevated probe (Insider-29617 caveat above), and the gate is verified
+by reading back the devnode's Device Parameters key. Note build 16 stacks on
+ground where the 13/14/15 field checklists are still pending.
+
+### Build 17 — dynamic mode lists (2026-07-30, branch `feat/dynamic-modes-build17`; UNSIGNED, UNINSTALLED, UNVALIDATED)
+
+> **REWRITTEN 2026-07-30 (second model).** Everything below the
+> "REPLACE-TARGET-MODES" heading supersedes the additive-merge design that
+> the rest of this section originally described; the historical text is
+> kept only where it still documents a live rule. Read the new part first.
+>
+> **AMENDED 2026-07-31 (review pass, `f04cb2a`/`c0daafb`).** Five findings
+> fixed; the two that changed the DESIGN are called out under
+> "Review-pass corrections" at the end of this section. If you are about to
+> reason about the parked-spec patch, about what the OS has committed, or
+> about `PreferredMonitorModeIdx`, read that first — three of the bullets
+> below are now historical on those points.
+
+Branched from `feat/duck-the-device-build16` @ 7a3f696, so build 16 rides
+along. **Which of a monitor's create-time modes it offers can now change
+without a DESTROY+CREATE cycle** — proto 0.5 `UPDATE_MODES` (`FN 0x809`,
+`IOCTL 0x0022_2024`) bound to `IddCxMonitorUpdateModes2`. The motivating
+case: a client streams "Desktop" over Moonlight and only THEN a
+frame-generation title launches wanting the doubled rate on offer. The
+only prior remedy was a monitor cycle, which broadcasts
+`DBT_DEVNODES_CHANGED` (kills GTA V Enhanced via its own uncatchable
+`0xC000041D` handler) and which amplified the 2026-07-30 wedge.
+
+#### REPLACE-TARGET-MODES — the corrected model (do not re-derive)
+
+Established from the 1.10 headers, the IddCx 1.11 update page, the
+`IddCxMonitorUpdateModes2` reference page, and the
+VirtualDrivers/Virtual-Display-Driver source (IddCx 1.10, MIT, calls
+UpdateModes ZERO times):
+
+- `IDARG_IN_UPDATEMODES2` (IddCx.h:3586) carries ONLY
+  `{ Reason, TargetModeCount, pTargetModes }`. **TARGET** modes.
+- There is **NO DDI in 1.10 or 1.11 that replaces a monitor's DESCRIPTION**
+  on an arrived monitor. The monitor-mode set is fixed at
+  `IddCxMonitorCreate`. Changing it means departure + recreate.
+- `IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE` (which
+  would skip the intersection) is documented remote-drivers-only; a console
+  driver cannot opt in (`REMOTE_SESSION_DRIVER` fails adapter init).
+- Windows selects from the **INTERSECTION** of the monitor-mode list and
+  the target-mode list.
+
+Therefore: advertise a static SUPERSET of monitor modes at creation
+(EDID → `ParseMonitorDescription2`), then use `IddCxMonitorUpdateModes2`
+to publish the currently valid TARGET subset. **It can gate/steer within
+the superset; it can never enlarge it.** Hosts must CREATE with every mode
+they might later want (base rate *and* framegen rate). A requested target
+with no entry in the superset is rejected with detail (`rejected`,
+`first_rejected`), never published. **`TargetModeCount` cannot be zero**
+(IddCx.h:3594) — the target list is replaceable, never emptyable; both
+`mode_count == 0` and an all-out-of-superset request are `err::BAD_MODE`
+with the published list untouched. `Reason` is
+`IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS` (IddCx.h:327).
+
+**Function-table index 6 (`IddCxMonitorUpdateModes`) is DELETED from
+bindings.rs and must never be re-added.** Verbatim from the
+`IddCxMonitorUpdateModes2` reference page: "drivers reporting
+IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 can only call
+IddCxMonitorUpdateModes2; calling IddCxMonitorUpdateModes is an error."
+CAN_PROCESS_FP16 is the ONLY adapter flag `entry.rs` sets
+(`caps.Flags = ...CAN_PROCESS_FP16`, entry.rs:251 — the HDR10 contract),
+so index 6 is forbidden for this driver as long as it does HDR at all. The
+comment block where the wrapper used to be carries the citation.
+
+State split, three layers, each with two lists now:
+`Monitor.modes` (durable superset, frozen) + `Monitor.target_modes`
+(durable published subset, seeded to the whole superset at create, carried
+by `Effect::PlugMonitor.targets` so a replug never silently ungates);
+`MonitorRt.monitor_modes` + `MonitorRt.target_modes`;
+`DuckedMonitor.monitor_modes` + `.target_modes`. `static_mode_count` and
+`ORIGIN_DRIVER` are GONE — every monitor mode comes from the EDID that
+created the monitor, so `MONITORDESCRIPTOR` is now simply true.
+`ParseDescription2` serves the superset, `QueryTargetModes2` the subset.
+
+**REPLACE vs APPEND is still undocumented, and it no longer matters for
+safety.** The Learn Remarks say only "update the mode list previously
+reported for a monitor"; the headers say nothing. The code ASSUMES REPLACE
+(recorded at `shell::monitors::push_targets`) and is correct either way
+because of one invariant re-checked immediately before the OS call against
+the LIVE `monitor_modes`: `targets ⊆ superset`. Replace ⇒ OS holds
+`targets`; append ⇒ `previous ∪ targets`; re-solicit ⇒ `targets`. All
+three are non-empty subsets of the frozen superset, so the intersection is
+non-empty and fully activatable — no unactivatable mode, no monitor
+without targets, no failed session. Only effectiveness differs (append
+would fail to remove a rate). **How a reader tells:** publish a strict
+subset, then in one trace read `UpdateModesApplied(modes, superset)`,
+whether `QueryTargetModes2` reappears with the pushed count, and how many
+rates Display Settings offers — `published` ⇒ replace/re-query,
+`superset` ⇒ append or no re-solicit. `vgd-probe --target-mode WxH@HZ`
+(alias `--add-mode`, same flag, new meaning) exercises it standalone.
+
+ETW changed with the model: `UpdateModesApplied(modes, superset, status)`;
+`ParseDescription2(modes, published, buffer)` and
+`QueryTargetModes2(modes, superset, buffer)` replace the old `dynamic`
+field; `UpdateModesAccepted` / `UpdateModesDenied` gained `rejected` (and
+Denied gained `first_rejected`). New deny stage
+`UPD_STAGE_NOT_IN_SUPERSET = 9`. Settle these names BEFORE signing.
+
+#### Historical (additive-merge, superseded — kept for the rules that survived)
+
+Verified before writing any code (do not re-derive): `IddCxMonitorUpdateModes`
+= table index 6, `IddCxMonitorUpdateModes2` = 34, `IddFunctionTableNumEntries`
+= 36 for 1.10 — in the eWDK header the build compiles against
+(`10.0.28000.0/um/iddcx/1.10/IddCxFuncEnum.h:230,258`) AND in our generated
+bindings. Both were already emitted by bindgen; only the wrappers were
+missing. (Index 6's wrapper has since been DELETED — see the
+CAN_PROCESS_FP16 rule above. Index 34 is the only legal entry.)
+
+- ~~**Additive-merge is the safety property**~~ — SUPERSEDED. `merge_additive`
+  is gone; `Mode::select_targets` replaced it. The reasoning was applied to
+  the wrong list: appending to what the code called "the monitor's modes"
+  could never enlarge the frozen description, so it bought nothing the OS
+  would honour. ~~The *concern* it addressed survives and is now explicit —
+  the driver still cannot identify the committed mode
+  (`evt_commit_modes2` stores nothing), so gating a rate the OS has
+  committed will make it re-select. That is now a deliberate,
+  host-requested effect rather than something the design forbids.~~
+  **SUPERSEDED 2026-07-31** — the driver DOES identify the committed mode
+  now, and refuses the push instead of re-selecting. See "Review-pass
+  corrections" below.
+- ~~**Appended modes are `ORIGIN_DRIVER`**~~ — SUPERSEDED, along with
+  `MonitorRt.static_mode_count`. Nothing is ever appended to the monitor
+  list, so every monitor mode really does come from the EDID that created
+  it and `MONITORDESCRIPTOR` is unconditionally truthful
+  (`monitors::MONITOR_MODE_ORIGIN`).
+- **The lock protocol is the whole of the danger.** `IddCxMonitorUpdateModes2`
+  makes the OS re-enter `QueryTargetModes2` / `ParseDescription2` /
+  `AssignSwapChain` SYNCHRONOUSLY on the calling thread, and all of those take
+  `shell.monitors`; `std::sync::Mutex` is not reentrant. `monitors::update_modes`
+  takes the lock, publishes the new list (the re-entrant query MUST see it),
+  copies the handle, builds the `IDDCX_TARGET_MODE2` array, DROPS the guard,
+  then calls. Only the effects worker may call it (`Effect::UpdateModes` →
+  `apply_now`) — never an IOCTL or callback frame (§3.3 rule 3; CLAUDE.md:316,548).
+  `fill_target_mode2` is now the single fill used by both the push and
+  `evt_query_target_modes2`, so pushed and queried lists cannot diverge.
+- **Failure degrades to "keep the current modes"** (constraint 1): the previous
+  Vec is restored after re-verifying session id AND monitor handle still match
+  (the `AssignRacedUnplug` pattern), never a departure, never a refused session.
+  The rollback is best-effort by nature — the OS may already have consumed the
+  new list in a re-entrant query — so the trace records what happened instead of
+  pretending it is atomic. `err::UPDATE_FAILED` (-13) lands in the monitor's
+  sticky `GET_STATUS` last error.
+- **Three places the list lives, all covered** — and since the rewrite each
+  holds BOTH lists: `MonitorRt.{monitor_modes,target_modes}` (live),
+  `core::session::Monitor.{modes,target_modes}` (durable — what every
+  replug-from-DeviceState plugs with; without the target half a device
+  re-add / D3Final re-bring-up / pool restore silently un-gates), and
+  `DuckedMonitor.{monitor_modes,target_modes}` (parked under the legacy TDR
+  gate — an update landing while parked patches the parked target subset
+  instead of calling IddCx, since the re-arrival creates a NEW monitor
+  object, and re-checks it against the parked superset first).
+- **Deferrals rather than refusals**: a duck in flight (`tdr_duck_pending`) or a
+  cleared adapter stores the list and skips the OS push — traced — so the
+  recovery's own re-negotiation picks it up. Build 16's regression test
+  (`tdr::tests::recovered_ring_settles_even_though_its_worker_pins_the_mutex`)
+  stays green; nothing was added between the poller and the ring.
+- **Versioning, both directions.** PROTO_VERSION_MINOR 4→5;
+  `PROTO_VERSION_MINOR_REQUIRED` stays **3** — raising it would make a build-17
+  host fail the handshake against every alpha.2/alpha.4 driver in the field,
+  presenting as `NOT_HANDSHAKEN` on every session IOCTL, i.e. a refused
+  session. Detection is `caps::DYNAMIC_MODES` (1 << 9 — NOT the never-set
+  `REFRESH_DOUBLING` bit), which already travels in the handshake, GET_STATUS
+  and `VgdCaps.caps`. Reply structs can never grow (all-or-nothing writes on
+  one side, exact-length checks on the other), hence `UpdateModesReply.reserved[6]`;
+  requests grow by appending, hence `UPDATE_MODES_REQUEST_SIZE_V5` named on day one.
+- **`result == OK` means ACCEPTED, not applied.** The IRP completes before the
+  effects run, so the reply structurally cannot carry the IddCx status. Do not
+  let host code (or docs) claim otherwise.
+- **NOTHING COMMITS UNTIL THE OS TAKES IT (fixed 2026-07-30, second pass).**
+  The first cut committed the DURABLE list inside `dispatch` — before the push,
+  and unconditionally. Three symptoms, one defect: a failed push rolled back
+  only the RUNTIME list, so durable and runtime diverged; a DEFERRED push
+  (duck in flight / adapter cleared) left durable asserting modes the OS was
+  never told about; and worst, the identical RETRY then merged to "nothing to
+  add", emitted no effect, and returned `OK` — a permanent silent no-op
+  reporting success while the monitor advertised the old list, with no way for
+  the caller to recover. The contract now (unchanged by the rewrite except
+  for which list it guards): `SessionTable::update_modes` parks the selection
+  in `Monitor.pending_targets` with a table-wide monotonic `update_seq`;
+  `Effect::UpdateModes` carries that seq; `monitors::update_modes`
+  is the only caller of `IddCxMonitorUpdateModes2` and owes exactly ONE
+  `settle_modes`, with `Applied` (and only `Applied`) committing
+  `Monitor.target_modes`. Failed AND deferred both settle `NotApplied` →
+  pending discarded, every copy keeps the pre-update list, sticky
+  `err::UPDATE_FAILED`, and the next identical request genuinely re-pushes.
+  Rules that fall out and must not be re-broken: a deferral is NOT an
+  application (~~the parked-spec patch is best-effort and still settles
+  NotApplied — a retry re-selects to the same list, so they converge~~ —
+  **SUPERSEDED 2026-07-31**: the parked-spec patch COMMITS, because it
+  changes what the re-arrived monitor publishes; a deferral is now
+  strictly "nothing was changed anywhere". See "Review-pass corrections"); a
+  request arriving while a push is outstanding replaces the PENDING
+  selection, never the live one (replace semantics: last intent wins, and
+  the effects worker is serialized so push #1 finishes before push #2
+  starts); a stale settle (superseded, or session destroyed and the id
+  reused) commits nothing, which is why the seq is table-wide and never
+  reset. Residual, accepted and documented at `settle_modes`: a superseded
+  push that SUCCEEDED followed by a superseding one that FAILED leaves the
+  durable subset lagging the OS's until the next request — both are valid
+  non-empty subsets of the superset, so nothing unactivatable results.
+- **Partial application is reported, not swallowed.** `Mode::select_targets`
+  returns `TargetSelection { targets, accepted, rejected, first_rejected }`
+  with `accepted + rejected == requested.len()` always. `UpdateModesReply`
+  fills its `reserved` words — `[0] accepted, [1] requested, [2] flags,
+  [3] rejected, [4] first_rejected` — read through
+  `accepted()/requested()/flags()/rejected()/first_rejected()/is_pending()/
+  is_partial()/fully_in_force()`, never by index; build with
+  `UpdateModesReply::new`, because a literal `[0; 6]` reads back as "your
+  FIRST mode was rejected" (`NO_REJECTED_INDEX` = `u32::MAX` is the sentinel).
+  The struct does NOT grow (still 40 bytes, asserted). `update_status::PARTIAL`
+  now = some requested modes are not in the create-time description and can
+  never be offered; `PENDING` = queued at the OS, not in force yet. Partial
+  stays `err::OK`: never fail the session, never drop the modes that DO
+  exist (constraint 1). `result == OK` with neither flag is the ONLY shape
+  meaning "in force, in full, right now". Total rejection is `err::BAD_MODE`
+  with the same detail — a refused REQUEST, not a failed session.
+- **The rollback can only undo its own write**: the failure path restores
+  only when the monitor handle still matches AND the runtime target list is
+  still, entry for entry, the one this call published. What it puts back was
+  itself a non-empty subset of the same frozen superset, so a rollback can
+  produce neither an empty nor an unactivatable target list.
+- ETW (existing provider): `UpdateModesAccepted(modes,queued,accepted,
+  requested,rejected,pending,partial)`,
+  `UpdateModesDenied(stage,code,modes,rejected,first_rejected)`,
+  `UpdateModesApplied(modes,superset,status)`,
+  `UpdateModesDeferred(stage,modes,retryable)`,
+  `UpdateModesFailed(stage,code,modes,rolled_back)`,
+  `UpdateModesSettleStale(seq)` (a push whose update was superseded or whose
+  session is gone — silent, it would be indistinguishable from a settle that
+  never happened, and a missing settle is the one way to leak a pending list),
+  plus `published` on `ParseDescription2` and `superset` on
+  `QueryTargetModes2` (the pair that answers replace-vs-append).
+  Note this is the FIRST ETW at the dispatch layer at all — nothing there
+  traced anything before, which is how the build-8 ACL outage stayed
+  unexplained for three builds. Settle these names BEFORE signing.
+- Found and fixed while testing: the UPDATE_MODES arm validated the OUTPUT
+  buffer only at reply-write time, so a short output buffer mutated the session
+  table while the effect was dropped with `BadBuffer` — permanently diverging
+  the durable list from the advertised one. The arm now checks the output size
+  before touching the table. (CREATE_MONITOR has the same shape; harmless there
+  — the session just exists un-plugged and the watchdog reaps it — and left
+  alone deliberately.)
+
+**THE OPEN QUESTION AS FIRST WRITTEN — now ANSWERED, and it is what forced
+the rewrite above.** The original text asked whether the OS re-solicits
+`ParseMonitorDescription2` after an `IddCxMonitorUpdateModes2`, hoping a
+re-parse would let an ADDED mode survive the monitor∩target intersection.
+That hope was unfounded: `ParseMonitorDescription2` is handed the EDID the
+monitor was CREATED with, and no DDI reissues it, so re-parsing could only
+ever return the same superset. Dynamic ADD is not achievable through this
+DDI for a console-session driver, full stop. The feature is now
+replace-target-modes within the create-time superset (above), which is
+achievable and is what the traced install will measure.
+
+The measurement command changes with it:
+`vgd-probe 2560x1440@120 2560x1440@240 --hold 30 --target-mode 2560x1440@240
+--target-after 10` with a logman session on the provider GUID — create with
+BOTH rates, then publish only the doubled one. Look for
+`UpdateModesApplied(modes=1, superset=2)`, then whether
+`QueryTargetModes2` reappears, whether Display Settings drops to one rate
+(⇒ REPLACE) or keeps both (⇒ APPEND / no re-solicit), and whether any
+devnode-change follows. Still undocumented and still not to be asserted
+either way in code or docs until measured: the devnode-change question, and
+replace-vs-append (safe either way — see the invariant above).
+
+#### Review-pass corrections (2026-07-31, build 17 still UNSIGNED)
+
+Five review findings, all verified against the code before being fixed.
+The decisions moved into `crate::modepush` — portable, unit-tested,
+below the shell line for exactly the reason `crate::tdr` is:
+`shell::monitors::push_targets` needs the eWDK, a live adapter and an
+arrived monitor, so it can never be tested, and every decision it made
+inline was therefore untested. Both MAJOR fixes have a test that fails
+against the pre-fix behaviour
+(`modepush::tests::a_parked_patch_commits_durably_so_a_rescind_still_re_pushes`,
+`modepush::tests::a_push_that_would_evict_the_committed_mode_is_refused`).
+
+- **A TDR-parked patch is an APPLICATION, not a deferral** (supersedes
+  "the parked-spec patch is best-effort and still settles NotApplied"
+  above). `push_targets` patched `DuckedMonitor.target_modes` — so the
+  monitor the replug re-arrived published the new subset — and returned
+  `Deferred`, so `Monitor.target_modes` kept the old one. Because
+  `SessionTable::update_modes` short-circuits a request matching the
+  durable list ("already published", no effect, `OK`), the RESCIND
+  direction was unreachable for the life of the session: the host asked
+  for the wider list back, was told yes, and kept streaming to a gated
+  monitor. `PushOutcome::commits()` is now both the authorisation to write
+  the parked spec and the settle decision, so the halves cannot drift
+  apart; `AppliedParked` is a separate variant from `Applied` only so a
+  call-less application does not pollute `UpdateModesApplied(modes,
+  superset)`, which is the replace-vs-append measurement. This also closed
+  the MINOR "patched runtime, never committed durably" — same defect,
+  other side.
+- **The committed path is captured, and a push never gates it out**
+  (supersedes "the driver still cannot identify the committed mode … that
+  is now a deliberate, host-requested effect"). `evt_commit_modes2`
+  discarded `IDDCX_PATH2`; it now records the ACTIVE paths into
+  `modepush::CommittedPaths` (lock-free fixed slots, atomic stores, no
+  allocation — it is a modeset CALLBACK FRAME) and traces every path with
+  its mode (`CommitModes2Path`). **`UPDATE_MODES` steers what the OS MAY
+  select; it never evicts what the OS HAS selected**: under
+  `virtual_display_layout=exclusive` that would force a modeset on the
+  only active display, mid-stream, which is the one thing this feature
+  must not cause. Such a push is refused (`GATES_COMMITTED`) — the PUSH
+  only, never the session. A host that wants a different ACTIVE mode does
+  the modeset itself (`SetDisplayConfig`, which the display helper already
+  drives) and gates afterwards. FAILS OPEN by design: a committed mode the
+  superset does not describe cannot be reasoned about, so the push
+  proceeds as before and the trace says so — otherwise one decoding
+  mismatch would silently disable the whole feature.
+- **D3Final can no longer tear the adapter down under a live push.** It
+  runs on a power callback concurrently with the effects worker; checking
+  `adapter()` before the call left the whole interval to the DDI
+  unguarded. Handshake: the push marks in-flight → fence → reads handle
+  and epoch in ONE acquisition (`Shell::adapter_with_epoch`); `evt_d0_exit`
+  clears the adapter → fence → drains in-flight pushes on a 500 ms
+  deadline (`UpdateModesDrainTimeout`) inside the worker drain it already
+  performs. SeqCst fences both sides ⇒ at least one sees the other. The
+  epoch is re-checked after publishing and before the call
+  (`ADAPTER_TORN_DOWN`: restore the runtime list, defer).
+- **`PreferredMonitorModeIdx` follows the published subset.** It was a
+  constant 0 while a gate could exclude `monitor_modes[0]`, naming a mode
+  outside the intersection Windows offers. Now the first monitor mode
+  actually offered, computed against what was written into the OS's
+  buffer, and traced as `preferred` on `ParseDescription2`.
+- New ETW (settle before signing, task #58's autologger keys on these):
+  `CommitModes2Path(monitor,flags,active,width,height,refresh_mhz)`,
+  `CommitModes2` + `active`/`skipped`/`generation`, `UpdateModesParked`,
+  `UpdateModesGatesCommitted(stage,modes,committed_w,committed_h,
+  committed_mhz,active_paths)`, `UpdateModesAdapterTornDown`,
+  `UpdateModesDrainTimeout`, `ParseDescription2` + `preferred`. New
+  stages: `GATES_COMMITTED = 10`, `ADAPTER_TORN_DOWN = 11`.
+- Add to the traced-install measurement: with both rates created and 120
+  committed, `vgd-probe --target-mode 2560x1440@240` must now be REFUSED
+  with `UpdateModesGatesCommitted` rather than forcing a modeset — so
+  measure replace-vs-append by gating out the rate the OS is NOT running
+  (create three rates, or commit the one you intend to keep first).
+
+#### Second review pass (2026-07-31, build 17 still UNSIGNED)
+
+Six findings, all verified against the code before being fixed; none was
+misdiagnosed. One MAJOR, and it is about what the HOST can see.
+
+- **A permanent refusal that reads as a transient one is a retry loop.**
+  The `GATES_COMMITTED` refusal above settled as an ordinary
+  `NotApplied`: sticky `err::UPDATE_FAILED`, which proto 0.5 documents as
+  "the previous list is still in force and this request is fully
+  retryable — resending it really does push again". So a retrying host
+  queued a push, had it refused for the same reason, was told to retry,
+  and never converged. The refusal is PERMANENT while that mode stays
+  committed — retrying is the one response that cannot work — and the
+  wire now says exactly that, in the reserved words the reply already had
+  (still 40 bytes, no IOCTL value touched, `const_assert` unchanged):
+  - `err::MODE_COMMITTED = -14` — appended, nothing renumbered. Appears as
+    the `UPDATE_MODES` reply `result` AND as the monitor's sticky
+    `MonitorStatus.last_error`, so a host that only polls `GET_STATUS`
+    learns it too. `UPDATE_FAILED` keeps its meaning and is now documented
+    as the RETRYABLE one.
+  - `update_status::BLOCKED = 1 << 2` in `flags` (`reserved[2]`), read as
+    `is_blocked()` / `worth_retrying()`.
+  - `reserved[5]` (was "must be 0") = the blocking mode's index in the
+    monitor's CREATE_MONITOR list, read as `blocking_mode_idx()`,
+    sentinel `NO_MODE_INDEX` = `u32::MAX` — a bare 0 would read as "your
+    first create-time mode", exactly the trap `NO_REJECTED_INDEX` exists
+    for. An INDEX because the reply may never grow and one u32 is all
+    there is; it costs no precision, because the superset IS the list the
+    host sent at create.
+  - FFI: `VgdUpdateModesReply.blocking_mode`, `VGD_UPDATE_BLOCKED`,
+    `VGD_NO_MODE_INDEX` (safe to grow — nothing ships `vgd_update_modes`
+    yet; the pinned submodule is still proto 0.4).
+- **How the answer reaches a request at all.** The push is asynchronous —
+  the IRP completes before the effects worker calls IddCx — so the only
+  request that can be told about a refusal is a LATER one. The refusal is
+  remembered in `Monitor.blocked` (`BlockedPush { targets, superset_idx,
+  token }`) and a request resolving to that same list is answered from it
+  with no effect emitted. `ModeUpdateResult::Blocked` is a third settle
+  variant, and `PushOutcome::Blocked` its shell counterpart, so the
+  distinction cannot be lost in the mapping (`retryable()` is the single
+  definition behind both the ETW `retryable` field and the wire flag).
+  **The block is evidence, so it expires like evidence**: it is honoured
+  only while `modepush::committed_token()` — the `CommittedPaths`
+  generation, bumped by every commit — still matches. Any modeset drops
+  it and the next request pushes for real. A different selection also
+  drops it (it is a different question, and may well keep the committed
+  mode). Expiring early costs one push; expiring late would refuse a
+  request that has become legal, which is the same bug in mirror image.
+- **`CommittedPaths` is now a real seqlock.** The key WAS the sequence:
+  publish payload, publish monitor handle, re-read the handle. Defeated by
+  the commonest write there is — the same monitor committing again — which
+  restores the same key while the payload changes underneath, pairing a
+  size from one commit with a refresh rate from the next. A phantom mode is
+  worse than none here, because it is compared against the superset to
+  decide whether to refuse. Slots now carry an even/odd `version`
+  (`fence(Release)` after the odd store, `fence(Acquire)` before the
+  re-read), and `apply` visits every slot exactly once instead of clearing
+  all keys and then filling the front.
+- **Two writers can no longer interleave.** `apply` (modeset callback) and
+  `forget` (effects worker) both rewrite the array. No lock is available on
+  a callback frame, so they take a non-blocking token: the loser writes
+  NOTHING and sets `contended`, and the holder then CLEARS the record
+  rather than publish a mixture of two path sets. Clearing is the
+  fail-open direction — "nothing committed" is exactly the pre-gate
+  behaviour — so losing this race can only ever allow a push, never invent
+  a refusal.
+- **`active()` really can exceed the slots recorded now**, as it always
+  claimed: `evt_commit_modes2` counts every active path and passes the
+  total to `apply(paths, active_total)`. Deriving it from the truncated
+  record made the documented case unreachable and understated the one
+  number `UpdateModesGatesCommitted.active_paths` exists to report.
+- **The fail-open eviction path traces.** `live_gate` returns a distinct
+  `PushCommittedUnrecognised` verdict when the committed mode is not in the
+  monitor's superset (a decoding mismatch), the push site emits
+  `UpdateModesCommittedUnrecognised`, and `LiveGate::pushes()` keeps a call
+  site from mistaking it for a refusal. Untraced, "the gate declined to
+  fire because it could not read the commit" and "the gate had nothing to
+  do" were the same silence — i.e. the whole feature could switch itself
+  off invisibly.
+- **`ParseDescription2.preferred` is the value REPORTED.** It was computed
+  with `usize::MAX` for the trace and re-computed with `fill` for the OS,
+  so on a truncated buffer the trace showed a number the OS never got.
+  Computed once now, before the event; the event also carries `filled`.
+- New/changed ETW (settle before signing — task #58's autologger keys on
+  these): `UpdateModesGatesCommitted` gains `code`, `blocking_mode`,
+  `commit_token`, `retryable`; `UpdateModesCommittedUnrecognised(stage,
+  modes,superset,committed_w,committed_h,committed_mhz,active_paths)` is
+  new; `UpdateModesDeferred`/`UpdateModesFailed` carry `retryable` from
+  the one definition; `UpdateModesDenied` (dispatch layer) gains
+  `blocked`, `blocking_mode`, `retryable` and reports stage
+  `GATES_COMMITTED` for an answered-from-refusal reply;
+  `ParseDescription2` gains `filled`. No new stage numbers.
+- Regression tests that fail against the pre-fix behaviour (verified by
+  reverting the settle arm and re-running):
+  `dispatch::tests::a_retry_after_a_committed_mode_refusal_is_answered_not_re_pushed`
+  (the wire: pre-fix gives `result == OK`, `PENDING`, and another queued
+  push), `modepush::tests::a_refused_push_tells_the_host_it_is_permanent_
+  and_which_mode_blocked_it`, and
+  `modepush::tests::a_remembered_refusal_expires_when_anything_commits`.
+  Plus `a_rewrite_that_restores_the_same_key_is_still_detected` and
+  `a_lost_writer_clears_the_record_instead_of_mixing_two_commits` for the
+  record's two races.
+- Traced-install measurement, updated again: the refused push now prints
+  its own diagnosis in `vgd-probe` ("refused PERMANENTLY … blocking mode:
+  create-list index N"), so the run that gates out the committed rate is
+  self-explaining rather than a silent no-op to be read out of ETW.
+
+#### Third review pass (2026-07-31, build 17 still UNSIGNED — the last defect before signing)
+
+Eight findings raised, six refuted, two fixed. One MAJOR, and it is the
+same hole as the parked-patch split brain in its third guise: **a push
+that CHANGED a published list committed nothing.**
+
+- **A SUPERSEDED-BUT-SUCCESSFUL push made the RESCIND permanently
+  unreachable, and reported `fully_in_force()` for a mode the monitor was
+  not offering.** The interleaving is real and was reproduced against this
+  branch's own core: the IOCTL holds the device lock only for `dispatch()`
+  (control.rs), and the effects worker calls `IddCxMonitorUpdateModes2`
+  with NO lock held, so request #2's whole dispatch lands inside push #1's
+  DDI call. Push #1 publishes the runtime list and returns Applied on
+  STATUS_SUCCESS — but `settle_modes` rejected it as stale, because the
+  pending seq was now #2's, so `Monitor.target_modes` never learned what
+  the OS took. Push #2 then settles NotApplied without publishing (the
+  `tdr_duck_pending` arm, the NO_ADAPTER arm, or an OS refusal whose
+  `restore_targets` puts push #1's list back — note the last one needs no
+  TDR at all). Sticky `err::UPDATE_FAILED` tells the host to retry; its
+  retry for the WIDER list now equals the stale `target_base()`, so
+  `update_modes` short-circuits it as "already published": queued `None`,
+  no effect, `result == OK`, no PENDING/PARTIAL flag ⇒
+  `UpdateModesReply::fully_in_force()` TRUE while the OS and
+  `MonitorRt.target_modes` hold the narrower list. Nothing resyncs it —
+  `replug_ducked` and `duck_selected` both carry the RUNTIME list, so a
+  duck/requalify/deadline cycle preserves the divergence and only a full
+  replug-from-`DeviceState` heals it. **The doc at `settle_modes` named
+  this interleaving and bounded its cost at "the durable subset lags what
+  the OS holds until the next request" — but the next request is the
+  rescind, which is exactly what the short-circuit swallows. The stated
+  bound was not a bound; it is gone.**
+
+  Fix, confined to the portable core (`session.rs` / the shell's one call
+  site): the settle now carries the LIST the push put in front of the OS,
+  not just the outcome, because a superseded push cannot read its own
+  selection back out of `pending_targets`. A superseded settle whose
+  outcome COMMITS writes `Monitor.target_modes` from it and reports
+  `SettleOutcome::SupersededCommitted`; the newer update is untouched
+  (pending kept, sticky error unwritten) and still decides on its own
+  settle. A superseded settle that changed nothing still records nothing.
+  `ModeUpdateResult::commits()` is the core's half of
+  `PushOutcome::commits()`, so the two layers cannot drift.
+- **…and the guard that keeps that from becoming its own bug.** Honouring
+  superseded settles means the pending selection is no longer proof of
+  either ownership or ordering, so both are explicit now:
+  `Monitor.settled_seq`, a per-monitor high-water mark that STARTS at the
+  table-wide `update_seq` standing at CREATE time. A settle is honoured
+  only if strictly greater, which rejects (a) a re-ordered older settle
+  putting an older list back over a newer push that already took, and (b)
+  a destroyed session's settle reaching a replacement that reused its id —
+  which the `pending_targets.seq == seq` check used to do by accident.
+  Ids the table never issued are rejected too, and a committing settle
+  refuses an empty list a third time (constraint 1: never a monitor with
+  no targets).
+- **MINOR — the `CommittedPaths` writer token had a loser window of its
+  own.** `end_write` asked "was anyone turned away?" and the guard's drop
+  released the token one statement later. A writer arriving between them
+  was refused by a token nobody would look at again: its update was
+  dropped, the record was left STALE (fail-CLOSED — a superseded committed
+  mode is what makes `live_gate` refuse a push that should have gone
+  through, contradicting the type's own "can only ever allow a push"
+  invariant), and the `contended` flag it set survived with no holder to
+  honour it, so the clear landed on the NEXT commit — a complete,
+  uncontended one — instead. Token and flag are now ONE atomic word and
+  the check is PART of the release (`WriteToken::drop` → `release()`,
+  bounded CAS retry), so a writer is always turned away by a holder still
+  in a position to clear. `begin_write` sets the flag with a CAS against
+  `WRITING` rather than an unconditional `fetch_or`, and retries (bounded)
+  when that CAS fails — which means the holder just released and the
+  commit can be recorded properly instead of dropped.
+- ETW: no renames, no new events. `UpdateModesSettleStale` gains
+  `committed` (0/1) — without it `SupersededCommitted` and a settle that
+  really decided nothing are the same line in a capture, which is the
+  distinction the whole fix is about. Still settle names before signing
+  (task #58's autologger).
+- Regression tests that fail against the pre-fix behaviour (verified by
+  reverting each fix and re-running):
+  `session::tests::a_superseded_push_the_os_accepted_still_records_what_
+  the_os_took` and `dispatch::tests::a_rescind_after_a_superseded_success_
+  still_reaches_the_os` (the wire: pre-fix the rescind emits no effect and
+  the reply says `fully_in_force()`),
+  `session::tests::a_stale_settle_never_clobbers_a_newer_successful_push`,
+  `session::tests::a_settle_can_never_empty_the_published_list`, and
+  `modepush::tests::a_writer_turned_away_after_the_release_check_is_still_
+  honoured` (pre-fix leaves the stale record standing).
+  `a_second_request_while_a_push_is_outstanding_supersedes_and_stays_pending`
+  and `a_stale_settle_that_changed_nothing_commits_nothing` were rewritten:
+  they asserted the old "a superseded settle commits nothing" contract.
+
+Host-side work remaining (LuminalShine, NOT done here): the pinned submodule
+`src/drivers/luminal-display` is at da0349b = build 15 / proto 0.4, so it cannot
+even see build 16 — any host work needs that pointer advanced first. Then the
+call site at `virtual_display_vgd.cpp:361` (which today can only advertise the
+base rate at CREATE time, and only if framegen is already known active) gains an
+`UPDATE_MODES` path gated on `VGD_CAP_DYNAMIC_MODES`, degrading silently in the
+style of the existing `proto_minor < 4` nits log. When it does, the one rule it
+must honour is `worth_retrying()`: retry an `UPDATE_FAILED`, never a
+`MODE_COMMITTED` — for the latter, either keep `blocking_mode` in the list or do
+the `SetDisplayConfig` first.

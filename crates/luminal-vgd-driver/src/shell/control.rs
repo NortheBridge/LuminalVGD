@@ -26,7 +26,9 @@ use std::sync::mpsc;
 
 use super::PROVIDER;
 use super::{dxgi, monitors, OsHandle, Shell};
-use crate::dispatch::{dispatch, Effect, HandleCtx, Status};
+use crate::dispatch::{
+    dispatch, DispatchResult, Effect, HandleCtx, Status, TDR_DUCK_DEVICE, TDR_DUCK_DISPLAY,
+};
 use luminal_driver_proto::ioctl;
 
 const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022u32 as NTSTATUS;
@@ -361,6 +363,116 @@ pub unsafe fn read_persisted(device: WDFDEVICE) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Registry value selecting the TDR response policy (build 16 gate), a
+/// REG_DWORD under the SAME devnode `Device Parameters` key as the state
+/// blob: `HKLM\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY\000x\Device
+/// Parameters\LuminalVgdTdrDuckMode`. That key survives driver-package
+/// updates (it is how identity retention works across reinstalls), so an
+/// operator can restore the legacy behaviour with regedit + `pnputil
+/// /restart-device` and no reinstall.
+const TDR_MODE_VALUE_INIT: [u16; 22] = super::wide("LuminalVgdTdrDuckMode");
+/// `wide()` TRUNCATES silently when the array is a byte short, which would
+/// send an unterminated (and wrong-length) name to WdfRegistryQueryULong —
+/// the gate would then read as "absent" on every machine and the override
+/// would be undiscoverably dead. Catch it at compile time instead of in a
+/// signing round: the last element must be the NUL terminator.
+const _: () = assert!(
+    TDR_MODE_VALUE_INIT[TDR_MODE_VALUE_INIT.len() - 1] == 0,
+    "TDR_MODE_VALUE array is too short for its string (no NUL terminator)"
+);
+static TDR_MODE_VALUE: [u16; 22] = TDR_MODE_VALUE_INIT;
+
+fn tdr_mode_name_unicode() -> UNICODE_STRING {
+    let bytes = ((TDR_MODE_VALUE.len() - 1) * 2) as u16;
+    UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes + 2,
+        Buffer: TDR_MODE_VALUE.as_ptr().cast_mut(),
+    }
+}
+
+/// Not in wdk-sys' generated status constants; the value is fixed by the
+/// NT status contract. This is the ORDINARY outcome — the value is absent
+/// on every machine that never configured the gate.
+const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034u32 as NTSTATUS;
+
+/// Gate-read stages, so a trace says WHERE a read failed, not just that it
+/// did (constraint 4 — the 2026-07 blind-signing lesson).
+const TDR_GATE_STAGE_OPEN: u32 = 0;
+const TDR_GATE_STAGE_QUERY: u32 = 1;
+const TDR_GATE_STAGE_RANGE: u32 = 2;
+
+/// Gate provenance, reported in the `TdrDuckConfig` event.
+const TDR_GATE_SOURCE_DEFAULT: u32 = 0;
+const TDR_GATE_SOURCE_REGISTRY: u32 = 1;
+
+/// Read the TDR duck-mode gate at device add (before the shell global
+/// exists — must not call `Shell::get`). Returns `(mode, source)`.
+///
+/// Every failure defaults to [`TDR_DUCK_DEVICE`] so the shipped behaviour
+/// is the spec-conformant one (DESIGN.md §3.3 rule 2) even on a machine
+/// whose registry cannot be read — but "absent" and "unreadable" are
+/// traced differently, because a box where `WdfDeviceOpenRegistryKey`
+/// fails must not look identical to a box that was simply never
+/// configured. Deliberately NOT seeded by the INF's AddReg: HKR there
+/// rewrites on every package update and would silently stamp an
+/// operator's override back to the default mid-upgrade.
+pub unsafe fn read_tdr_duck_mode(device: WDFDEVICE) -> (u32, u32) {
+    let Some(key) = open_device_key(device, KEY_READ_ACCESS) else {
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDuckConfigReadFailed",
+            level(Warning),
+            u32("stage", &TDR_GATE_STAGE_OPEN),
+            i32("code", &0i32)
+        );
+        return (TDR_DUCK_DEVICE, TDR_GATE_SOURCE_DEFAULT);
+    };
+    let name = tdr_mode_name_unicode();
+    let mut value: ULONG = 0;
+    let status =
+        call_unsafe_wdf_function_binding!(WdfRegistryQueryULong, key, &name, &mut value);
+    call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+    if status != STATUS_SUCCESS {
+        if status != STATUS_OBJECT_NAME_NOT_FOUND {
+            tracelogging::write_event!(
+                PROVIDER,
+                "TdrDuckConfigReadFailed",
+                level(Warning),
+                u32("stage", &TDR_GATE_STAGE_QUERY),
+                i32("code", &status)
+            );
+        }
+        return (TDR_DUCK_DEVICE, TDR_GATE_SOURCE_DEFAULT);
+    }
+    if value != TDR_DUCK_DEVICE && value != TDR_DUCK_DISPLAY {
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDuckConfigReadFailed",
+            level(Warning),
+            u32("stage", &TDR_GATE_STAGE_RANGE),
+            i32("code", &(value as i32))
+        );
+        return (TDR_DUCK_DEVICE, TDR_GATE_SOURCE_DEFAULT);
+    }
+    (value, TDR_GATE_SOURCE_REGISTRY)
+}
+
+/// Announce the policy this binary is actually running under. THE most
+/// important new event of build 16: it makes "which TDR behaviour is this
+/// signed driver using" answerable from a single trace, instead of a
+/// signing round spent guessing.
+pub fn trace_tdr_duck_config(mode: u32, source: u32) {
+    tracelogging::write_event!(
+        PROVIDER,
+        "TdrDuckConfig",
+        level(Informational),
+        u32("mode", &mode),
+        u32("source", &source),
+        u32("build", &super::DRIVER_BUILD)
+    );
+}
+
 unsafe fn write_persisted(blob: &[u8]) {
     let shell = Shell::get();
     let Some(device) = shell.wdf_device() else {
@@ -419,6 +531,35 @@ pub(crate) enum EffectsTask {
     /// Re-arrive the monitors parked by TdrDuck (queued by the recovery
     /// poller thread when the display stack answers again).
     TdrReplug { epoch: u64 },
+    /// TDR DEVICE-duck (build 16 default, `TDR_DUCK_DEVICE`): a frame
+    /// worker observed device removal, and by the time this runs it has
+    /// ALREADY torn down the D3D device, abandoned the swapchain, retired
+    /// the ring textures and marked the ring REBUILDING (swapchain.rs).
+    /// This task deliberately does NOT depart anything — the IddCx monitor
+    /// stays ARRIVED so Windows keeps a display path to compose onto. It
+    /// only records the duck and starts the recovery poller, which keeps
+    /// the ring heartbeat alive and waits for the OS's own
+    /// unassign→assign to restore the transport.
+    TdrDeviceDuck { epoch: u64, session_id: u64, reason_hr: i32 },
+    /// The GPU answers again but the OS never re-assigned a swapchain:
+    /// force ONE depart+re-arrive against a stack we just probed HEALTHY.
+    /// This is the task spec's "depart only if OS recovery genuinely
+    /// completes" clause — a clean modeset, not a last-display removal
+    /// during a wedge.
+    ///
+    /// `sessions` is the LUID-scoped set the duck covered. It travels with
+    /// the task for two reasons: the arm must not depart monitors on a
+    /// healthy second adapter, and it must RE-CHECK the lock-free liveness
+    /// mirror before departing anything — the queue-to-execution gap is
+    /// enough for the OS to re-assign, and departing a display that is
+    /// publishing again is exactly the failure build 16 exists to prevent.
+    TdrRequalify { epoch: u64, sessions: Vec<u64> },
+    /// The long recovery deadline expired with the GPU never answering
+    /// (the machine-wide-wedge case): fall back to the legacy departure so
+    /// a permanently dead stack cannot leave a phantom display arrived
+    /// forever. The task spec's "or a long deadline expires" clause.
+    /// Same scoping and same re-check as `TdrRequalify`.
+    TdrDeadlineDepart { epoch: u64, sessions: Vec<u64> },
 }
 
 /// Spawn the effects worker at device add (from Shell::init). Returns
@@ -436,6 +577,15 @@ pub(crate) fn start_effects_thread() -> Option<mpsc::Sender<EffectsTask>> {
                 }
                 EffectsTask::TdrDuck { epoch } => run_tdr_duck(epoch),
                 EffectsTask::TdrReplug { epoch } => run_tdr_replug(epoch),
+                EffectsTask::TdrDeviceDuck { epoch, session_id, reason_hr } => {
+                    run_tdr_device_duck(epoch, session_id, reason_hr)
+                }
+                EffectsTask::TdrRequalify { epoch, sessions } => {
+                    run_tdr_requalify(epoch, sessions)
+                }
+                EffectsTask::TdrDeadlineDepart { epoch, sessions } => {
+                    run_tdr_deadline_depart(epoch, sessions)
+                }
             }
         }
     });
@@ -494,7 +644,19 @@ pub(crate) fn queue_adapter_ready(adapter: OsHandle, epoch: u64) {
 /// every other IddCx side effect; there is deliberately no inline
 /// fallback here (a duck that cannot be queued is dropped and re-armed
 /// by the next failing worker).
-pub(crate) fn queue_tdr_duck() {
+/// THE BUILD-16 GATE. Both frame-loop failure sites funnel through here,
+/// so the two modes can never diverge between the acquire path and the
+/// publish path.
+///
+/// `reason_hr` is the HRESULT that armed this duck — the device-removal
+/// reason from `GetDeviceRemovedReason`, or the `create_device_on_luid`
+/// failure at the re-arm site. It travels into the duck's own events so a
+/// capture that has wrapped past `TdrDeviceRemoved` /
+/// `SwapChainDeviceCreateFailed` can still say what a display stopped
+/// publishing for; build 16 traced it only at the originating site. Zero
+/// means "no HRESULT": the only such caller is the poller's own
+/// close-the-latch-window re-arm, which is tagged `TdrDeviceDuckRearmed`.
+pub(crate) fn queue_tdr_duck(session_id: u64, reason_hr: i32) {
     let shell = Shell::get();
     if shell
         .tdr_duck_pending
@@ -504,7 +666,22 @@ pub(crate) fn queue_tdr_duck() {
         return; // one already in flight
     }
     let epoch = shell.adapter_epoch();
-    if send_task(EffectsTask::TdrDuck { epoch }).is_some() {
+    let task = if shell.tdr_duck_mode() == TDR_DUCK_DISPLAY {
+        // Legacy build-14/15 behaviour, now opt-in. Traced distinctly so a
+        // single field capture says which policy ran, without needing the
+        // device-add event to still be in the buffer.
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrLegacyDuck",
+            level(Warning),
+            u64("session", &session_id),
+            i32("hresult", &reason_hr)
+        );
+        EffectsTask::TdrDuck { epoch }
+    } else {
+        EffectsTask::TdrDeviceDuck { epoch, session_id, reason_hr }
+    };
+    if send_task(task).is_some() {
         shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
         tracelogging::write_event!(PROVIDER, "TdrDuckQueueFailed", level(Warning));
     }
@@ -548,6 +725,20 @@ fn abandon_ducked(reason: &str) -> u64 {
     count
 }
 
+/// A duck arriving long after the last successful recovery is a NEW
+/// incident, not a continuation of the old flap — reset the budget so
+/// sparse genuine TDRs across a long boot never exhaust it (which would
+/// silently abandon permanent-pool monitors on the 4th). Shared by both
+/// duck styles.
+fn reset_cycles_if_new_incident() {
+    let shell = Shell::get();
+    const INCIDENT_WINDOW_MS: u64 = 10 * 60 * 1000;
+    let last_recovery = shell.tdr_last_recovery_ms.load(std::sync::atomic::Ordering::SeqCst);
+    if last_recovery != 0 && shell.now_ms().saturating_sub(last_recovery) > INCIDENT_WINDOW_MS {
+        shell.tdr_duck_cycles.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn run_tdr_duck(epoch: u64) {
     let shell = Shell::get();
     if shell.adapter_epoch() != epoch {
@@ -555,15 +746,7 @@ fn run_tdr_duck(epoch: u64) {
         tracelogging::write_event!(PROVIDER, "TdrDuckStale", level(Warning));
         return;
     }
-    // A duck arriving long after the last successful recovery is a NEW
-    // incident, not a continuation of the old flap — reset the budget so
-    // sparse genuine TDRs across a long boot never exhaust it (which
-    // would silently abandon permanent-pool monitors on the 4th).
-    const INCIDENT_WINDOW_MS: u64 = 10 * 60 * 1000;
-    let last_recovery = shell.tdr_last_recovery_ms.load(std::sync::atomic::Ordering::SeqCst);
-    if last_recovery != 0 && shell.now_ms().saturating_sub(last_recovery) > INCIDENT_WINDOW_MS {
-        shell.tdr_duck_cycles.store(0, std::sync::atomic::Ordering::SeqCst);
-    }
+    reset_cycles_if_new_incident();
     let parked = monitors::duck_all(epoch);
     if parked == 0 {
         // Nothing to park (already unplugged, or torn down mid-loop):
@@ -701,6 +884,524 @@ fn run_tdr_replug(epoch: u64) {
     shell.tdr_duck_pending.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
+// ---------------------------------------------------------------------
+// Build 16: duck the DEVICE, not the DISPLAY (`TDR_DUCK_DEVICE`).
+//
+// Evidence (2026-07-30, verified): a corrected PCIe AER on the GPU root
+// port produced DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET; 84 ms later the
+// build-14 duck-out departed the ONLY active display, taking the active
+// display count to zero BY DESIGN. 131 ms after that dwm.exe reported a
+// black screen and Windows wrote a 0x1b8 live dump; QueryDisplayConfig
+// then returned zero paths for 7.9 s and ERROR_NOT_SUPPORTED thereafter,
+// never recovering. Windows logged NO Event 4101 — the OS never ran a
+// TDR recovery cycle at all, so the thing the duck existed to get out of
+// the way of never happened. The duck was not the root cause, but it
+// converted a recoverable device removal into a machine-wide wedge.
+//
+// So: tear the DEVICE down (already done by the frame worker before it
+// queues this) and keep the DISPLAY. DESIGN.md §3.3 rule 2 has specified
+// exactly this from the start — "Monitors stay attached" — and the driver
+// already relies on arrived-with-no-device being legal on every routine
+// swapchain replacement (`evt_unassign` leaves the monitor arrived; the
+// OS itself does this ~10 ms after every activation).
+// ---------------------------------------------------------------------
+
+/// Heartbeat cadence for a device-ducked ring. Must stay well under the
+/// host's `RING_HEARTBEAT_STALE_MS` (2000): keeping the display alive is
+/// pointless if the host concludes "driver gone" two seconds in. 250 ms
+/// matches the frame worker's own `HEARTBEAT_EVERY`.
+const TDR_DEVICE_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Once the GPU answers device creation again, how long to let the OS
+/// drive its own unassign→assign before forcing a requalify modeset. A
+/// completed reset normally re-assigns within a few hundred ms, so this
+/// is deliberately generous — the zero-modeset path should win whenever
+/// it possibly can.
+const TDR_REASSIGN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Release the one-duck-in-flight latch. There is no device-duck state
+/// object by design: `tdr_duck_pending` is the only thing that has to be
+/// global, and the poller keeps everything else in its own locals.
+fn finish_device_duck() {
+    Shell::get()
+        .tdr_duck_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A poller exit arm could not reach the effects worker (process teardown,
+/// or it never spawned). Constraint 4: an arm that silently does nothing is
+/// indistinguishable in a trace from an arm that was never taken, and this
+/// one decides whether the display is ever departed — the single most
+/// consequential question in a build-16 capture.
+///
+/// There is deliberately NO inline fallback: an IddCx call from a poller
+/// thread is exactly what §3.3 forbids. The monitor stays ARRIVED, which is
+/// the safe residue in this mode.
+fn trace_device_task_queue_failed(task: &str) {
+    tracelogging::write_event!(
+        PROVIDER,
+        "TdrDeviceTaskQueueFailed",
+        level(Error),
+        str8("task", task)
+    );
+}
+
+/// Which of `sessions` is STILL not recovered, judged by the lock-free
+/// liveness mirror — never by the ring mutex, which a live frame worker
+/// pins for its entire lifetime.
+///
+/// Every path that is about to depart a display calls this first. A session
+/// that has gone since the duck started, or whose ring is ACTIVE/DEAD
+/// again, is not in trouble and must not be departed: build 16's whole
+/// acceptance bar is "NO MonitorDeparture across the window", and the
+/// queue-to-execution gap on the effects worker is more than enough for the
+/// OS to have re-assigned a swap chain in the meantime.
+fn unrecovered_sessions(sessions: &[u64]) -> Vec<u64> {
+    let shell = Shell::get();
+    let monitors = shell.monitors.lock().unwrap();
+    sessions
+        .iter()
+        .filter(|sid| {
+            monitors
+                .get(sid)
+                .is_some_and(|rt| !rt.ring.live.settled())
+        })
+        .copied()
+        .collect()
+}
+
+/// How many of `sessions` are publishing RIGHT NOW (worker live + ring
+/// ACTIVE). Reported alongside every skip so a trace shows the arm was
+/// declined because the display was healthy, not because it had vanished.
+fn publishing_sessions(sessions: &[u64]) -> u64 {
+    let shell = Shell::get();
+    let monitors = shell.monitors.lock().unwrap();
+    sessions
+        .iter()
+        .filter(|sid| monitors.get(sid).is_some_and(|rt| rt.ring.live.publishing()))
+        .count() as u64
+}
+
+/// The GATED FALLBACK departure — build 14/15's behaviour, reached only
+/// when the device-duck cannot be sustained (the long deadline expired, or
+/// the poller could not be spawned). Departs the still-unrecovered members
+/// of the duck's LUID-scoped set and drains the parked set immediately:
+/// there is no recovery left to wait for, the budget is already spent.
+///
+/// Scoped, not `duck_all`: the duck was scoped to one adapter's LUID
+/// precisely so a monitor on a healthy second GPU is not dragged into
+/// another adapter's reset, and departing everything here would have thrown
+/// that away at the one moment it mattered.
+fn depart_fallback(epoch: u64, sessions: &[u64], reason: &str) {
+    let shell = Shell::get();
+    let (departed, skipped) = if shell.adapter_epoch() == epoch {
+        let unrecovered = unrecovered_sessions(sessions);
+        let skipped = (sessions.len() - unrecovered.len()) as u64;
+        (monitors::duck_sessions(epoch, &unrecovered), skipped)
+    } else {
+        (0, 0)
+    };
+    let abandoned = abandon_ducked(reason);
+    tracelogging::write_event!(
+        PROVIDER,
+        "TdrDeviceDuckGaveUp",
+        level(Warning),
+        str8("reason", reason),
+        u64("departed", &(departed as u64)),
+        u64("kept", &skipped),
+        u64("abandoned", &abandoned)
+    );
+    finish_device_duck();
+}
+
+/// Device-duck entry point on the effects worker. Note what is ABSENT:
+/// there is no `monitors::duck_all` call, and that omission is the whole
+/// change. Everything the teardown needs already happened on the frame
+/// worker (D3D device dropped at `frame_loop`'s return, swapchain
+/// abandoned, textures retired with a generation bump, ring REBUILDING).
+/// The IddCx monitor stays ARRIVED, so Windows keeps a display path and
+/// no `DBT_DEVNODES_CHANGED` departure is broadcast.
+fn run_tdr_device_duck(epoch: u64, session_id: u64, reason_hr: i32) {
+    let shell = Shell::get();
+    if shell.adapter_epoch() != epoch {
+        finish_device_duck();
+        tracelogging::write_event!(PROVIDER, "TdrDeviceDuckStale", level(Warning));
+        return;
+    }
+    reset_cycles_if_new_incident();
+
+    // Scope the duck to the adapter that actually reported removal: a
+    // monitor rendering on a HEALTHY second adapter must not be dragged
+    // into another GPU's reset. The poller judges each covered session by
+    // its RING STATE, so nothing else needs snapshotting here.
+    let (luid, sessions) = {
+        let monitors = shell.monitors.lock().unwrap();
+        // If the failing session is GONE, duck nothing: falling back to
+        // luid 0 would sweep in every never-assigned monitor and then probe
+        // a LUID that EnumAdapterByLuid cannot resolve, so the poller could
+        // never see recovery and would burn the whole 10-minute budget
+        // before departing displays that were never in trouble.
+        match monitors.get(&session_id).map(|rt| rt.adapter_luid) {
+            Some(luid) => {
+                let sessions: Vec<u64> = monitors
+                    .iter()
+                    .filter(|(_, rt)| rt.adapter_luid == luid)
+                    .map(|(sid, _)| *sid)
+                    .collect();
+                (luid, sessions)
+            }
+            None => (0, Vec::new()),
+        }
+    };
+    if sessions.is_empty() {
+        // Destroyed between the worker's failure and this task. Nothing to
+        // keep alive, and deliberately consumes no incident budget.
+        finish_device_duck();
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDeviceDuckNoMonitors",
+            level(Informational),
+            u64("session", &session_id)
+        );
+        return;
+    }
+    tracelogging::write_event!(
+        PROVIDER,
+        "TdrDeviceDuckStart",
+        level(Warning),
+        u64("session", &session_id),
+        u64("sessions", &(sessions.len() as u64)),
+        u64("luid", &luid),
+        i32("hresult", &reason_hr)
+    );
+
+    // The poller lives on its own thread for the same reason the legacy
+    // one does: the effects worker must stay free for every other IddCx
+    // side effect while the GPU recovers.
+    let poller_sessions = sessions.clone();
+    let spawned = std::thread::Builder::new()
+        .name("vgd-tdr-device".into())
+        .spawn(move || device_duck_poller(epoch, luid, poller_sessions));
+    if spawned.is_err() {
+        // Without a poller there is no heartbeat and no recovery
+        // detection, so an arrived monitor would sit behind a frozen ring
+        // with nothing watching it. Take the fallback instead.
+        tracelogging::write_event!(PROVIDER, "TdrDevicePollerSpawnFailed", level(Error));
+        depart_fallback(epoch, &sessions, "poller spawn failed");
+    }
+}
+
+/// The device-duck recovery poller. Every wait here is bounded and none of
+/// it runs on a callback frame (§3.3): own thread, 250 ms tick, D3D probes
+/// on THROWAWAY 15 s-deadline threads that are detached if they hang
+/// inside a wedged OS call.
+fn device_duck_poller(epoch: u64, luid: u64, sessions: Vec<u64>) {
+    let shell = Shell::get();
+    let started = std::time::Instant::now();
+    let deadline = started + TDR_RECOVERY_BUDGET;
+    let mut probe: Option<(std::thread::JoinHandle<bool>, std::time::Instant)> = None;
+    let mut last_hang_at: Option<std::time::Instant> = None;
+    let mut last_probe_step = std::time::Instant::now();
+    let mut recovered_at: Option<std::time::Instant> = None;
+    let mut heartbeat_blocked_traced = false;
+    let mut heartbeats: u64 = 0;
+
+    loop {
+        std::thread::sleep(TDR_DEVICE_TICK);
+
+        if shell.adapter_epoch() != epoch {
+            // D3Final tore the device down. Its drain already handled these
+            // monitors through the ordinary MonitorTornDown path — they
+            // were never parked, which is exactly why nothing extra is
+            // needed here (contrast the legacy poller, which must
+            // `abandon_ducked` entries it still owns).
+            tracelogging::write_event!(PROVIDER, "TdrDevicePollerStale", level(Informational));
+            finish_device_duck();
+            return;
+        }
+
+        // Snapshot the covered sessions' ring Arcs, then release the
+        // monitors lock BEFORE touching any ring: `duck_all` takes
+        // monitors→ring, so doing the same here keeps that order, and the
+        // per-ring try_locks must not run under a lock IddCx callbacks
+        // also take.
+        let rings: Vec<(u64, std::sync::Arc<super::swapchain::RingHandle>)> = {
+            let monitors = shell.monitors.lock().unwrap();
+            sessions
+                .iter()
+                .filter_map(|sid| monitors.get(sid).map(|rt| (*sid, rt.ring.clone())))
+                .collect()
+        };
+        if rings.is_empty() {
+            tracelogging::write_event!(
+                PROVIDER,
+                "TdrDeviceDuckSessionsGone",
+                level(Informational),
+                u64("held_ms", &(started.elapsed().as_millis() as u64))
+            );
+            finish_device_duck();
+            return;
+        }
+        // One tick per covered ring: decide recovery from the LOCK-FREE
+        // liveness mirror, and refresh the heartbeat of whatever is still
+        // REBUILDING. The mirror, not the ring mutex: `frame_loop` pins
+        // that mutex for the entire life of a worker, so a fully recovered,
+        // actively-publishing ring can NEVER grant a try_lock — asking the
+        // lock first (build 16's first cut) made every genuine recovery
+        // read as "still pending", put the good exit below out of reach,
+        // and handed the display to the requalify arm ~10 s later. Only
+        // `frame_loop` publishes ACTIVE, and only after
+        // IddCxSwapChainSetDevice succeeded on a freshly created device, so
+        // a replacement worker that died in create_device_on_luid (GPU
+        // still gone) leaves the mirror REBUILDING and this poller
+        // correctly keeps watching.
+        let mut pending = 0usize;
+        let mut live_gens = 0u64;
+        for (_, ring) in &rings {
+            live_gens += ring.live.live_generation();
+            match super::ring_tick_arc(ring) {
+                super::RingTick::Settled => {}
+                super::RingTick::Rebuilding => {
+                    pending += 1;
+                    heartbeats += 1;
+                }
+                super::RingTick::HeartbeatBlocked => {
+                    pending += 1;
+                    if !heartbeat_blocked_traced {
+                        // A deadline-DETACHED worker is pinning the ring
+                        // mutex — the only way to reach this arm now that
+                        // a live worker settles lock-free. Traced once per
+                        // duck; the host's stale-heartbeat handling covers
+                        // it exactly as it did before build 16.
+                        heartbeat_blocked_traced = true;
+                        tracelogging::write_event!(
+                            PROVIDER,
+                            "TdrDeviceHeartbeatBlocked",
+                            level(Warning)
+                        );
+                    }
+                }
+            }
+        }
+        if pending == 0 {
+            // THE GOOD EXIT: every covered ring is publishing again (or is
+            // finished). The OS drove its own unassign→assign, the
+            // transport is back with ZERO modesets from us, and the display
+            // never left — which is the entire point of build 16.
+            tracelogging::write_event!(
+                PROVIDER,
+                "TdrDeviceReassigned",
+                level(Informational),
+                u64("elapsed_ms", &(started.elapsed().as_millis() as u64)),
+                u64("heartbeats", &heartbeats),
+                // Total go-live transitions across the covered rings. Says
+                // a worker really came back, as opposed to the rings never
+                // having been REBUILDING in the first place.
+                u64("live_gens", &live_gens),
+                // Keeps this event honest: says whether our own probe ever
+                // confirmed the GPU answering again, or whether the ring
+                // simply went ACTIVE first. "Did it really come back?" is
+                // the whole question a build-16 capture is taken to answer.
+                u32("gpu_confirmed", &(recovered_at.is_some() as u32))
+            );
+            shell
+                .tdr_last_recovery_ms
+                .store(shell.now_ms().max(1), std::sync::atomic::Ordering::SeqCst);
+            // Release the one-in-flight latch, THEN re-read the mirrors.
+            // Between the tally above and this store, a worker can fail
+            // again; its `queue_tdr_duck` would lose the CAS to the latch
+            // we are about to clear and be dropped, leaving an arrived
+            // monitor behind a REBUILDING ring with nothing watching it.
+            // Clearing first and re-checking after closes that window in
+            // the only order that can: anything that failed BEFORE the
+            // clear is still visible in the mirror, and anything after it
+            // arms itself.
+            finish_device_duck();
+            for (session_id, ring) in &rings {
+                if !ring.live.settled() {
+                    tracelogging::write_event!(
+                        PROVIDER,
+                        "TdrDeviceDuckRearmed",
+                        level(Warning),
+                        u64("session", session_id)
+                    );
+                    queue_tdr_duck(*session_id, 0);
+                    break;
+                }
+            }
+            return;
+        }
+
+        if last_probe_step.elapsed() >= TDR_RECOVERY_PROBE_EVERY {
+            last_probe_step = std::time::Instant::now();
+            if let Some((handle, at)) = probe.take() {
+                if handle.is_finished() {
+                    if handle.join().unwrap_or(false) && recovered_at.is_none() {
+                        recovered_at = Some(std::time::Instant::now());
+                        tracelogging::write_event!(
+                            PROVIDER,
+                            "TdrDeviceRecovered",
+                            level(Informational),
+                            u64("elapsed_ms", &(started.elapsed().as_millis() as u64))
+                        );
+                    }
+                } else if at.elapsed() >= TDR_PROBE_DEADLINE {
+                    // Hung inside the OS call — detach and rate-limit
+                    // respawns. The leak is bounded by the respawn interval
+                    // and each thread exits when its call finally returns.
+                    drop(handle);
+                    last_hang_at = Some(std::time::Instant::now());
+                    tracelogging::write_event!(PROVIDER, "TdrRecoveryProbeHung", level(Warning));
+                } else {
+                    probe = Some((handle, at));
+                }
+            }
+            if probe.is_none() && recovered_at.is_none() {
+                let respawn_ok = match last_hang_at {
+                    Some(at) => at.elapsed() >= TDR_PROBE_RESPAWN_AFTER_HANG,
+                    None => true,
+                };
+                if respawn_ok {
+                    if let Ok(handle) = std::thread::Builder::new()
+                        .name("vgd-tdr-probe".into())
+                        .spawn(move || super::swapchain::probe_adapter_on_luid(luid))
+                    {
+                        probe = Some((handle, std::time::Instant::now()));
+                    }
+                }
+            }
+        }
+
+        if recovered_at.is_some_and(|at| at.elapsed() >= TDR_REASSIGN_GRACE) {
+            // The GPU answers again but the OS never came back for the
+            // swapchain. Force ONE depart+re-arrive — a clean modeset
+            // against a stack we just probed HEALTHY, which is a
+            // categorically different act from departing the last display
+            // in the middle of a wedge.
+            tracelogging::write_event!(
+                PROVIDER,
+                "TdrDeviceRequalifyQueued",
+                level(Warning),
+                u64("elapsed_ms", &(started.elapsed().as_millis() as u64))
+            );
+            // Only the sessions that are STILL unrecovered travel with the
+            // task, and `run_tdr_requalify` re-checks them again before it
+            // departs anything.
+            let unrecovered = unrecovered_sessions(&sessions);
+            if send_task(EffectsTask::TdrRequalify { epoch, sessions: unrecovered }).is_some() {
+                // Effects worker gone (D3Final, or it never spawned). The
+                // monitor stays ARRIVED — the safe residue in this mode, and
+                // deliberately NOT an inline departure: an IddCx call from a
+                // poller thread is exactly what §3.3 forbids.
+                trace_device_task_queue_failed("requalify");
+                finish_device_duck();
+            }
+            return;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            // Never recovered inside the budget: this is the machine-wide
+            // wedge case, where only a reboot helps. Hand the fallback to
+            // the effects worker (departure is an IddCx call and must be
+            // ordered with every other side effect).
+            let unrecovered = unrecovered_sessions(&sessions);
+            if send_task(EffectsTask::TdrDeadlineDepart { epoch, sessions: unrecovered }).is_some()
+            {
+                trace_device_task_queue_failed("deadline depart");
+                finish_device_duck();
+            }
+            return;
+        }
+    }
+}
+
+/// The "OS recovery genuinely completed" departure: depart + immediately
+/// re-arrive, so Windows rebuilds the path against a healthy stack and
+/// reattaches the remembered topology (same container GUID + connector).
+fn run_tdr_requalify(epoch: u64, sessions: Vec<u64>) {
+    let shell = Shell::get();
+    if shell.adapter_epoch() != epoch {
+        tracelogging::write_event!(PROVIDER, "TdrRequalifyStale", level(Warning));
+        finish_device_duck();
+        return;
+    }
+    // THE GUARD. This arm is the only thing in device-duck mode that can
+    // take a display away, so it re-reads the lock-free liveness mirror
+    // immediately before acting and departs NOTHING that has come back.
+    // The poller already filtered, but this task sat on the effects queue
+    // behind whatever else was in flight, and the OS re-assigns swap chains
+    // on its own clock — "healthy and publishing" is a state that can
+    // arrive at any point in that gap. Departing then would be the exact
+    // failure build 16 exists to prevent (a modeset plus the
+    // DBT_DEVNODES_CHANGED broadcast on a machine that already healed).
+    let unrecovered = unrecovered_sessions(&sessions);
+    if unrecovered.is_empty() {
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrDeviceRequalifySkipped",
+            level(Informational),
+            u64("covered", &(sessions.len() as u64)),
+            u64("publishing", &publishing_sessions(&sessions))
+        );
+        // A recovery, not a give-up: the display never left, so this counts
+        // as the good outcome for the incident-window budget and consumes
+        // no cycle.
+        shell
+            .tdr_last_recovery_ms
+            .store(shell.now_ms().max(1), std::sync::atomic::Ordering::SeqCst);
+        finish_device_duck();
+        return;
+    }
+    // The requalify is the ONLY modeset build 16 performs, so this is what
+    // the per-incident cycle budget governs in device-duck mode (in legacy
+    // mode the same counter caps duck→replug flaps). A stack needing a
+    // fourth forced modeset in one incident is flapping: stop churning and
+    // leave the monitor arrived — an arrived-but-idle display is still a
+    // display Windows can compose onto, which is the point.
+    let cycle = shell.tdr_duck_cycles.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if cycle > TDR_MAX_DUCK_CYCLES {
+        tracelogging::write_event!(
+            PROVIDER,
+            "TdrRequalifyCapped",
+            level(Warning),
+            u32("cycle", &cycle)
+        );
+        finish_device_duck();
+        return;
+    }
+    // Scoped to the duck's own unrecovered sessions — `duck_all` here would
+    // depart monitors on a healthy second adapter and undo the per-LUID
+    // scoping run_tdr_device_duck computed.
+    let departed = monitors::duck_sessions(epoch, &unrecovered);
+    tracelogging::write_event!(
+        PROVIDER,
+        "TdrDeviceRequalify",
+        level(Warning),
+        u64("departed", &(departed as u64)),
+        u64("kept", &((sessions.len() - unrecovered.len()) as u64)),
+        u32("cycle", &cycle)
+    );
+    if departed > 0 {
+        monitors::replug_ducked();
+        shell
+            .tdr_last_recovery_ms
+            .store(shell.now_ms().max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+    finish_device_duck();
+}
+
+/// The "long deadline expired" departure (task spec's second clause).
+/// `depart_fallback` re-checks the liveness mirror, so a session that came
+/// back while this task sat on the queue is kept, not departed.
+fn run_tdr_deadline_depart(epoch: u64, sessions: Vec<u64>) {
+    if Shell::get().adapter_epoch() != epoch {
+        tracelogging::write_event!(PROVIDER, "TdrDeadlineDepartStale", level(Warning));
+        finish_device_duck();
+        return;
+    }
+    depart_fallback(epoch, &sessions, "recovery deadline");
+}
+
 /// Adapter bring-up, off the EvtIddCxAdapterInitFinished frame: both the
 /// DXGI factory walk (D3D work) and the permanent-pool replug (IddCx
 /// monitor create/arrival) violate the callback rules when run inline.
@@ -748,6 +1449,7 @@ fn apply_now(effects: Vec<Effect>) {
                 display_id,
                 connector_index,
                 modes,
+                targets,
                 adapter_luid,
                 ring_slots,
                 edid,
@@ -756,11 +1458,24 @@ fn apply_now(effects: Vec<Effect>) {
                 display_id,
                 connector_index,
                 modes,
+                targets,
                 adapter_luid,
                 ring_slots,
                 edid,
             ),
             Effect::UnplugMonitor { session_id } => monitors::unplug(session_id),
+            // Build 17: the ONLY caller of IddCxMonitorUpdateModes2, and
+            // it is here for the same reason plug/unplug are — the OS
+            // re-enters the mode DDIs synchronously, so this may never run
+            // on an IOCTL or callback frame, and never under a lock those
+            // DDIs take.
+            // It also owes the session table a settle_modes for
+            // `update_seq` — the durable list stays pending until the OS
+            // push is confirmed, so this effect is the only thing that
+            // can resolve it, in either direction.
+            Effect::UpdateModes { session_id, update_seq, targets } => {
+                monitors::update_modes(session_id, update_seq, targets)
+            }
             Effect::PersistState(blob) => unsafe { write_persisted(&blob) },
         }
     }
@@ -774,7 +1489,117 @@ fn requires_adapter(code: u32) -> bool {
         ioctl::IOCTL_CREATE_MONITOR
             | ioctl::IOCTL_DESTROY_MONITOR
             | ioctl::IOCTL_SET_PERMANENT_POOL
+            // Build 17: dispatch would happily merge the list, but the
+            // resulting Effect targets an IddCx monitor that cannot exist
+            // before the adapter does.
+            | ioctl::IOCTL_UPDATE_MODES
     )
+}
+
+/// Build-17 ETW for dispatch-level `UPDATE_MODES` outcomes (constraint 4:
+/// every deny/fail path emits stage + code).
+///
+/// Nothing at the dispatch layer traces anything today — the only
+/// IOCTL-layer events are the authorization gate's — so without this the
+/// new opcode's refusals (`NOT_HANDSHAKEN`, `BAD_MODE`, `NO_SUCH_SESSION`,
+/// a short buffer) would be completely invisible in a capture, which is
+/// exactly how the build-8 ACL outage stayed unexplained for three builds.
+///
+/// # Safety
+/// `out_ptr`/`out_got` must be the output buffer just handed to
+/// `dispatch`, still valid (the request has not been completed yet).
+unsafe fn trace_update_modes_result(result: &DispatchResult, out_ptr: PVOID, out_got: usize) {
+    const UPD_DISPATCH_STAGE_BUFFER: u32 = 6;
+    const UPD_DISPATCH_STAGE_VALIDATE: u32 = 7;
+    match result.status {
+        Status::Ok => {
+            let n = core::mem::size_of::<luminal_driver_proto::UpdateModesReply>();
+            if out_ptr.is_null() || out_got < n {
+                return;
+            }
+            let reply = core::ptr::read_unaligned(
+                out_ptr.cast::<luminal_driver_proto::UpdateModesReply>(),
+            );
+            if reply.result == luminal_driver_proto::err::OK {
+                // Accepted. `queued` distinguishes a real change from an
+                // idempotent resend of an already-advertised list, which
+                // deliberately produces no effect and no OS call.
+                // `accepted`/`requested` are the build-17 partial-
+                // application counts, and `pending` says whether the
+                // reported list is in force yet: without them a capture
+                // cannot tell a fully applied update from one the cap
+                // truncated or one still waiting on the effects worker,
+                // which is exactly the ambiguity that let a silent no-op
+                // read as success.
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "UpdateModesAccepted",
+                    level(Informational),
+                    u64("session", &reply.session_id),
+                    u32("modes", &reply.mode_count),
+                    u32("queued", &u32::from(!result.effects.is_empty())),
+                    u32("accepted", &reply.accepted()),
+                    u32("requested", &reply.requested()),
+                    u32("rejected", &reply.rejected()),
+                    u32("pending", &u32::from(reply.is_pending())),
+                    u32("partial", &u32::from(reply.is_partial()))
+                );
+            } else {
+                // `rejected` / `first_rejected` are what make a BAD_MODE
+                // here diagnosable: a request refused because every mode
+                // it named is outside the monitor's create-time
+                // description reads identically to a malformed request
+                // without them, and the two need completely different
+                // fixes (create with a wider superset vs fix the caller).
+                //
+                // `blocked` / `blocking_mode` are the same argument for the
+                // other refusal: a request answered from a committed-mode
+                // refusal the effects worker already made (stage
+                // GATES_COMMITTED, the same stage that refusal traced) is
+                // NOT a caller bug and NOT retryable, and a capture that
+                // showed only "denied, BAD_MODE-ish" would send the reader
+                // looking for one in the host.
+                let blocked = reply.is_blocked();
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "UpdateModesDenied",
+                    level(Warning),
+                    u64("session", &reply.session_id),
+                    u32(
+                        "stage",
+                        &if blocked {
+                            crate::modepush::stage::GATES_COMMITTED
+                        } else {
+                            UPD_DISPATCH_STAGE_VALIDATE
+                        }
+                    ),
+                    i32("code", &reply.result),
+                    u32("modes", &reply.mode_count),
+                    u32("rejected", &reply.rejected()),
+                    u32("first_rejected", &reply.first_rejected()),
+                    u32("blocked", &u32::from(blocked)),
+                    u32("blocking_mode", &reply.blocking_mode_idx()),
+                    u32("retryable", &u32::from(reply.worth_retrying()))
+                );
+            }
+        }
+        Status::BadBuffer | Status::UnknownCode => {
+            tracelogging::write_event!(
+                PROVIDER,
+                "UpdateModesDenied",
+                level(Warning),
+                u64("session", &0u64),
+                u32("stage", &UPD_DISPATCH_STAGE_BUFFER),
+                i32("code", &luminal_driver_proto::err::INTERNAL),
+                u32("modes", &0u32),
+                u32("rejected", &0u32),
+                u32("first_rejected", &luminal_driver_proto::NO_REJECTED_INDEX),
+                u32("blocked", &0u32),
+                u32("blocking_mode", &luminal_driver_proto::NO_MODE_INDEX),
+                u32("retryable", &1u32)
+            );
+        }
+    }
 }
 
 pub unsafe extern "C" fn evt_ioctl(
@@ -905,6 +1730,11 @@ pub unsafe extern "C" fn evt_ioctl(
         let mut dev = shell.dev.lock().unwrap();
         dispatch(&mut dev, handle, shell.now_ms(), code, input, output)
     };
+
+    if code == ioctl::IOCTL_UPDATE_MODES {
+        // Before completion, while the output buffer is still ours.
+        trace_update_modes_result(&result, out_ptr, out_got);
+    }
 
     let (status, info): (NTSTATUS, usize) = match result.status {
         Status::Ok => (STATUS_SUCCESS, result.bytes_written),

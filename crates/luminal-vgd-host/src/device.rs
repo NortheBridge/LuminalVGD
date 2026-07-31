@@ -17,8 +17,8 @@ use luminal_driver_proto::{
     CreateMonitorRequest, CursorHeader, DestroyMonitorRequest, GetStatusReply, HandshakeReply,
     HandshakeRequest, PermanentPoolConfig, PingRequest, QueryLeaseReply, QueryLeaseRequest,
     QueryPermanentPoolReply, RingHeader, SetRenderAdapterRequest, SlotMetadata,
-    CURSOR_HEADER_VERSION, CURSOR_MAGIC, CURSOR_SHAPE_OFFSET, LUMINAL_VGD_INTERFACE_GUID,
-    PROTO_VERSION_MAJOR, RING_SLOTS_OFFSET,
+    UpdateModesReply, UpdateModesRequest, CURSOR_HEADER_VERSION, CURSOR_MAGIC,
+    CURSOR_SHAPE_OFFSET, LUMINAL_VGD_INTERFACE_GUID, PROTO_VERSION_MAJOR, RING_SLOTS_OFFSET,
 };
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -167,6 +167,20 @@ impl VgdDevice {
     /// Returns the proto result code (`err::OK` or negative).
     pub fn destroy_monitor(&self, session_id: u64) -> io::Result<i32> {
         self.ioctl_inout(ioctl::IOCTL_DESTROY_MONITOR, &DestroyMonitorRequest { session_id })
+    }
+
+    /// Grow a live monitor's advertised mode list (proto 0.5).
+    ///
+    /// Gate this on `caps::DYNAMIC_MODES` from the handshake. Against a
+    /// pre-0.5 driver the opcode is unknown, `DeviceIoControl` fails, and
+    /// this returns `Err` — which the caller must treat as "the modes are
+    /// unchanged, carry on", never as a session failure.
+    ///
+    /// `reply.result == err::OK` means ACCEPTED, not applied: the driver
+    /// completes this request before it calls the OS (see
+    /// [`UpdateModesReply`]).
+    pub fn update_modes(&self, req: &UpdateModesRequest) -> io::Result<UpdateModesReply> {
+        self.ioctl_inout(ioctl::IOCTL_UPDATE_MODES, req)
     }
 
     /// Returns the proto result code. Call at least once per watchdog

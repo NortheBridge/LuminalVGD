@@ -35,13 +35,16 @@ use luminal_vgd_core::modes::Mode;
 /// shared cursor section (the OS stops composing it into frames);
 /// GAMMA_RAMP = the SetGammaRamp DDI is registered and acknowledged
 /// (pixels stay pass-through — capture on physical displays is pre-LUT
-/// too, so the stream parity is identical).
+/// too, so the stream parity is identical); DYNAMIC_MODES = build 17's
+/// `UPDATE_MODES` opcode is implemented, so a live monitor's advertised
+/// list can grow without a destroy/create cycle.
 pub(crate) const SHELL_CAPS: u32 = luminal_driver_proto::caps::MULTI_MODE
     | luminal_driver_proto::caps::PERMANENT_POOL
     | luminal_driver_proto::caps::HDR10
     | luminal_driver_proto::caps::SDR10_BIT
     | luminal_driver_proto::caps::HW_CURSOR
-    | luminal_driver_proto::caps::GAMMA_RAMP;
+    | luminal_driver_proto::caps::GAMMA_RAMP
+    | luminal_driver_proto::caps::DYNAMIC_MODES;
 
 /// Monotonic build stamp reported in HANDSHAKE/GET_STATUS. Release
 /// builds stamp it via the LUMINAL_VGD_BUILD environment variable
@@ -60,7 +63,7 @@ pub(crate) const DRIVER_BUILD: u32 = match option_env!("LUMINAL_VGD_BUILD") {
         }
         n
     }
-    None => 14,
+    None => 17,
 };
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the
@@ -90,7 +93,26 @@ pub(crate) struct MonitorRt {
     /// The exact EDID served to the OS. Boxed so the pointer handed to
     /// IddCxMonitorCreate stays stable while the map rehashes.
     pub edid: Box<[u8; 256]>,
-    pub modes: Vec<Mode>,
+    /// The MONITOR-mode list this monitor object was created with — what
+    /// `evt_parse_monitor_description2` reports, every entry
+    /// `IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR` because the 256-byte
+    /// EDID in `edid` was generated from exactly this list.
+    ///
+    /// **Immutable for the life of the monitor object.** The EDID cannot
+    /// be reissued and no IddCx 1.10/1.11 DDI replaces an arrived
+    /// monitor's description, so this set can only change by departure +
+    /// recreate. `UPDATE_MODES` does not touch it.
+    pub monitor_modes: Vec<Mode>,
+    /// The TARGET-mode list currently published — what
+    /// `evt_query_target_modes2` reports and what
+    /// `IddCxMonitorUpdateModes2` pushes. Always a non-empty subset of
+    /// `monitor_modes`, because Windows offers the intersection of the two
+    /// and a target outside the monitor list could never surface.
+    ///
+    /// Mutable since build 17 (`UPDATE_MODES`), but ONLY through
+    /// `monitors::update_modes`, which is the only caller of
+    /// `IddCxMonitorUpdateModes2`.
+    pub target_modes: Vec<Mode>,
     /// Plug identity, kept so a TDR duck-out can re-arrive the same
     /// monitor (same container GUID via display_id, same connector)
     /// without a round trip through the host.
@@ -104,10 +126,12 @@ pub(crate) struct MonitorRt {
     /// wedged.
     pub adapter_luid: u64,
     pub worker: Option<swapchain::Worker>,
-    /// The transport ring (section + policy + textures). Lives here, not
-    /// in the worker, so sequences and the generation persist across
-    /// swap-chain reassignments; the active worker drives it exclusively.
-    pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
+    /// The transport ring (section + policy + textures) plus its lock-free
+    /// liveness mirror. Lives here, not in the worker, so sequences and the
+    /// generation persist across swap-chain reassignments; the active
+    /// worker drives it exclusively — and pins its mutex for its whole
+    /// life, which is why `RingHandle.live` exists beside it.
+    pub ring: std::sync::Arc<swapchain::RingHandle>,
     /// Hardware-cursor worker + section (None when spawn failed — the OS
     /// then composes the cursor into frames, the pre-cursor behavior).
     /// The worker owns every cursor IddCx call, including the
@@ -131,7 +155,14 @@ impl MonitorRt {
 /// Bounded DEAD-marking for a bare ring Arc (see MonitorRt::mark_ring_dead
 /// for the rationale) — also used for parked (ducked) monitors, which
 /// hold their ring outside a MonitorRt.
-pub(crate) fn mark_ring_dead_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRing>>) {
+pub(crate) fn mark_ring_dead_arc(handle: &std::sync::Arc<swapchain::RingHandle>) {
+    // The lock-free mirror is set FIRST and unconditionally. It costs one
+    // store, it cannot fail, and it means a lost try_lock below no longer
+    // loses the fact that this ring is dead — the TDR poller reads the
+    // mirror, so a dead-but-unmarkable ring now settles instead of being
+    // watched (and eventually requalified) forever.
+    handle.live.publish_state(luminal_driver_proto::ring_state::DEAD);
+    let ring = &handle.ring;
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
         match ring.try_lock() {
@@ -163,6 +194,81 @@ pub(crate) fn mark_ring_dead_arc(ring: &std::sync::Arc<Mutex<swapchain::FrameRin
     }
 }
 
+/// Bounded REBUILDING mark for a bare ring Arc — the transport-side half
+/// of arming a TDR device-duck from a site that never owned a locked ring
+/// (`frame_loop`'s device-create failure). Without it a duck armed there
+/// would find the ring still ACTIVE and the poller would settle instantly,
+/// making the whole duck a no-op.
+///
+/// Single bounded attempt for the usual reason (a detached worker pins the
+/// ring mutex for its lifetime); losing it is survivable — the host's
+/// stale-heartbeat detection covers an unmarked ring exactly as it did
+/// before build 16.
+pub(crate) fn mark_ring_rebuilding_arc(handle: &std::sync::Arc<swapchain::RingHandle>) {
+    // Mirror first, unconditionally — see mark_ring_dead_arc. This is what
+    // makes the arm work at all when the losing site is exactly the one
+    // that cannot take the lock: a duck armed against a ring whose mirror
+    // still said ACTIVE would settle on the poller's first tick and do
+    // nothing.
+    handle.live.publish_state(luminal_driver_proto::ring_state::REBUILDING);
+    let ring = match handle.ring.try_lock() {
+        Ok(ring) => ring,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            tracelogging::write_event!(PROVIDER, "RingRebuildMarkTimeout", level(Warning));
+            return;
+        }
+    };
+    if let Some(section) = &ring.section {
+        section.set_state(luminal_driver_proto::ring_state::REBUILDING);
+    }
+}
+
+pub(crate) use crate::tdr::RingTick;
+
+/// One TDR device-duck poller tick against a ring handle: decide whether
+/// the transport came back and, while it has not, keep the shared header's
+/// `driver_heartbeat_qpc` advancing.
+///
+/// **The discriminator is `handle.live`, and it is read with NO LOCK.**
+/// That ordering is the whole point. `frame_loop` pins the FrameRing mutex
+/// for the entire life of a worker, so a recovered, actively-publishing
+/// ring can never grant a `try_lock` — build 16's first cut asked the mutex
+/// first, mapped `WouldBlock` to "not recovered", and thereby made a
+/// genuine recovery indistinguishable from a dead GPU: the zero-modeset
+/// good exit became unreachable, and ~10 s later the requalify arm departed
+/// a display that had already healed. See `crate::tdr` for the full
+/// mechanism.
+///
+/// The lock is still taken, but ONLY to refresh the heartbeat of a ring the
+/// mirror has already told us is still REBUILDING. Losing it there is no
+/// longer a recovery decision — just a lost heartbeat, which the host's
+/// stale-heartbeat handling has always covered.
+///
+/// Build 16 needs that heartbeat because keeping the monitor arrived across
+/// a GPU reset leaves the ring worker-less, and every other `heartbeat()`
+/// call site lives inside `frame_loop` — without it the host declares the
+/// driver stale after `RING_HEARTBEAT_STALE_MS` (2 s) even though the
+/// display path is alive and recovering. Pure shared-memory access: no D3D
+/// device, no IddCx call, nothing that can fail against a wedged GPU.
+pub(crate) fn ring_tick_arc(handle: &std::sync::Arc<swapchain::RingHandle>) -> RingTick {
+    // LOCK-FREE FIRST — and if it says settled, the mutex is never touched.
+    if handle.live.settled() {
+        return crate::tdr::ring_tick(&handle.live, true);
+    }
+    let ring = match handle.ring.try_lock() {
+        Ok(ring) => ring,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        // A deadline-detached worker pins the mutex for its lifetime; a
+        // LIVE one was already judged settled above.
+        Err(TryLockError::WouldBlock) => return crate::tdr::ring_tick(&handle.live, false),
+    };
+    if let Some(section) = &ring.section {
+        section.heartbeat();
+    }
+    crate::tdr::ring_tick(&handle.live, true)
+}
+
 /// A monitor parked during a GPU reset: departed from the OS so TDR
 /// recovery never waits on the indirect display, with everything needed
 /// to re-arrive it kept alive (the ring Arc preserves sequences and the
@@ -173,8 +279,16 @@ pub(crate) struct DuckedMonitor {
     pub connector_index: u32,
     pub adapter_luid: u64,
     pub edid: Box<[u8; 256]>,
-    pub modes: Vec<Mode>,
-    pub ring: std::sync::Arc<Mutex<swapchain::FrameRing>>,
+    /// The monitor-mode superset at park time — what the re-arrival's new
+    /// monitor object is created with. The EDID above describes it, so
+    /// the two must be replugged together.
+    pub monitor_modes: Vec<Mode>,
+    /// The published target subset at park time. An `UPDATE_MODES` that
+    /// lands while a session is parked patches THIS copy (there is no
+    /// monitor object to push at), or the re-arrival would silently
+    /// restore the pre-update selection.
+    pub target_modes: Vec<Mode>,
+    pub ring: std::sync::Arc<swapchain::RingHandle>,
 }
 
 pub(crate) struct Shell {
@@ -189,10 +303,17 @@ pub(crate) struct Shell {
     /// stack recovers (TDR duck-out; control.rs). Purged when the same
     /// session is destroyed or re-plugged while parked.
     pub ducked: Mutex<Vec<DuckedMonitor>>,
+    /// TDR response policy: `dispatch::TDR_DUCK_DEVICE` (default) or
+    /// `TDR_DUCK_DISPLAY` (legacy). Mirrored out of `DriverConfig` at
+    /// device add so the frame worker and the effects worker can read it
+    /// lock-free — reading it through `Shell::dev` would put the device
+    /// lock (held for the whole of every `dispatch()`) on the one path
+    /// that must never wedge.
+    pub tdr_duck_mode: std::sync::atomic::AtomicU32,
     /// One duck-out in flight at a time: set (CAS) when a frame worker
     /// observes device removal, cleared when the replug (or give-up)
     /// completes. Keeps N workers failing off one GPU reset from queueing
-    /// N duck tasks.
+    /// N duck tasks. Shared by both duck styles.
     pub tdr_duck_pending: std::sync::atomic::AtomicBool,
     /// Duck cycles in the current INCIDENT. A wedge where device creation
     /// succeeds but activation still fails would otherwise flap
@@ -241,6 +362,9 @@ impl Shell {
             handles: Mutex::new(HashMap::new()),
             monitors: Mutex::new(HashMap::new()),
             ducked: Mutex::new(Vec::new()),
+            tdr_duck_mode: std::sync::atomic::AtomicU32::new(
+                crate::dispatch::TDR_DUCK_DEVICE,
+            ),
             tdr_duck_pending: std::sync::atomic::AtomicBool::new(false),
             tdr_duck_cycles: std::sync::atomic::AtomicU32::new(0),
             tdr_last_recovery_ms: std::sync::atomic::AtomicU64::new(0),
@@ -272,6 +396,16 @@ impl Shell {
         self.adapter.lock().unwrap().epoch
     }
 
+    /// Handle and epoch from ONE acquisition. Reading them apart lets a
+    /// `clear_adapter` land in between and hand back a live-looking handle
+    /// with the epoch that already invalidated it — which is exactly the
+    /// pair `monitors::push_targets` re-checks against before calling the
+    /// OS, so it must be a single observation.
+    pub fn adapter_with_epoch(&self) -> Option<(OsHandle, u64)> {
+        let slot = self.adapter.lock().unwrap();
+        slot.handle.map(|handle| (handle, slot.epoch))
+    }
+
     /// Publish the adapter only if no clear_adapter intervened since
     /// `epoch` was captured — a stale (pre-teardown) AdapterReady task
     /// must never republish a destroyed adapter. Returns false when stale.
@@ -289,6 +423,20 @@ impl Shell {
         slot.handle = None;
         slot.epoch += 1;
         self.tdr_duck_cycles.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The TDR response policy in force (`dispatch::TDR_DUCK_*`). Read on
+    /// the frame-worker failure path and by the effects worker.
+    pub fn tdr_duck_mode(&self) -> u32 {
+        self.tdr_duck_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mirror the registry-read gate into the shell at device add. Set
+    /// AFTER `init` rather than inside it: `init` is a `get_or_init`, so a
+    /// same-process device re-add would otherwise keep the first device's
+    /// value forever.
+    pub fn set_tdr_duck_mode(&self, mode: u32) {
+        self.tdr_duck_mode.store(mode, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn wdf_device(&self) -> Option<OsHandle> {

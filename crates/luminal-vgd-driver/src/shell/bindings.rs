@@ -75,6 +75,56 @@ pub unsafe fn monitor_departure(monitor: IDDCX_MONITOR) -> NTSTATUS {
     iddcx_call!(_IDDFUNCENUM_IddCxMonitorDepartureTableIndex as PFN_IDDCXMONITORDEPARTURE, monitor)
 }
 
+// -------------------------------------------------------------------
+// `IddCxMonitorUpdateModes` (function-table index 6) IS DELIBERATELY NOT
+// BOUND, AND MUST NOT BE RE-ADDED.
+//
+// Verbatim, from the IddCxMonitorUpdateModes2 reference page (Remarks):
+//
+//     "drivers reporting IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 can only
+//      call IddCxMonitorUpdateModes2; calling IddCxMonitorUpdateModes is
+//      an error."
+//
+// We report CAN_PROCESS_FP16 — it is the ONLY adapter flag
+// `shell::entry` sets (`caps.Flags = ...CAN_PROCESS_FP16`, the HDR10
+// contract), and clearing it would take advanced color off every
+// LuminalVGD monitor. So index 6 is forbidden for this driver for as
+// long as it does HDR at all.
+//
+// Build 17 originally bound it anyway, "for symmetry, never called".
+// A wrapper that must never be called is a wrapper someone eventually
+// calls: the deletion is the enforcement. The one legal entry is
+// [`monitor_update_modes2`] below. (The v1 arg struct is unusable for us
+// regardless — `IDDCX_TARGET_MODE` has no `BitsPerComponent`, which our
+// per-mode wire depth needs — but that is a second reason, not the rule.)
+// -------------------------------------------------------------------
+
+/// v1.10 variant, table index 34 — THE entry build 17 calls. Carries
+/// `IDDCX_TARGET_MODE2` (with `BitsPerComponent`), matching what
+/// `evt_query_target_modes2` reports. It is also the ONLY update entry a
+/// CAN_PROCESS_FP16 driver may call at all — see the block above index
+/// 6's absence.
+///
+/// Safe to call unconditionally: IddMinimumVersionRequired = 10 means the
+/// OS only loads us with a ≥1.10 function table (index 34 is inside the
+/// 1.10 table of 36 entries). Note the C header wraps THIS entry — but
+/// not index 6 — in `IDD_IS_FUNCTION_AVAILABLE`, whose else-branch calls
+/// `WdfDriverErrorReportApiMissing` with `isFatal = TRUE`. Our macro
+/// indexes the table directly and never reaches that branch, exactly like
+/// `swapchain_release_and_acquire_buffer2` and
+/// `monitor_query_hardware_cursor3`; the min-version declaration is what
+/// makes that legal, so do not "fix" this into a guarded call.
+pub unsafe fn monitor_update_modes2(
+    monitor: IDDCX_MONITOR,
+    in_args: *const IDARG_IN_UPDATEMODES2,
+) -> NTSTATUS {
+    iddcx_call!(
+        _IDDFUNCENUM_IddCxMonitorUpdateModes2TableIndex as PFN_IDDCXMONITORUPDATEMODES2,
+        monitor,
+        in_args
+    )
+}
+
 pub unsafe fn swapchain_set_device(
     swapchain: IDDCX_SWAPCHAIN,
     in_args: *const IDARG_IN_SWAPCHAINSETDEVICE,

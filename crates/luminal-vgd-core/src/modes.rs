@@ -125,6 +125,105 @@ impl Mode {
         }
         Ok(out)
     }
+
+    /// Resolve an `UPDATE_MODES` request (proto 0.5) into the TARGET-mode
+    /// list to publish: every entry of `requested` that has a compatible
+    /// entry in `supported` — the monitor-mode SUPERSET fixed at
+    /// `IddCxMonitorCreate` — in request order, deduplicated.
+    ///
+    /// # Why this is a filter and not a merge (build 17, second model)
+    ///
+    /// `IDARG_IN_UPDATEMODES2` (IddCx.h:3586) carries `{ Reason,
+    /// TargetModeCount, pTargetModes }` — TARGET modes, nothing else.
+    /// There is no DDI anywhere in IddCx 1.10 or 1.11 that replaces an
+    /// arrived monitor's DESCRIPTION, so its MONITOR-mode set is frozen at
+    /// create; and Windows presents the INTERSECTION of the monitor-mode
+    /// list with the target-mode list (the intersection is skipped only
+    /// for remote drivers setting
+    /// `IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE`,
+    /// which a console-session driver cannot be). So a target this driver
+    /// publishes with no counterpart in `supported` is invisible to the
+    /// user no matter what the OS returns — it is a lie the driver would
+    /// then have to explain. Filtering here is what makes the reply
+    /// truthful.
+    ///
+    /// # The safety property
+    ///
+    /// `targets ⊆ supported`, always. That single containment is what
+    /// makes the published list safe under EITHER possible semantics of
+    /// `IddCxMonitorUpdateModes2` (replace or append — undocumented, see
+    /// `shell::monitors::push_targets`): a replace leaves the OS holding
+    /// `targets`, an append leaves it holding `previous ∪ targets`, and
+    /// every list this driver ever publishes is a subset of the same fixed
+    /// superset — so the intersection is non-empty and every mode in it is
+    /// one the monitor really describes. Windows can always activate
+    /// something.
+    ///
+    /// A request whose entries are ALL outside `supported` yields an empty
+    /// `targets`, which the caller must refuse rather than publish:
+    /// IddCx.h:3594 states `TargetModeCount` "cannot be zero", and a
+    /// monitor with no targets is a monitor with nothing to activate.
+    /// [`TargetSelection::is_empty`] is that check.
+    pub fn select_targets(supported: &[Mode], requested: &[Mode]) -> TargetSelection {
+        let mut targets: Vec<Mode> = Vec::with_capacity(requested.len());
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        let mut first_rejected = None;
+        for (i, mode) in requested.iter().enumerate() {
+            if !supported.contains(mode) {
+                // Outside the superset established at create. Counted and
+                // located, never silently dropped: a caller told only
+                // "fewer than you asked for" cannot tell which mode the
+                // monitor will never offer, and that is precisely the
+                // fact it needs to stop offering it to a client.
+                rejected += 1;
+                first_rejected.get_or_insert(i);
+                continue;
+            }
+            // A duplicate is already published by this very list, so it
+            // counts as accepted — that keeps `accepted + rejected ==
+            // requested.len()` true for every input, which is the
+            // invariant the reply's partial-application test rests on.
+            if !targets.contains(mode) {
+                targets.push(*mode);
+            }
+            accepted += 1;
+        }
+        TargetSelection { targets, accepted, rejected, first_rejected }
+    }
+}
+
+/// The outcome of [`Mode::select_targets`].
+///
+/// `accepted + rejected == requested.len()` always: every requested entry
+/// either has a compatible monitor mode (and is therefore published) or
+/// does not, never both and never neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetSelection {
+    /// The target list to publish, in request order, deduplicated. A
+    /// subset of the monitor superset by construction. **Never publish
+    /// this when it is empty** — see [`is_empty`](Self::is_empty).
+    pub targets: Vec<Mode>,
+    /// Requested entries the monitor can really offer.
+    pub accepted: usize,
+    /// Requested entries with no compatible entry in the monitor
+    /// superset. `rejected > 0` with `accepted > 0` is PARTIAL
+    /// application: the modes that exist are published and the rest are
+    /// reported — never a failed request, never a failed session.
+    pub rejected: usize,
+    /// Index into the request of the first rejected entry, so a caller can
+    /// name the offending mode instead of just counting it.
+    pub first_rejected: Option<usize>,
+}
+
+impl TargetSelection {
+    /// Nothing in the request exists on this monitor. The caller must
+    /// refuse the request with detail and leave the published list alone:
+    /// `TargetModeCount` cannot be zero (IddCx.h:3594), and an empty
+    /// target list would leave the monitor with nothing to activate.
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +327,102 @@ mod tests {
         // Duplicates rejected.
         let dup = [specs[0], specs[0]];
         assert_eq!(Mode::validate_list(&dup, 2, 8, 0, ALL_CAPS).err(), Some(CoreError::BadMode));
+    }
+
+    fn m(hz: u32) -> Mode {
+        Mode::validate(2560, 1440, hz, 8, 0, ALL_CAPS).unwrap()
+    }
+
+    /// Build 17: the target selection that makes a live monitor's
+    /// ADVERTISED set steerable. The motivating case is the whole reason
+    /// the opcode exists — a monitor created with both the base rate and
+    /// the frame-generation-doubled rate in its superset, streaming at the
+    /// base rate, and then a framegen title launches and only the doubled
+    /// rate should be on offer, WITHOUT a destroy/create cycle.
+    #[test]
+    fn select_targets_publishes_the_requested_subset_of_the_superset() {
+        let superset = vec![m(120_000), m(240_000)];
+        let r = Mode::select_targets(&superset, &[m(240_000)]);
+        assert_eq!((r.accepted, r.rejected, r.first_rejected), (1, 0, None));
+        assert_eq!(r.targets, vec![m(240_000)]);
+        assert!(!r.is_empty());
+
+        // ...and back again. A replace can steer in both directions; an
+        // append-only merge structurally could not.
+        let r = Mode::select_targets(&superset, &[m(120_000)]);
+        assert_eq!(r.targets, vec![m(120_000)]);
+
+        // Order is the request's, not the superset's: the host decides
+        // which target it puts first.
+        let r = Mode::select_targets(&superset, &[m(240_000), m(120_000)]);
+        assert_eq!(r.targets, vec![m(240_000), m(120_000)]);
+        assert_eq!((r.accepted, r.rejected), (2, 0));
+    }
+
+    /// The containment that makes the publish safe whichever way
+    /// `IddCxMonitorUpdateModes2` behaves: a target with no monitor mode
+    /// behind it can never reach the OS, so the target list is always a
+    /// subset of the frozen superset and the intersection Windows presents
+    /// is always non-empty and always activatable.
+    #[test]
+    fn select_targets_rejects_anything_outside_the_superset_with_detail() {
+        let superset = vec![m(60_000), m(120_000)];
+        // The classic mistake this model exists to make impossible:
+        // "advertise a rate the monitor description never described".
+        let r = Mode::select_targets(&superset, &[m(120_000), m(240_000)]);
+        assert_eq!(r.targets, vec![m(120_000)], "only what the monitor really has");
+        assert_eq!((r.accepted, r.rejected), (1, 1));
+        assert_eq!(r.first_rejected, Some(1), "and WHICH entry was refused");
+        assert!(!r.is_empty(), "partial: publish what exists");
+
+        for t in &r.targets {
+            assert!(superset.contains(t), "targets ⊆ superset, always");
+        }
+    }
+
+    /// Everything asked for is outside the superset. The selection is
+    /// empty, and an empty target list must never be published:
+    /// IddCx.h:3594 says TargetModeCount "cannot be zero", and a monitor
+    /// with no targets has nothing Windows can activate.
+    #[test]
+    fn select_targets_reports_an_empty_selection_rather_than_an_empty_list() {
+        let superset = vec![m(60_000)];
+        let r = Mode::select_targets(&superset, &[m(120_000), m(240_000)]);
+        assert!(r.is_empty(), "the caller must refuse, not publish");
+        assert_eq!((r.accepted, r.rejected, r.first_rejected), (0, 2, Some(0)));
+
+        // Degenerate input: an empty request selects nothing, and is
+        // likewise refusable rather than publishable.
+        let r = Mode::select_targets(&superset, &[]);
+        assert!(r.is_empty());
+        assert_eq!((r.accepted, r.rejected), (0, 0));
+    }
+
+    #[test]
+    fn select_targets_is_idempotent_and_counts_every_requested_entry() {
+        let superset = vec![m(60_000), m(90_000), m(120_000), m(240_000)];
+        assert_eq!(superset.len(), MAX_MODES_PER_MONITOR as usize);
+        let want = [m(120_000), m(240_000)];
+        let once = Mode::select_targets(&superset, &want);
+        let twice = Mode::select_targets(&superset, &once.targets);
+        assert_eq!(once.targets, twice.targets, "resending the published list changes nothing");
+
+        // A duplicate is already published by this list: accepted, listed
+        // once. The whole superset is publishable in one go.
+        let r = Mode::select_targets(&superset, &[m(60_000), m(60_000)]);
+        assert_eq!((r.targets, r.accepted, r.rejected), (vec![m(60_000)], 2, 0));
+        let r = Mode::select_targets(&superset, &superset);
+        assert_eq!(r.targets, superset);
+
+        // The invariant every caller relies on to report honestly.
+        for req in [
+            vec![m(30_000)],
+            vec![m(30_000), m(45_000)],
+            vec![m(120_000)],
+            vec![m(120_000), m(30_000), m(240_000)],
+        ] {
+            let r = Mode::select_targets(&superset, &req);
+            assert_eq!(r.accepted + r.rejected, req.len());
+        }
     }
 }

@@ -68,6 +68,36 @@ pub(crate) struct FrameRing {
     assigned_before: bool,
 }
 
+/// A monitor's ring: the mutex-guarded [`FrameRing`] plus the LOCK-FREE
+/// [`crate::tdr::RingLive`] mirror beside it.
+///
+/// The two halves are separate on purpose. `frame_loop` takes the
+/// `FrameRing` mutex once and holds the guard for the entire life of the
+/// worker (see the comment at the lock site below) — a load-bearing
+/// invariant that `mark_ring_dead_arc` and `duck_all` are both written
+/// around. Anything that must be readable WHILE a worker runs therefore
+/// cannot live behind that mutex, which is exactly the mistake the first
+/// cut of the TDR device-duck poller made: it `try_lock`ed to read the
+/// ring state, always got `WouldBlock` from a healthy worker, and so could
+/// never observe a recovery. `live` is the answer — published by the
+/// worker at its two transitions, read by the poller with no lock at all.
+pub(crate) struct RingHandle {
+    pub live: crate::tdr::RingLive,
+    pub ring: Mutex<FrameRing>,
+}
+
+impl RingHandle {
+    pub fn new(ring: FrameRing) -> Self {
+        // A ring whose section failed to create has no transport to
+        // restore; the mirror records that once, at construction.
+        let transport = ring.section.is_some();
+        Self {
+            live: crate::tdr::RingLive::new(transport),
+            ring: Mutex::new(ring),
+        }
+    }
+}
+
 impl FrameRing {
     pub fn new(session_id: u64, ring_slots: u32) -> Self {
         let section = match RingSection::create(session_id, ring_slots) {
@@ -311,12 +341,25 @@ const HEARTBEAT_EVERY: Duration = Duration::from_millis(250);
 /// STATUS_PENDING is accepted too, for belt and braces.)
 const E_PENDING: NTSTATUS = 0x8000_000Au32 as NTSTATUS;
 
+/// Publishes the frame worker's exit to the lock-free mirror on EVERY way
+/// out of `frame_loop` after it went live — the stop re-checks scattered
+/// through the loop, the failure returns, and an unwind. A missed exit
+/// would leave a corpse advertising itself as publishing, which is what
+/// the requalify guard refuses to depart.
+struct LiveMark<'a>(&'a crate::tdr::RingLive);
+
+impl Drop for LiveMark<'_> {
+    fn drop(&mut self) {
+        self.0.publish_worker_exit();
+    }
+}
+
 fn frame_loop(
     session_id: u64,
     swapchain: OsHandle,
     frame_event: OsHandle,
     luid: u64,
-    ring: Arc<Mutex<FrameRing>>,
+    handle: Arc<RingHandle>,
     stop: Arc<AtomicBool>,
 ) {
     tracelogging::write_event!(
@@ -345,6 +388,41 @@ fn frame_loop(
                 u64("session", &session_id),
                 i32("hresult", &code)
             );
+            // BUILD-16 RE-ARM. Device creation failing is how a GPU death
+            // presents when it happens between an unassign and the next
+            // assign: there is no device yet, so `maybe_queue_tdr_duck`
+            // (which interrogates one with GetDeviceRemovedReason) can
+            // never be reached from here, and before build 16 this site
+            // armed nothing at all. In device-duck mode that would leave
+            // the ring unwatched — heartbeat frozen, and the bounded
+            // 10-minute deadline arm never reachable.
+            //
+            // The REBUILDING mark is load-bearing, not cosmetic: the
+            // recovery poller decides "did the transport come back" from
+            // the ring state, so a duck armed here against a still-ACTIVE
+            // ring would settle on its first tick and do nothing.
+            //
+            // Re-arming is idempotent: `queue_tdr_duck`'s one-in-flight CAS
+            // collapses a storm of failing workers into a single duck, and
+            // while a poller is already watching this is a cheap no-op. The
+            // cadence is the OS's reassign rate, not a spin.
+            //
+            // Gated to device-duck mode on purpose: builds 14/15 never
+            // ducked from this site, and the legacy gate exists to restore
+            // their behaviour faithfully, not an improved version of it.
+            // The stop check keeps a routine teardown (the OS's ~10 ms
+            // unassign landing inside a slow create) from reading as a GPU
+            // reset.
+            if !stop.load(Ordering::SeqCst)
+                && Shell::get().tdr_duck_mode() == crate::dispatch::TDR_DUCK_DEVICE
+            {
+                super::mark_ring_rebuilding_arc(&handle);
+                // The HRESULT travels WITH the arm (build 16 shipped it
+                // only on SwapChainDeviceCreateFailed, so a capture that
+                // wrapped past that event could not say what the duck was
+                // armed against). Every arm site now names its cause.
+                super::control::queue_tdr_duck(session_id, code);
+            }
             return;
         }
     };
@@ -370,9 +448,19 @@ fn frame_loop(
         }
     }
 
+    // THE RING MUTEX IS PINNED FROM HERE TO THE END OF THIS FUNCTION.
+    // The `let ring = &mut *guard` below is a reborrow, not a drop — the
+    // guard lives until the worker returns. That is deliberate (the worker
+    // owns the ring exclusively while it runs) and load-bearing elsewhere:
+    // `mark_ring_dead_arc` is a bounded try_lock poll BECAUSE of it. The
+    // consequence for anything outside this thread is absolute — no
+    // FrameRing field can be read while a worker is alive — which is why
+    // the TDR recovery signal lives in `handle.live`, beside the mutex
+    // rather than behind it.
+    //
     // Poison recovery matches mark_ring_dead: a prior worker's panic must
     // not cascade a second panic into WUDFHost on the next assign.
-    let mut ring = ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = handle.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Re-check after the (possibly long) lock wait: a worker stopped while
     // queued behind a wedged predecessor may have been deadline-detached —
     // its swapchain is then already torn down and must not be touched
@@ -381,7 +469,7 @@ fn frame_loop(
     if stop.load(Ordering::SeqCst) {
         return;
     }
-    let ring = &mut *ring;
+    let ring = &mut *guard;
 
     // A reassignment means a new device: retire the old textures and bump
     // the generation so the host re-opens by name. Runs before any publish
@@ -396,12 +484,28 @@ fn frame_loop(
     if let Some(s) = &ring.section {
         s.set_state(ring_state::ACTIVE);
     }
+    // PUBLISH: the transport is live. SetDevice has succeeded on a freshly
+    // created device, the textures are retired and the shared section is
+    // ACTIVE — this is the exact instant a TDR device-duck poller is
+    // waiting to observe, and `live` is the only way it CAN observe it
+    // (the section it mirrors is now behind a mutex this thread owns for
+    // the rest of its life). Deliberately not published earlier, right
+    // after IddCxSwapChainSetDevice: a worker that then blocked on the
+    // ring lock behind a detached corpse would be advertising a transport
+    // that never actually starts, and "recovered" concluded from a ring
+    // nobody is driving is the one mistake that strands the display.
+    //
+    // `_live` is RAII so EVERY exit below — the stop re-checks, the
+    // failure returns, an unwind — publishes the matching worker-exit.
+    let live_generation = handle.live.publish_worker_live();
+    let _live = LiveMark(&handle.live);
     tracelogging::write_event!(
         PROVIDER,
         "FrameLoopStart",
         level(Informational),
         u64("session", &session_id),
-        u32("generation", &ring.policy.generation)
+        u32("generation", &ring.policy.generation),
+        u64("live_generation", &live_generation)
     );
 
     let mut last_heartbeat = Instant::now();
@@ -455,6 +559,12 @@ fn frame_loop(
                 s.set_state(ring_state::REBUILDING);
             }
             ring.retire_textures();
+            // Mirror the state and drop the live flag BEFORE arming the
+            // duck: the poller's very first tick must see a ring that is
+            // REBUILDING and unowned, never a corpse still advertising
+            // itself as publishing.
+            handle.live.publish_state(ring_state::REBUILDING);
+            handle.live.publish_worker_exit();
             maybe_queue_tdr_duck(session_id, &d3d.0);
             return;
         }
@@ -493,6 +603,9 @@ fn frame_loop(
                 s.set_state(ring_state::REBUILDING);
             }
             ring.retire_textures();
+            // Same ordering as the acquire-failure arm above.
+            handle.live.publish_state(ring_state::REBUILDING);
+            handle.live.publish_worker_exit();
             maybe_queue_tdr_duck(session_id, &d3d.0);
             return;
         }
@@ -501,11 +614,17 @@ fn frame_loop(
 
 /// Distinguish "this swapchain is being replaced" (routine — the OS's
 /// ~10 ms unassign, mode switches) from "the GPU itself reset" and queue
-/// a TDR duck-out only for the latter. The discriminator is the D3D
-/// device: swapchain-level failures with a healthy device are handled by
-/// the OS's unassign→assign cycle; a removed device means every monitor
-/// on this adapter is about to fail the same way, and a failing OS TDR
-/// recovery must not be left waiting on our indirect display path.
+/// a TDR duck only for the latter. The discriminator is the D3D device:
+/// swapchain-level failures with a healthy device are handled by the OS's
+/// unassign→assign cycle; a removed device means every monitor on this
+/// adapter is about to fail the same way.
+///
+/// By the time this runs, the caller has ALREADY done everything build
+/// 16's "duck the device" means: the ring is REBUILDING, the textures are
+/// retired with a generation bump, the swapchain is abandoned, and `d3d`
+/// (the ID3D11Device/Context/IDXGIDevice triple) drops at the caller's
+/// `return`. What `control::queue_tdr_duck` then decides is only whether
+/// the DISPLAY goes too — see the build-16 gate there.
 fn maybe_queue_tdr_duck(session_id: u64, device: &ID3D11Device) {
     let removed = unsafe { device.GetDeviceRemovedReason() };
     if let Err(reason) = removed {
@@ -517,7 +636,11 @@ fn maybe_queue_tdr_duck(session_id: u64, device: &ID3D11Device) {
             u64("session", &session_id),
             i32("reason", &code)
         );
-        super::control::queue_tdr_duck();
+        // Carry the removal reason into the arm so the duck's own events
+        // name what caused it — a capture that has wrapped past
+        // TdrDeviceRemoved must still be able to say why a display stopped
+        // publishing.
+        super::control::queue_tdr_duck(session_id, code);
     }
 }
 

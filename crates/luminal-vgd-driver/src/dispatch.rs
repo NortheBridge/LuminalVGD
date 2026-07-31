@@ -17,10 +17,11 @@
 //! core, and replies are fully written before success is returned.
 
 use luminal_driver_proto::{
-    err, ioctl, names, versions_compatible, CreateMonitorReply, CreateMonitorRequest,
-    DestroyMonitorRequest, HandshakeRequest, PermanentPoolConfig, PingRequest,
-    QueryLeaseReply, QueryLeaseRequest, SetRenderAdapterRequest, ABI_MAX_RING_SLOTS,
-    DEFAULT_RING_SLOTS,
+    err, ioctl, names, update_status, versions_compatible, CreateMonitorReply,
+    CreateMonitorRequest, DestroyMonitorRequest, HandshakeRequest, PermanentPoolConfig,
+    PingRequest, QueryLeaseReply, QueryLeaseRequest, SetRenderAdapterRequest,
+    UpdateModesReply, UpdateModesRequest, ABI_MAX_RING_SLOTS, DEFAULT_RING_SLOTS,
+    MAX_MODES_PER_MONITOR,
 };
 use luminal_vgd_core::adapter::AdapterInfo;
 use luminal_vgd_core::edid::{self, EdidParams};
@@ -29,9 +30,32 @@ use luminal_vgd_core::permanent;
 use luminal_vgd_core::persist::{self, PersistedState};
 use luminal_vgd_core::session::{Monitor, SessionTable};
 
-/// Fixed driver-side configuration, read from the registry at device add
-/// (SudoVDA kept its knobs in the registry; we keep only the global caps
-/// there — per-monitor parameters travel in CREATE_MONITOR).
+/// TDR response policy: duck the DEVICE, keep the DISPLAY (build 16, the
+/// default). On `DXGI_ERROR_DEVICE_REMOVED` the D3D device and swapchain
+/// are torn down and the ring goes REBUILDING — but the IddCx monitor
+/// stays ARRIVED and the OS display path stays alive, exactly as
+/// DESIGN.md §3.3 rule 2 specifies ("Monitors stay attached"). Departure
+/// becomes the gated fallback: only after OS recovery genuinely completes
+/// (a requalify modeset against a healthy stack) or the long recovery
+/// deadline expires.
+pub const TDR_DUCK_DEVICE: u32 = 0;
+
+/// TDR response policy: duck the DISPLAY (builds 14/15 behaviour, now
+/// opt-in). Departs every monitor the instant a frame worker sees device
+/// removal. Retained selectable because it is the only shipped-and-signed
+/// TDR behaviour to date — but it AMPLIFIED the 2026-07-30 incident:
+/// under `virtual_display_layout=exclusive` the departure took the active
+/// display count to zero, DWM declared a black screen 131 ms later, and
+/// the departure's `DBT_DEVNODES_CHANGED` broadcast is the documented
+/// GTA V killer. Select with the `LuminalVgdTdrDuckMode` REG_DWORD under
+/// the devnode's `Device Parameters` key (no reinstall; restart the
+/// device to apply).
+pub const TDR_DUCK_DISPLAY: u32 = 1;
+
+/// Fixed driver-side configuration. `caps`/`driver_build` are compiled in;
+/// `tdr_duck_mode` is the one knob read from the devnode registry at
+/// device add (SudoVDA kept its knobs in the registry; per-monitor
+/// parameters travel in CREATE_MONITOR instead).
 #[derive(Clone, Debug)]
 pub struct DriverConfig {
     pub caps: u32,
@@ -39,6 +63,8 @@ pub struct DriverConfig {
     pub max_monitors: u32,
     pub watchdog_secs: u32,
     pub ring_slots: u32,
+    /// [`TDR_DUCK_DEVICE`] (default) or [`TDR_DUCK_DISPLAY`].
+    pub tdr_duck_mode: u32,
 }
 
 /// Per-device state owned by the shell, mutated only through dispatch.
@@ -72,14 +98,22 @@ pub struct HandleCtx {
 #[derive(Debug, PartialEq)]
 pub enum Effect {
     /// Plug an IddCx monitor on `connector_index`: serve `edid` from
-    /// `EvtIddCxParseMonitorDescription`, advertise `modes`, build the
+    /// `EvtIddCxParseMonitorDescription`, describe the monitor with
+    /// `modes`, publish `targets` as its IddCx target-mode list, build the
     /// shared ring (`ring_slots` slots) on `adapter_luid`, section names
     /// per `names::{ring,cursor}_section_name(session_id)`.
     PlugMonitor {
         session_id: u64,
         display_id: u64,
         connector_index: u32,
+        /// The MONITOR-mode superset, which the EDID describes and which
+        /// is frozen for the life of the monitor object.
         modes: Vec<Mode>,
+        /// The TARGET subset to publish — the whole superset for a fresh
+        /// session, or whatever `UPDATE_MODES` last put in force when the
+        /// session is being replugged from `DeviceState`. Never empty,
+        /// always a subset of `modes`.
+        targets: Vec<Mode>,
         adapter_luid: u64,
         ring_slots: u32,
         /// Boxed: keeps Effect variants near-uniform in size (effects
@@ -89,6 +123,30 @@ pub enum Effect {
     /// Unplug the monitor and free its ring (explicit destroy, pool
     /// shrink, or watchdog reap).
     UnplugMonitor { session_id: u64 },
+    /// Replace the TARGET-mode list a LIVE monitor publishes (proto 0.5
+    /// `UPDATE_MODES`) — no departure, no re-arrival, no ring churn.
+    ///
+    /// `targets` is the complete list to publish, already validated
+    /// entry-by-entry against the monitor's create-time superset and
+    /// guaranteed non-empty, so the shell never has to reason about what
+    /// to keep. It exists as an Effect (rather than as work done inline
+    /// in `dispatch`) for the same reason plug and unplug do: applying it
+    /// calls `IddCxMonitorUpdateModes2`, which the OS answers by
+    /// re-entering our mode DDIs synchronously, and that may only ever
+    /// happen on the effects worker with no lock held (DESIGN.md §3.3
+    /// rule 3).
+    ///
+    /// **The shell owes the table an answer.** The list is pending, not
+    /// committed: whoever applies this effect MUST call
+    /// `SessionTable::settle_modes(session_id, update_seq, …)` exactly
+    /// once, with `Applied` only if `IddCxMonitorUpdateModes2` returned
+    /// success. Without that call the durable list never changes and the
+    /// host's next request re-pushes — safe, but a leak of intent; with a
+    /// wrong `Applied` the durable state resumes lying, which is the
+    /// defect this ordering exists to kill. `update_seq` is table-wide
+    /// and monotonic, so a settle for a superseded or destroyed update
+    /// no-ops instead of committing.
+    UpdateModes { session_id: u64, update_seq: u64, targets: Vec<Mode> },
     /// Store this blob under the device registry key; hand it back to
     /// `DeviceState::new` on next start (identity retention + pool).
     PersistState(Vec<u8>),
@@ -148,6 +206,27 @@ fn read_create_request(input: &[u8]) -> Option<CreateMonitorRequest> {
     Some(unsafe { core::ptr::read_unaligned(padded.as_ptr().cast::<CreateMonitorRequest>()) })
 }
 
+/// UPDATE_MODES-specific reader (proto 0.5). Identical in shape to
+/// [`read_create_request`] and present from the opcode's first day: the
+/// full size first, then exactly one named legacy size with the tail
+/// zero-padded. Today the two sizes are the same, so this is a plain
+/// read — the point is that the NEXT minor which appends a field only has
+/// to add a `UPDATE_MODES_REQUEST_SIZE_V<n>` constant and one branch,
+/// instead of reconstructing the baseline after the fact the way
+/// `CREATE_MONITOR_REQUEST_SIZE_V3` had to be.
+fn read_update_modes_request(input: &[u8]) -> Option<UpdateModesRequest> {
+    if let Some(req) = read_req::<UpdateModesRequest>(input) {
+        return Some(req);
+    }
+    if input.len() < luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5 {
+        return None;
+    }
+    let mut padded = [0u8; core::mem::size_of::<UpdateModesRequest>()];
+    padded[..luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5]
+        .copy_from_slice(&input[..luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5]);
+    Some(unsafe { core::ptr::read_unaligned(padded.as_ptr().cast::<UpdateModesRequest>()) })
+}
+
 /// Write a full reply or nothing.
 fn write_reply<T: Copy>(output: &mut [u8], reply: &T) -> Option<usize> {
     let n = core::mem::size_of::<T>();
@@ -193,6 +272,11 @@ fn plug_effect(m: &Monitor, ring_slots: u32) -> Effect {
         display_id: m.display_id,
         connector_index: m.connector_index,
         modes: m.modes.clone(),
+        // The published subset travels with the plug: a replug that
+        // reverted to the whole superset would silently undo whatever
+        // gating an UPDATE_MODES had put in force, on a path (device
+        // re-add, D3Final re-bring-up, pool restore) the host never sees.
+        targets: m.target_modes.clone(),
         adapter_luid: m.adapter_luid,
         ring_slots,
         edid: Box::new(monitor_edid(m)),
@@ -218,6 +302,23 @@ impl DeviceState {
     /// Shell refreshes this on adapter arrival/departure notifications.
     pub fn set_adapters(&mut self, adapters: Vec<AdapterInfo>) {
         self.adapters = adapters;
+    }
+
+    /// The TDR response policy in force ([`TDR_DUCK_DEVICE`] or
+    /// [`TDR_DUCK_DISPLAY`]).
+    ///
+    /// The shell mirrors this into `Shell::tdr_duck_mode` (an atomic) at
+    /// device add, because the TDR path must never take the device lock —
+    /// but it reads it FROM HERE, so the config field is the single
+    /// source of truth rather than a value that merely happens to be
+    /// carried alongside one. Build 16 shipped it write-only: the field
+    /// was stored into `DriverConfig` and then never read by anything,
+    /// while the shell mirrored a separate local. A later edit that fixed
+    /// the config and forgot the local (or vice versa) would have silently
+    /// shipped the wrong TDR policy — the one defect class the
+    /// `TdrDuckConfig` event exists to make visible.
+    pub fn tdr_duck_mode(&self) -> u32 {
+        self.cfg.tdr_duck_mode
     }
 
     /// Reconcile portable state with a full runtime teardown (final
@@ -310,6 +411,10 @@ impl Default for DriverConfig {
             max_monitors: luminal_driver_proto::DEFAULT_MAX_MONITORS,
             watchdog_secs: luminal_driver_proto::DEFAULT_WATCHDOG_SECS,
             ring_slots: DEFAULT_RING_SLOTS,
+            // Build 16 default: keep the display, duck only the device.
+            // An absent registry value MUST mean this — see
+            // shell::control::read_tdr_duck_mode.
+            tdr_duck_mode: TDR_DUCK_DEVICE,
         }
     }
 }
@@ -403,6 +508,161 @@ pub fn dispatch(
                 }
             };
             match write_reply(output, &result) {
+                Some(n) => DispatchResult { status: Status::Ok, bytes_written: n, effects },
+                None => DispatchResult::bad_buffer(),
+            }
+        }
+
+        ioctl::IOCTL_UPDATE_MODES => {
+            let Some(req) = read_update_modes_request(input) else {
+                return DispatchResult::bad_buffer();
+            };
+            // Check the OUTPUT buffer before touching the table. Every
+            // other opcode validates it only at write_reply time, which
+            // leaves a caller with a short output buffer having mutated
+            // the session while the effect that would have told the OS is
+            // dropped with the BadBuffer result. Harmless for a create
+            // (the session simply exists un-plugged and the watchdog
+            // reaps it); NOT harmless here, where it would silently
+            // diverge the durable list from the advertised one for the
+            // rest of the session's life.
+            if output.len() < core::mem::size_of::<UpdateModesReply>() {
+                return DispatchResult::bad_buffer();
+            }
+            // `new` (not a struct literal) so the first-rejected word
+            // starts at NO_REJECTED_INDEX — a literal zero there would
+            // read back as "your FIRST mode was rejected".
+            let mut reply = UpdateModesReply::new(req.session_id);
+            let mut effects = Vec::new();
+            // The published count in force on ANY outcome except "no such
+            // session", so a host that is refused still learns what the
+            // monitor is offering right now rather than guessing.
+            let current = dev
+                .table
+                .get(req.session_id)
+                .map(|m| m.target_modes.len() as u32)
+                .unwrap_or(0);
+            reply.mode_count = current;
+            // Requested count is echoed on every outcome, including
+            // refusals: `accepted < requested` is the caller's partial-
+            // application test, and it must not read as "0 of 0" when the
+            // request never got as far as the selection.
+            reply.set_detail(0, req.mode_count, 0);
+            if !handle.handshaken {
+                reply.result = err::NOT_HANDSHAKEN;
+            } else if req.mode_count == 0
+                || req.mode_count > MAX_MODES_PER_MONITOR
+                || req.mode_count as usize > req.modes.len()
+            {
+                // Bounds-check before slicing; `validate_list` would reject
+                // these too, but a panic-free slice is not optional in a
+                // driver reading an untrusted buffer. `mode_count == 0` is
+                // also the wire-level half of IddCx.h:3594's
+                // "TargetModeCount ... cannot be zero": the published list
+                // may be replaced, never emptied.
+                reply.result = err::BAD_MODE;
+            } else {
+                // `flags` is deliberately not validated: unknown bits are
+                // IGNORED, matching create_flags, so a newer host cannot
+                // be refused by an older driver over a bit it set. A
+                // future flag that changes semantics ships with its own
+                // caps bit instead.
+                let specs = &req.modes[..req.mode_count as usize];
+                // The commit token: "what has the OS committed" as a
+                // version stamp. It decides whether a refusal this monitor
+                // already collected is still evidence — see
+                // `SessionTable::update_modes`. Read here, on the IOCTL
+                // frame, because it is a single relaxed load of a global
+                // the modeset callback bumps; nothing is locked and nothing
+                // can block.
+                let commit_token = crate::modepush::committed_token();
+                match dev.table.update_modes(req.session_id, specs, dev.cfg.caps, commit_token) {
+                    Ok(update) => {
+                        reply.mode_count = update.targets.len() as u32;
+                        reply.set_rejected(
+                            update.rejected as u32,
+                            update.first_rejected.map(|i| i as u32),
+                        );
+                        let mut flags = 0u32;
+                        // PARTIAL: some requested modes have no entry in
+                        // the monitor's create-time description, so they
+                        // could never be offered no matter what is pushed.
+                        // Reporting plain OK told a caller it could select
+                        // a mode the monitor will never have — so say it,
+                        // and say it without failing the request or
+                        // throwing away the modes that DO exist
+                        // (constraint 1).
+                        if update.rejected > 0 {
+                            flags |= update_status::PARTIAL;
+                        }
+                        // PENDING: the selection is NOT in force yet. The
+                        // durable list is committed only when the shell
+                        // reports the OS push succeeded
+                        // (`SessionTable::settle_modes`), which cannot
+                        // have happened before this IRP completes.
+                        if update.pending {
+                            flags |= update_status::PENDING;
+                        }
+                        reply.set_detail(update.accepted as u32, req.mode_count, flags);
+                        if let Some(blocking_mode_idx) = update.blocked {
+                            // PERMANENT refusal: this exact list was
+                            // already refused because it would gate out the
+                            // mode the OS has committed, and nothing has
+                            // committed since. Say so on the wire — a
+                            // distinct code AND the BLOCKED flag, plus the
+                            // blocking mode's index in the list the host
+                            // created the monitor with.
+                            //
+                            // Reported as its own outcome rather than as
+                            // `UPDATE_FAILED`, which means "not applied,
+                            // send it again": this one cannot succeed on a
+                            // resend, and a host that resends it is in a
+                            // loop with nothing on the other side. No
+                            // effect is emitted — a second push would be
+                            // refused by the same gate for the same reason.
+                            // Constraint 1 holds throughout: the session,
+                            // the monitor and the published list are all
+                            // untouched.
+                            reply.result = err::MODE_COMMITTED;
+                            reply.set_blocked(blocking_mode_idx);
+                        } else if update.refused {
+                            // NOTHING requested exists on this monitor.
+                            // Publishing the empty result would break
+                            // IddCx.h:3594 and leave the monitor with no
+                            // targets, so the request is refused with the
+                            // rejection detail above and the published
+                            // list is untouched. A refused REQUEST — the
+                            // session, the monitor and the stream are all
+                            // still running (constraint 1).
+                            reply.result = err::BAD_MODE;
+                        } else if let Some(update_seq) = update.queued {
+                            // `queued` is Some only when THIS request
+                            // changes what is published. A request that
+                            // asks for the list already in force emits no
+                            // effect: re-pushing an unchanged list is a
+                            // modeset risk taken for nothing — but note
+                            // that after a failed or deferred push the
+                            // pending selection is discarded, so an
+                            // identical retry lands here with a real
+                            // change and does re-push. That is the whole
+                            // build-17 commit-ordering fix.
+                            effects.push(Effect::UpdateModes {
+                                session_id: req.session_id,
+                                update_seq,
+                                targets: update.targets,
+                            });
+                        }
+                        // No PersistState: the blob carries identity
+                        // reservations and the pool config only — never
+                        // mode lists — so there is nothing new to write.
+                        // The published subset still survives an in-process
+                        // replug because it lives in the session table,
+                        // which is what `plug_effect` reads.
+                    }
+                    Err(e) => reply.result = e.code(),
+                }
+            }
+            match write_reply(output, &reply) {
                 Some(n) => DispatchResult { status: Status::Ok, bytes_written: n, effects },
                 None => DispatchResult::bad_buffer(),
             }
@@ -547,8 +807,10 @@ mod tests {
     use super::*;
     use luminal_driver_proto::{
         caps, GetStatusReply, HandshakeReply, ModeSpec, QueryPermanentPoolReply,
-        LEASE_TIMEOUT_USE_DEFAULT, PROTO_VERSION_MAJOR, PROTO_VERSION_MINOR,
+        UpdateModesReply, UpdateModesRequest, LEASE_TIMEOUT_USE_DEFAULT, PROTO_VERSION_MAJOR,
+        PROTO_VERSION_MINOR,
     };
+    use luminal_vgd_core::session::ModeUpdateResult;
 
     const CAPS: u32 =
         caps::HDR10 | caps::SDR10_BIT | caps::DIRTY_RECTS | caps::MULTI_MODE | caps::PERMANENT_POOL;
@@ -637,10 +899,11 @@ mod tests {
 
         assert_eq!(effects.len(), 2, "plug + persist");
         match &effects[0] {
-            Effect::PlugMonitor { session_id, display_id, connector_index, modes, adapter_luid, ring_slots, edid } => {
+            Effect::PlugMonitor { session_id, display_id, connector_index, modes, targets, adapter_luid, ring_slots, edid } => {
                 assert_eq!((*session_id, *display_id), (0xA1, 0xCAFE));
                 assert_eq!(*connector_index, 0);
                 assert_eq!(modes.len(), 1);
+                assert_eq!(targets, modes, "a fresh session publishes its whole superset");
                 assert_eq!(*adapter_luid, 0x20);
                 assert_eq!(*ring_slots, DEFAULT_RING_SLOTS);
                 let base: u32 = edid[..128].iter().map(|&b| u32::from(b)).sum();
@@ -994,11 +1257,731 @@ mod tests {
         assert!(matches!(effects[1], Effect::PersistState(_)));
     }
 
+    // -----------------------------------------------------------------
+    // Build 17 / proto 0.5: UPDATE_MODES.
+    // -----------------------------------------------------------------
+
+    fn update_req(session_id: u64, specs: &[ModeSpec]) -> UpdateModesRequest {
+        let mut modes = [ModeSpec::default(); 4];
+        modes[..specs.len()].copy_from_slice(specs);
+        UpdateModesRequest {
+            session_id,
+            flags: 0,
+            mode_count: specs.len() as u32,
+            modes,
+            reserved: [0; 4],
+        }
+    }
+
+    fn do_update(
+        d: &mut DeviceState,
+        h: &mut HandleCtx,
+        req: &UpdateModesRequest,
+    ) -> (UpdateModesReply, Vec<Effect>) {
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(d, h, 2000, ioctl::IOCTL_UPDATE_MODES, &as_bytes(req), &mut out);
+        assert_eq!(r.status, Status::Ok);
+        (from_bytes(&out), r.effects)
+    }
+
+    /// Take an `Effect::UpdateModes` out of a dispatch result: its
+    /// `update_seq` (what the shell must settle) and the list it pushes.
+    fn queued_update(effects: &[Effect]) -> Option<(u64, Vec<Mode>)> {
+        effects.iter().find_map(|e| match e {
+            Effect::UpdateModes { update_seq, targets, .. } => {
+                Some((*update_seq, targets.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    const BASE_120: ModeSpec = ModeSpec { width: 2560, height: 1440, refresh_millihz: 120_000 };
+    const FG_240: ModeSpec = ModeSpec { width: 2560, height: 1440, refresh_millihz: 240_000 };
+    /// A rate deliberately NOT in `superset_req`'s create list: the mode
+    /// this driver structurally cannot start offering on a live monitor.
+    const NEVER_CREATED: ModeSpec =
+        ModeSpec { width: 2560, height: 1440, refresh_millihz: 360_000 };
+
+    /// Created with BOTH the base rate and the framegen-doubled rate in
+    /// its monitor description — the shape a host must use if it wants to
+    /// switch between them later, because the description is frozen at
+    /// `IddCxMonitorCreate` and no IddCx DDI can extend it.
+    fn superset_req(session_id: u64) -> CreateMonitorRequest {
+        let mut r = create_req(session_id);
+        r.mode_count = 2;
+        r.modes[0] = BASE_120;
+        r.modes[1] = FG_240;
+        r
+    }
+
+    /// The build-17 milestone in one test: a monitor created with both
+    /// rates is switched to publishing ONLY the framegen-doubled one on a
+    /// LIVE session — one UpdateModes effect, no unplug, no plug, no
+    /// monitor cycle anywhere — and then switched back.
+    #[test]
+    fn update_modes_republishes_a_subset_on_a_live_monitor() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(0xD4));
+        assert_eq!(d.table.get(0xD4).unwrap().target_modes.len(), 2, "all of it, initially");
+
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xD4, &[FG_240]));
+        assert_eq!(reply.result, err::OK);
+        assert_eq!(reply.session_id, 0xD4);
+        assert_eq!(reply.mode_count, 1, "the subset that will be published");
+        assert_eq!((reply.accepted(), reply.requested(), reply.rejected()), (1, 1, 0));
+        assert_eq!(reply.first_rejected(), luminal_driver_proto::NO_REJECTED_INDEX);
+        assert!(reply.is_pending(), "queued at the OS, not in force yet");
+        assert!(!reply.is_partial());
+        assert!(!reply.fully_in_force());
+
+        assert_eq!(effects.len(), 1, "no plug, no unplug, no persist");
+        let (seq, targets) = queued_update(&effects).expect("one push queued");
+        match &effects[0] {
+            Effect::UpdateModes { session_id, .. } => assert_eq!(*session_id, 0xD4),
+            other => panic!("unexpected effect {other:?}"),
+        }
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].refresh_millihz, 240_000);
+
+        // Not durable yet: the IRP completed before the OS was told
+        // anything, so a replug-from-DeviceState right now must still
+        // carry the previously published list.
+        assert_eq!(d.table.get(0xD4).unwrap().target_modes.len(), 2);
+
+        // The shell reports the push succeeded — NOW it is durable.
+        assert!(d.table.settle_modes(0xD4, seq, ModeUpdateResult::Applied, &targets).settled());
+        let m = d.table.get(0xD4).unwrap();
+        assert_eq!(m.target_modes.len(), 1);
+        assert_eq!(m.modes.len(), 2, "the monitor description never moved");
+        assert_eq!(m.preferred_mode().refresh_millihz, 120_000);
+
+        // Resending the published list is a no-op: no effect at all, so
+        // the OS is never asked to renegotiate for nothing — and the
+        // reply says so without the PENDING flag.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xD4, &[FG_240]));
+        assert_eq!((reply.result, reply.mode_count), (err::OK, 1));
+        assert!(effects.is_empty());
+        assert!(reply.fully_in_force(), "in force, in full, right now");
+
+        // And back: gating is reversible within the superset, which is
+        // the whole reason the target list rather than the monitor list
+        // is what this opcode moves.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xD4, &[BASE_120, FG_240]));
+        assert_eq!(reply.mode_count, 2);
+        let (seq, targets) = queued_update(&effects).expect("a real change, so a real push");
+        assert!(d.table.settle_modes(0xD4, seq, ModeUpdateResult::Applied, &targets).settled());
+        assert_eq!(d.table.get(0xD4).unwrap().target_modes.len(), 2);
+    }
+
+    /// A target with no entry in the monitor's create-time description is
+    /// REJECTED WITH DETAIL — never published, because Windows offers
+    /// monitor∩target and it could not surface anyway.
+    ///
+    /// Constraint 1 is the point of the test: the request is refused, the
+    /// SESSION is not. No effect, no departure, the previously published
+    /// list still in force, and the reply carries enough detail (count and
+    /// index) for a host to name the mode it cannot have.
+    #[test]
+    fn a_target_outside_the_superset_is_rejected_and_the_session_carries_on() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(0x5A));
+
+        // PARTIAL: one of the two exists.
+        let (reply, effects) =
+            do_update(&mut d, &mut h, &update_req(0x5A, &[FG_240, NEVER_CREATED]));
+        assert_eq!(reply.result, err::OK, "partial success is success, not an error");
+        assert!(reply.is_partial(), "and it must not read as a clean OK");
+        assert_eq!((reply.accepted(), reply.requested(), reply.rejected()), (1, 2, 1));
+        assert_eq!(reply.first_rejected(), 1, "WHICH entry, not just how many");
+        assert_eq!(reply.mode_count, 1);
+        assert!(!reply.fully_in_force());
+        let (seq, targets) = queued_update(&effects).expect("what exists is still published");
+        assert_eq!(targets, vec![Mode::validate(2560, 1440, 240_000, 8, 0, CAPS).unwrap()]);
+        assert!(d.table.settle_modes(0x5A, seq, ModeUpdateResult::Applied, &targets).settled());
+        let published = d.table.get(0x5A).unwrap().target_modes.clone();
+        assert_eq!(published.len(), 1);
+
+        // WHOLLY outside: refused. The published list may never be
+        // emptied — IddCx.h:3594 says TargetModeCount "cannot be zero" —
+        // so nothing is pushed and nothing changes.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0x5A, &[NEVER_CREATED]));
+        assert_eq!(reply.result, err::BAD_MODE);
+        assert_eq!((reply.accepted(), reply.requested(), reply.rejected()), (0, 1, 1));
+        assert_eq!(reply.first_rejected(), 0, "index 0 is a real rejection, not 'none'");
+        assert_eq!(reply.mode_count, 1, "what is still in force is reported");
+        assert!(effects.is_empty(), "nothing may reach the OS");
+        assert!(!reply.fully_in_force());
+
+        // The session is untouched and entirely usable: still arrived,
+        // still publishing a non-empty list, still able to take the next
+        // request. A refused REQUEST is not a failed session.
+        let m = d.table.get(0x5A).unwrap();
+        assert_eq!(m.target_modes, published, "target modes unchanged, carry on");
+        assert!(!m.target_modes.is_empty(), "never left with no targets");
+        assert_eq!(m.modes.len(), 2, "and the description is still the description");
+        assert!(d.table.pending_targets(0x5A).is_none(), "nothing queued");
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0x5A, &[BASE_120]));
+        assert_eq!(reply.result, err::OK);
+        assert!(queued_update(&effects).is_some(), "the next request works normally");
+    }
+
+    /// The header's other hard rule, at the wire: `TargetModeCount`
+    /// "cannot be zero" (IddCx.h:3594). An empty request is refused before
+    /// anything slices the array, emits no effect, and leaves the
+    /// published list alone — the target list can be replaced, never
+    /// emptied.
+    #[test]
+    fn an_empty_target_list_is_refused() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(0x1E));
+
+        let mut empty = update_req(0x1E, &[FG_240]);
+        empty.mode_count = 0;
+        let (reply, effects) = do_update(&mut d, &mut h, &empty);
+        assert_eq!(reply.result, err::BAD_MODE);
+        assert_eq!(reply.mode_count, 2, "the list still in force");
+        assert!(effects.is_empty(), "an empty push must never reach the OS");
+        assert_eq!(d.table.get(0x1E).unwrap().target_modes.len(), 2);
+        assert!(d.table.pending_targets(0x1E).is_none());
+
+        // A zeroed request body (mode_count 0 with zeroed specs) is the
+        // shape a buggy host is most likely to send; same answer.
+        let zeroed = UpdateModesRequest {
+            session_id: 0x1E,
+            flags: 0,
+            mode_count: 0,
+            modes: [ModeSpec::default(); 4],
+            reserved: [0; 4],
+        };
+        let (reply, effects) = do_update(&mut d, &mut h, &zeroed);
+        assert_eq!(reply.result, err::BAD_MODE);
+        assert!(effects.is_empty());
+        assert_eq!(d.table.get(0x1E).unwrap().target_modes.len(), 2, "session fine");
+    }
+
+    /// FINDINGS 1/3/4 (the one defect from three angles): a push the OS
+    /// REFUSED must leave the durable list where it was, and the
+    /// identical retry must produce a real second push.
+    ///
+    /// Against the pre-fix code this test fails twice over: the durable
+    /// list was committed at IOCTL time, so the assertion right after the
+    /// failed settle finds the new list; and the retry resolved to
+    /// "already published", emitted no effect, and reported plain OK — a
+    /// silent no-op the caller cannot recover from, reporting success
+    /// while the monitor offers the old list.
+    #[test]
+    fn a_retry_after_a_failed_push_really_pushes_again() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(7));
+
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[FG_240]));
+        assert!(reply.is_pending());
+        let (seq, targets) = queued_update(&effects).expect("first request queues a push");
+
+        // The OS refused it (monitors::update_modes rolled the runtime
+        // list back and settles NotApplied).
+        assert!(d.table.settle_modes(7, seq, ModeUpdateResult::NotApplied, &targets).settled());
+        assert_eq!(
+            d.table.get(7).unwrap().target_modes.len(),
+            2,
+            "the durable list must not claim a publish the OS refused"
+        );
+        assert_eq!(
+            d.table.get(7).unwrap().last_error,
+            err::UPDATE_FAILED,
+            "and GET_STATUS says so"
+        );
+
+        // THE FIX: the identical retry pushes again.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[FG_240]));
+        assert_eq!(reply.result, err::OK);
+        let (retry_seq, retry_targets) =
+            queued_update(&effects).expect("an identical retry must re-push, not no-op");
+        assert_ne!(retry_seq, seq, "a NEW push, not a replay of the settled one");
+        assert_eq!(retry_targets.len(), 1);
+        assert!(
+            reply.is_pending(),
+            "and it must NOT read as in force while the publish has not happened"
+        );
+        assert!(!reply.fully_in_force());
+        assert_eq!(d.table.get(7).unwrap().target_modes.len(), 2, "still not in force");
+
+        // Second time lucky.
+        assert!(d
+            .table
+            .settle_modes(7, retry_seq, ModeUpdateResult::Applied, &retry_targets)
+            .settled());
+        assert_eq!(d.table.get(7).unwrap().target_modes.len(), 1);
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[FG_240]));
+        assert!(effects.is_empty());
+        assert!(reply.fully_in_force());
+    }
+
+    /// The same property for a DEFERRED push — the shell made no OS call
+    /// at all (a TDR duck in flight, or the adapter torn down under a
+    /// D3Final). A deferral is not an application: it settles NotApplied,
+    /// so the durable list is untouched and the retry genuinely re-pushes
+    /// once the deferring condition clears. Pre-fix, the durable list was
+    /// already committed and the retry was a no-op reporting OK — the
+    /// worst version of the bug, because a deferral is the case a host is
+    /// most likely to hit and most likely to retry.
+    #[test]
+    fn a_retry_after_a_deferred_push_really_pushes_again() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(8));
+        let before = d.table.get(8).unwrap().target_modes.clone();
+
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(8, &[FG_240]));
+        assert!(reply.is_pending());
+        let (seq, targets) = queued_update(&effects).expect("first request queues a push");
+
+        // Deferred: stored nowhere, pushed nowhere, retryable.
+        assert!(d.table.settle_modes(8, seq, ModeUpdateResult::NotApplied, &targets).settled());
+        assert_eq!(
+            d.table.get(8).unwrap().target_modes,
+            before,
+            "target modes unchanged, carry on"
+        );
+        assert_eq!(d.table.get(8).unwrap().last_error, err::UPDATE_FAILED);
+
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(8, &[FG_240]));
+        let (retry_seq, retry_targets) =
+            queued_update(&effects).expect("a retry after a deferral must re-push");
+        assert_ne!(retry_seq, seq);
+        assert!(reply.is_pending() && !reply.fully_in_force());
+        assert!(d
+            .table
+            .settle_modes(8, retry_seq, ModeUpdateResult::Applied, &retry_targets)
+            .settled());
+        assert_eq!(d.table.get(8).unwrap().target_modes.len(), 1);
+    }
+
+    /// THE REGRESSION TEST for the retry loop, at the wire.
+    ///
+    /// A push refused because it would gate out the OS's COMMITTED mode is
+    /// PERMANENT for as long as that mode stays committed. Build 17 settled
+    /// it exactly like an OS-call failure — sticky `UPDATE_FAILED`, which
+    /// the protocol documents as "the previous list is still in force and
+    /// resending really does push again" — so a retrying host queued a
+    /// push, had it refused for the same reason, was told to retry, and did,
+    /// with no state anywhere converging.
+    ///
+    /// Against the pre-fix code this test fails on the retry, in the two
+    /// places the loop is visible without any new API: the reply's `result`
+    /// is `err::OK` (it was accepted for application) and an
+    /// `Effect::UpdateModes` is emitted (it really is about to be pushed
+    /// again). The reply carries no way to tell that from a transient
+    /// failure, and no way to learn which mode is in the way.
+    #[test]
+    fn a_retry_after_a_committed_mode_refusal_is_answered_not_re_pushed() {
+        use crate::modepush::{live_gate, CommittedMode, LiveGate, PushOutcome};
+
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(0xC0));
+        let superset = d.table.get(0xC0).unwrap().modes.clone();
+        // The OS has committed the BASE rate on this display: under
+        // `virtual_display_layout=exclusive` it is the only active one.
+        let committed = CommittedMode { width: 2560, height: 1440, refresh_millihz: 120_000 };
+
+        // The host gates down to the framegen rate. Accepted and queued —
+        // as it must be, the push has not happened yet.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xC0, &[FG_240]));
+        assert_eq!(reply.result, err::OK);
+        assert!(reply.is_pending() && !reply.is_blocked());
+        assert_eq!(reply.blocking_mode_idx(), luminal_driver_proto::NO_MODE_INDEX);
+        let (seq, targets) = queued_update(&effects).expect("first request queues a push");
+
+        // The effects worker reaches the gate and refuses: publishing
+        // {240} without the committed 120 would make Windows re-select
+        // mid-stream on the only active display.
+        let gate = live_gate(&superset, &targets, Some(committed));
+        let LiveGate::EvictsCommitted { committed, superset_idx } = gate else {
+            panic!("expected the committed-mode refusal, got {gate:?}");
+        };
+        let outcome = PushOutcome::Blocked {
+            committed,
+            superset_idx,
+            token: crate::modepush::committed_token(),
+            count: 1,
+        };
+        assert!(!outcome.retryable());
+        assert!(d.table.settle_modes(0xC0, seq, outcome.settle_result(), &targets).settled());
+
+        // Constraint 1: the PUSH was refused, never the session. The
+        // published list is untouched and the sticky code is the distinct
+        // one, so even a host that only polls GET_STATUS can tell.
+        let m = d.table.get(0xC0).unwrap();
+        assert_eq!(m.target_modes.len(), 2, "target modes unchanged, carry on");
+        assert_eq!(m.last_error, err::MODE_COMMITTED);
+        assert_ne!(err::MODE_COMMITTED, err::UPDATE_FAILED);
+
+        // THE CONSEQUENCE, and the whole point: the identical retry.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xC0, &[FG_240]));
+        assert_eq!(reply.result, err::MODE_COMMITTED, "not OK: this cannot be applied");
+        assert!(reply.is_blocked(), "and the flag says the refusal is permanent");
+        assert!(!reply.worth_retrying(), "which is the predicate a retry loop reads");
+        assert!(
+            effects.is_empty(),
+            "and it is NOT pushed again — the same gate would refuse it identically"
+        );
+        // WHICH mode blocked it, as an index into the list this host used
+        // at CREATE_MONITOR, so it can choose a different subset.
+        assert_eq!(reply.blocking_mode_idx(), 0);
+        assert_eq!(superset_req(0xC0).modes[reply.blocking_mode_idx() as usize], BASE_120);
+        assert_eq!(reply.mode_count, 2, "the list still in force is reported as always");
+        assert!(!reply.is_pending(), "nothing is outstanding — this is the final answer");
+        assert!(!reply.fully_in_force());
+        assert_eq!(d.table.get(0xC0).unwrap().target_modes.len(), 2);
+
+        // The way out is open, and it is the one the reply pointed at: a
+        // subset that KEEPS the blocking mode pushes normally.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xC0, &[BASE_120]));
+        assert_eq!(reply.result, err::OK);
+        assert!(!reply.is_blocked() && reply.worth_retrying());
+        let (seq, targets) = queued_update(&effects).expect("a different subset really pushes");
+        assert_eq!(live_gate(&superset, &targets, Some(committed)), LiveGate::Push);
+        assert!(d.table.settle_modes(0xC0, seq, ModeUpdateResult::Applied, &targets).settled());
+        assert_eq!(d.table.get(0xC0).unwrap().target_modes.len(), 1);
+    }
+
+    /// While a push is outstanding, a second request replaces the PENDING
+    /// selection rather than the in-force one, and every reply keeps
+    /// saying PENDING until something actually lands. The effects worker
+    /// is serialized, so push #1 completes before push #2 starts, and the
+    /// newer update is the one that decides what is FINALLY published —
+    /// but a superseded push the OS ACCEPTED still records what the OS took
+    /// on its way past, or the durable list under-reports the monitor until
+    /// something else happens to move it.
+    #[test]
+    fn a_second_request_while_a_push_is_outstanding_supersedes_and_stays_pending() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(12));
+
+        let (_, first) = do_update(&mut d, &mut h, &update_req(12, &[FG_240]));
+        let (first_seq, first_targets) = queued_update(&first).unwrap();
+        let (reply, second) = do_update(&mut d, &mut h, &update_req(12, &[BASE_120]));
+        let (second_seq, second_targets) = queued_update(&second).unwrap();
+        assert_eq!(second_targets.len(), 1);
+        assert_eq!(second_targets[0].refresh_millihz, 120_000, "the newer intent wins");
+        assert!(reply.is_pending());
+        assert_eq!(d.table.pending_targets(12).unwrap().len(), 1);
+
+        // The superseded push does not DECIDE — the pending selection is
+        // still #2's — but the OS took its list, so the durable list has to
+        // say so.
+        let outcome =
+            d.table.settle_modes(12, first_seq, ModeUpdateResult::Applied, &first_targets);
+        assert!(!outcome.settled(), "it decided nothing for the outstanding update");
+        assert!(outcome.recorded(), "but it recorded what the OS took");
+        assert_eq!(d.table.get(12).unwrap().target_modes, first_targets);
+        assert_eq!(d.table.pending_targets(12).unwrap().len(), 1, "#2 still outstanding");
+
+        // And the newer one still has the last word.
+        assert!(d
+            .table
+            .settle_modes(12, second_seq, ModeUpdateResult::Applied, &second_targets)
+            .settled());
+        assert_eq!(d.table.get(12).unwrap().target_modes, second_targets);
+
+        // Resending the list now in force is a no-op that reads as such.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(12, &[BASE_120]));
+        assert!(effects.is_empty());
+        assert!(reply.fully_in_force());
+    }
+
+    /// THE REGRESSION TEST for the unreachable rescind, at the wire.
+    ///
+    /// The interleaving is real, not theoretical: `dispatch` holds the
+    /// device lock only for its own duration, while the effects worker
+    /// calls `IddCxMonitorUpdateModes2` with no lock held — so request #2's
+    /// whole dispatch fits inside push #1's DDI call.
+    ///
+    /// Against the pre-fix code this fails on the LAST four assertions, and
+    /// it fails in the two places a host can actually see: the rescind
+    /// emits no `Effect::UpdateModes`, and its reply says
+    /// `fully_in_force()` — "everything you asked for is offered right
+    /// now" — for a list the OS is not holding. That reply is the predicate
+    /// DESIGN.md tells hosts to gate client capability on.
+    #[test]
+    fn a_rescind_after_a_superseded_success_still_reaches_the_os() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(0x11));
+        assert_eq!(d.table.get(0x11).unwrap().target_modes.len(), 2, "both rates, initially");
+
+        // #1 gates down to the framegen rate; the effects worker is inside
+        // IddCxMonitorUpdateModes2 with no lock held.
+        let (_, first) = do_update(&mut d, &mut h, &update_req(0x11, &[FG_240]));
+        let (first_seq, first_targets) = queued_update(&first).expect("#1 queues a push");
+
+        // #2's whole dispatch lands inside that call.
+        let (_, second) = do_update(&mut d, &mut h, &update_req(0x11, &[BASE_120]));
+        let (second_seq, second_targets) = queued_update(&second).expect("#2 queues a push");
+
+        // #1 returns STATUS_SUCCESS. Superseded — but the OS holds {240}.
+        d.table.settle_modes(0x11, first_seq, ModeUpdateResult::Applied, &first_targets);
+        // #2 does not apply: a duck in flight, a torn-down adapter, or an
+        // OS refusal whose rollback restores #1's list. `UPDATE_FAILED` is
+        // the sticky code, i.e. the host is told to retry.
+        d.table.settle_modes(0x11, second_seq, ModeUpdateResult::NotApplied, &second_targets);
+        assert_eq!(d.table.get(0x11).unwrap().last_error, err::UPDATE_FAILED);
+
+        // THE CONSEQUENCE: the host rescinds back to the full list.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0x11, &[BASE_120, FG_240]));
+        assert_eq!(reply.result, err::OK);
+        assert_eq!(reply.mode_count, 2);
+        let (_, rescind_targets) =
+            queued_update(&effects).expect("the rescind must reach the OS, not short-circuit");
+        assert_eq!(rescind_targets.len(), 2);
+        assert!(reply.is_pending(), "it is queued, not in force");
+        assert!(
+            !reply.fully_in_force(),
+            "and must never claim in-force for a list the OS is not holding"
+        );
+    }
+
+    /// Constraint 1: every refusal is a REPLY code with the published
+    /// count intact — never a failed IRP, never an effect, never a
+    /// disturbed session.
+    #[test]
+    fn update_modes_refusals_leave_the_session_alone() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(9));
+
+        // Not handshaken: refused, and the live count still reported.
+        let mut un = HandleCtx::default();
+        let (reply, effects) = do_update(&mut d, &mut un, &update_req(9, &[FG_240]));
+        assert_eq!(reply.result, err::NOT_HANDSHAKEN);
+        assert_eq!(reply.mode_count, 2, "the list in force is still reported");
+        assert!(effects.is_empty());
+        // A refusal takes nothing and queues nothing, and says both.
+        assert_eq!((reply.accepted(), reply.requested()), (0, 1));
+        assert_eq!(reply.flags(), 0);
+        assert!(!reply.fully_in_force(), "a refusal is never 'in force'");
+
+        // Unknown session: 0 modes in force is the one case that means
+        // "there is nothing there".
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(1234, &[FG_240]));
+        assert_eq!((reply.result, reply.mode_count), (err::NO_SUCH_SESSION, 0));
+        assert!(effects.is_empty());
+
+        // mode_count > MAX is bounds-checked before anything slices the
+        // array (mode_count == 0 has its own test above).
+        let mut too_many = update_req(9, &[FG_240]);
+        too_many.mode_count = luminal_driver_proto::MAX_MODES_PER_MONITOR + 1;
+        assert_eq!(do_update(&mut d, &mut h, &too_many).0.result, err::BAD_MODE);
+
+        // Out-of-envelope mode.
+        let bad = ModeSpec { width: 3, height: 3, refresh_millihz: 1 };
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(9, &[bad]));
+        assert_eq!((reply.result, reply.mode_count), (err::BAD_MODE, 2));
+        assert!(effects.is_empty());
+
+        // Short input and short output buffers stay BadBuffer.
+        let full = as_bytes(&update_req(9, &[FG_240]));
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(
+            &mut d, &mut h, 0, ioctl::IOCTL_UPDATE_MODES,
+            &full[..luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5 - 4], &mut out,
+        );
+        assert_eq!(r.status, Status::BadBuffer);
+        // A short OUTPUT buffer must be rejected BEFORE the table is
+        // touched: the effect would be dropped with the BadBuffer result,
+        // so a mutation here would leave the durable list permanently
+        // ahead of what the monitor advertises.
+        let mut tiny = vec![0u8; 8];
+        let r = dispatch(&mut d, &mut h, 0, ioctl::IOCTL_UPDATE_MODES, &full, &mut tiny);
+        assert_eq!(r.status, Status::BadBuffer);
+        assert!(r.effects.is_empty());
+        assert!(
+            d.table.pending_targets(9).is_none(),
+            "short reply buffer changed nothing"
+        );
+
+        // Through all of that, the monitor never changed.
+        assert_eq!(d.table.get(9).unwrap().target_modes.len(), 2);
+        assert_eq!(d.table.get(9).unwrap().modes.len(), 2);
+    }
+
+    /// FORWARD compatibility, request side: a FUTURE host that appends
+    /// fields sends a LARGER buffer, and this driver must accept it and
+    /// ignore the tail — that is the whole additive-growth contract, and
+    /// it only works if the exact 0.5 size is also still accepted.
+    #[test]
+    fn update_modes_accepts_the_v5_size_and_a_future_larger_request() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(11));
+        let full = as_bytes(&update_req(11, &[FG_240]));
+        assert_eq!(full.len(), luminal_driver_proto::UPDATE_MODES_REQUEST_SIZE_V5);
+
+        // Exactly the 0.5 size.
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(&mut d, &mut h, 0, ioctl::IOCTL_UPDATE_MODES, &full, &mut out);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(from_bytes::<UpdateModesReply>(&out).result, err::OK);
+
+        // A hypothetical 0.6 host: same prefix, 32 bytes of new tail.
+        let mut d2 = dev();
+        let mut h2 = HandleCtx::default();
+        shake(&mut d2, &mut h2);
+        do_create(&mut d2, &mut h2, &superset_req(11));
+        let mut future = full.clone();
+        future.extend_from_slice(&[0xAB; 32]);
+        let mut out2 = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(&mut d2, &mut h2, 0, ioctl::IOCTL_UPDATE_MODES, &future, &mut out2);
+        assert_eq!(r.status, Status::Ok);
+        let reply: UpdateModesReply = from_bytes(&out2);
+        assert_eq!((reply.result, reply.mode_count), (err::OK, 1));
+
+        // Unknown flag bits are IGNORED, not refused — an older driver
+        // must never reject a newer host over a bit it does not know.
+        let mut flagged = update_req(11, &[BASE_120]);
+        flagged.flags = 0xDEAD_BEEF;
+        assert_eq!(do_update(&mut d2, &mut h2, &flagged).0.result, err::OK);
+    }
+
+    /// BACKWARD compatibility, the direction that matters most: a host
+    /// built against proto 0.3/0.4 — which announces the required FLOOR,
+    /// not its compiled minor — still handshakes against this 0.5 driver
+    /// and drives every pre-0.5 opcode unchanged. It simply never sends
+    /// 0x809.
+    #[test]
+    fn a_pre_05_host_is_completely_unaffected_by_the_new_opcode() {
+        for announced in [3u16, 4u16] {
+            let mut d = dev();
+            let mut h = HandleCtx::default();
+            let req = HandshakeRequest {
+                host_proto_major: PROTO_VERSION_MAJOR,
+                host_proto_minor: announced,
+            };
+            let mut out = vec![0u8; core::mem::size_of::<HandshakeReply>()];
+            let r = dispatch(&mut d, &mut h, 0, ioctl::IOCTL_HANDSHAKE, &as_bytes(&req), &mut out);
+            assert_eq!(r.status, Status::Ok);
+            let reply: HandshakeReply = from_bytes(&out);
+            assert_eq!(reply.driver_proto_minor, PROTO_VERSION_MINOR);
+            assert_eq!(reply.driver_proto_minor, 5);
+            assert!(h.handshaken, "0.{announced} host still handshakes against 0.5");
+
+            // And its session IOCTLs still work.
+            let (create, effects) = do_create(&mut d, &mut h, &create_req(3));
+            assert_eq!(create.result, err::OK);
+            assert!(matches!(effects[0], Effect::PlugMonitor { .. }));
+        }
+    }
+
+    /// The structural backstop for the other direction: a build-17 HOST
+    /// talking to an older driver. There is no way to simulate an old
+    /// driver here, so the property under test is the one that makes the
+    /// fallback safe — an unrecognized code produces `UnknownCode`
+    /// (STATUS_INVALID_DEVICE_REQUEST → an I/O error host-side), never a
+    /// zero-filled reply that could read as success.
+    #[test]
+    fn an_unknown_opcode_can_never_look_like_an_update_modes_success() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        let mut out = vec![0u8; core::mem::size_of::<UpdateModesReply>()];
+        let r = dispatch(
+            &mut d, &mut h, 0, ioctl::ctl_code(0x80A),
+            &as_bytes(&update_req(1, &[ModeSpec { width: 1920, height: 1080, refresh_millihz: 60_000 }])),
+            &mut out,
+        );
+        assert_eq!(r.status, Status::UnknownCode);
+        assert_eq!(r.bytes_written, 0, "nothing written — no false success");
+        assert!(r.effects.is_empty());
+    }
+
+    /// The caps bit is the host's feature gate, so it has to be ON in the
+    /// handshake this driver actually returns — not merely defined.
+    #[test]
+    fn handshake_advertises_dynamic_modes_when_the_driver_has_it() {
+        let mut d = DeviceState::new(
+            DriverConfig {
+                caps: CAPS | caps::DYNAMIC_MODES,
+                driver_build: 17,
+                ..DriverConfig::default()
+            },
+            None,
+        );
+        let mut h = HandleCtx::default();
+        let mut out = vec![0u8; core::mem::size_of::<HandshakeReply>()];
+        dispatch(
+            &mut d, &mut h, 0, ioctl::IOCTL_HANDSHAKE,
+            &as_bytes(&HandshakeRequest {
+                host_proto_major: PROTO_VERSION_MAJOR,
+                host_proto_minor: luminal_driver_proto::PROTO_VERSION_MINOR_REQUIRED,
+            }),
+            &mut out,
+        );
+        let reply: HandshakeReply = from_bytes(&out);
+        assert_ne!(reply.caps & caps::DYNAMIC_MODES, 0);
+        assert_eq!(reply.driver_build, 17);
+    }
+
     #[test]
     fn unknown_code_rejected() {
         let mut d = dev();
         let mut h = HandleCtx::default();
         let r = dispatch(&mut d, &mut h, 0, ioctl::ctl_code(0x8FF), &[], &mut []);
         assert_eq!(r.status, Status::UnknownCode);
+    }
+
+    /// Build 16, constraint 1: the SHIPPED default must be "duck the
+    /// device, keep the display" (DESIGN.md §3.3 rule 2), and the legacy
+    /// build-14/15 display duck-out must remain SELECTABLE. A silent flip
+    /// of this default is a behaviour change nobody would see in a diff of
+    /// the shell — the 2026-07-30 incident is what it costs.
+    #[test]
+    fn tdr_duck_gate_defaults_to_device_duck_and_legacy_stays_selectable() {
+        assert_eq!(DriverConfig::default().tdr_duck_mode, TDR_DUCK_DEVICE);
+        assert_ne!(TDR_DUCK_DEVICE, TDR_DUCK_DISPLAY);
+        // The registry read clamps out-of-range values to the default, so
+        // the gate is a closed set of exactly these two.
+        assert_eq!(TDR_DUCK_DEVICE, 0);
+        assert_eq!(TDR_DUCK_DISPLAY, 1);
+    }
+
+    /// The gate has to survive the trip the driver actually takes it on:
+    /// registry read → `DriverConfig` → `DeviceState::new` → the value the
+    /// shell mirrors into its lock-free atomic at device add. Build 16
+    /// stored the field and never read it back — the shell mirrored a
+    /// separate local — so nothing anywhere proved the configured policy
+    /// was the policy that ran. `shell::entry::device_add` now reads it
+    /// through this accessor.
+    #[test]
+    fn tdr_duck_gate_survives_device_state_construction() {
+        for mode in [TDR_DUCK_DEVICE, TDR_DUCK_DISPLAY] {
+            let dev = DeviceState::new(
+                DriverConfig { tdr_duck_mode: mode, ..DriverConfig::default() },
+                None,
+            );
+            assert_eq!(dev.tdr_duck_mode(), mode);
+        }
+        // Restoring persisted state must not disturb the gate: the blob
+        // carries identity reservations and the pool, never policy.
+        let dev = DeviceState::new(
+            DriverConfig { tdr_duck_mode: TDR_DUCK_DISPLAY, ..DriverConfig::default() },
+            Some(&[0u8; 8]),
+        );
+        assert_eq!(dev.tdr_duck_mode(), TDR_DUCK_DISPLAY);
     }
 }

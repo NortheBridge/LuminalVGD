@@ -137,13 +137,36 @@ unsafe extern "C" fn evt_device_add(
     // Portable state: config defaults + persisted blob (identity
     // reservations, permanent pool) from the device registry key.
     let persisted = control::read_persisted(device);
+    // Build-16 gate: TDR response policy from the devnode's Device
+    // Parameters key. Absent (the normal case) ⇒ TDR_DUCK_DEVICE.
+    let (tdr_duck_mode, tdr_gate_source) = control::read_tdr_duck_mode(device);
     let cfg = DriverConfig {
         caps: SHELL_CAPS,
         driver_build: DRIVER_BUILD,
+        tdr_duck_mode,
         ..DriverConfig::default()
     };
     let shell = Shell::init(DeviceState::new(cfg, persisted.as_deref()));
     shell.set_wdf_device(OsHandle(device.cast()));
+    // Mirror the gate for lock-free reads on the TDR path, then announce
+    // it: a field trace must say which policy this binary is running
+    // WITHOUT needing a repro to find out.
+    //
+    // Use the value THIS device add just read from the registry, not a
+    // read-back out of DeviceState. `Shell::init` is a `get_or_init`, so on
+    // a same-process devnode re-add the freshly constructed DeviceState is
+    // discarded and the read-back returns the FIRST device's mode — which
+    // would silently ignore the gate flip that `pnputil /restart-device` is
+    // the documented way to apply. `set_tdr_duck_mode` exists precisely to
+    // be set after `init` for this reason (see its doc comment); feeding it
+    // the stale value defeated it.
+    //
+    // This gate is the escape hatch back to the build-14/15 display duck-out.
+    // If it does not take effect without a reinstall, a bad field outcome
+    // costs a signing round instead of a device restart.
+    let effective_mode = tdr_duck_mode;
+    shell.set_tdr_duck_mode(effective_mode);
+    control::trace_tdr_duck_config(effective_mode, tdr_gate_source);
 
     // 1 s periodic watchdog (feeds dispatch::watchdog_tick).
     let mut tc: WDF_TIMER_CONFIG = zeroed();
@@ -333,6 +356,19 @@ unsafe extern "C" fn evt_d0_exit(
     // PersistState from touching a destroyed WDFDEVICE handle.
     shell.clear_adapter();
     shell.clear_wdf_device();
+    // Then WAIT (bounded) for any IddCxMonitorUpdateModes2 already in
+    // flight on the effects worker. Order is the whole handshake: the
+    // clear above happens first, so a push starting from here on sees no
+    // adapter and defers, and this drain catches the one push that could
+    // otherwise have been holding a monitor object we are about to let the
+    // framework destroy. `monitors::push_targets` re-checks the adapter
+    // epoch after publishing and before its DDI call, so the teardown only
+    // has to avoid losing the race silently. Bounded per §3.3 rule 5, and
+    // it sits inside the multi-second worker drain below.
+    monitors::drain_mode_pushes();
+    // The paths the OS had committed die with the adapter; the handles
+    // could otherwise be reissued to a replacement device's monitors.
+    monitors::forget_all_committed();
     let drained: Vec<(u64, super::MonitorRt)> = {
         let mut monitors = shell.monitors.lock().unwrap();
         monitors.drain().collect()
