@@ -828,7 +828,9 @@ mod tests {
         // ends up holding `targets`, so the assertions below are about the
         // OTHER copy — the durable one — agreeing with it.
         let outcome = parked_push(&superset, &update.targets);
-        assert!(t.settle_modes(1, seq, outcome.settle_result()));
+        assert!(t
+            .settle_modes(1, seq, outcome.settle_result(), &update.targets)
+            .settled());
 
         // Durable now agrees with what the re-arrival will publish.
         assert_eq!(
@@ -1031,7 +1033,7 @@ mod tests {
         let outcome = PushOutcome::Blocked { committed, superset_idx, token: TOKEN, count: 1 };
         assert!(!outcome.retryable(), "THE property the wire has to carry");
         assert!(!outcome.commits(), "and a refusal still changes nothing");
-        assert!(t.settle_modes(1, seq, outcome.settle_result()));
+        assert!(t.settle_modes(1, seq, outcome.settle_result(), &first.targets).settled());
 
         // Constraint 1: the PUSH was refused, not the session. The list in
         // force is untouched and the monitor carries on.
@@ -1080,11 +1082,14 @@ mod tests {
             .expect("accepted")
             .queued
             .expect("queued");
-        assert!(t.settle_modes(
-            1,
-            seq,
-            ModeUpdateResult::Blocked { superset_idx: 0, token: TOKEN }
-        ));
+        assert!(t
+            .settle_modes(
+                1,
+                seq,
+                ModeUpdateResult::Blocked { superset_idx: 0, token: TOKEN },
+                &[mode(DOUBLED)],
+            )
+            .settled());
         assert_eq!(
             t.update_modes(1, &[spec(DOUBLED)], CAPS, TOKEN).unwrap().blocked,
             Some(0),

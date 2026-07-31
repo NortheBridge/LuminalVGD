@@ -544,6 +544,17 @@ pub(super) fn forget_all_committed() {
 /// not take leaves every copy on the pre-update list and the retry pushes
 /// again.
 ///
+/// The settle carries the pushed LIST as well as the outcome, because
+/// `update_seq` may already have been superseded by the time the DDI call
+/// returns — the IOCTL takes the device lock only for its own dispatch and
+/// this call holds no lock at all, so request #2's whole dispatch fits
+/// inside push #1's call. A superseded push that the OS ACCEPTED cannot
+/// read its own selection back out of `Monitor.pending_targets` (a newer
+/// request replaced it) and must still record what the OS took, or the
+/// durable list stays on the pre-update selection and the host's rescind
+/// is short-circuited as "already published" for the life of the session.
+/// See `SessionTable::settle_modes`.
+///
 /// # The lock protocol, which is the whole of the danger here
 ///
 /// `evt_query_target_modes2`, `evt_parse_monitor_description2` and
@@ -570,7 +581,12 @@ pub(super) fn forget_all_committed() {
 /// so whichever one the OS ends up holding is fully activatable.
 pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
     let shell = Shell::get();
-    let push = push_targets(shell, session_id, targets);
+    // `targets` is kept, not moved: it is the list this push puts in front
+    // of the OS, and the settle below needs it. A push whose settle turns
+    // out to be SUPERSEDED can no longer read its own selection out of
+    // `Monitor.pending_targets` — a newer request replaced it — so the list
+    // travels with the report instead.
+    let push = push_targets(shell, session_id, &targets);
 
     // Constraint 6: every deny/fail path carries stage + code.
     match push {
@@ -684,19 +700,36 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
     // it: anything that CHANGED a published list commits, anything that
     // changed nothing does not. Deciding that here, per arm, is how the
     // parked arm came to mutate a list it then settled `NotApplied`.
+    //
+    // `targets` rides along because a settle can be SUPERSEDED — a second
+    // request's whole dispatch fits inside the DDI call above, since that
+    // call is made with no lock held — and a superseded push that the OS
+    // ACCEPTED still owes the table the list the OS took. Without it the
+    // durable list stayed on the pre-update selection while the OS and the
+    // runtime held this one, and the host's rescind was short-circuited as
+    // "already published" for the life of the session.
     let result = push.settle_result();
-    let settled = shell.dev.lock().unwrap().table.settle_modes(session_id, update_seq, result);
-    if !settled {
+    let outcome = shell
+        .dev
+        .lock()
+        .unwrap()
+        .table
+        .settle_modes(session_id, update_seq, result, &targets);
+    if !outcome.settled() {
         // The update was superseded by a newer one, or its session is
         // gone. Neither is an error — the newer update's own settle
-        // covers a superset of these modes — but a silent miss and a
-        // missing settle look identical in a capture, so say which.
+        // decides the published list — but a silent miss and a missing
+        // settle look identical in a capture, so say which. `committed`
+        // separates the two superseded cases that behave differently: a
+        // push the OS took wrote the durable list on its way past
+        // (`SupersededCommitted`), one that changed nothing did not.
         tracelogging::write_event!(
             PROVIDER,
             "UpdateModesSettleStale",
             level(Informational),
             u64("session", &session_id),
-            u64("seq", &update_seq)
+            u64("seq", &update_seq),
+            u32("committed", &u32::from(outcome.recorded()))
         );
     }
 }
@@ -740,7 +773,7 @@ pub fn update_modes(session_id: u64, update_seq: u64, targets: Vec<Mode>) {
 /// count the rates Display Settings offers. `published` ⇒ replace or
 /// re-query; `superset` ⇒ append (or no re-solicit). Do not assert either
 /// in code or docs until that is measured.
-fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutcome {
+fn push_targets(shell: &Shell, session_id: u64, targets: &[Mode]) -> PushOutcome {
     // `IDARG_IN_UPDATEMODES2.TargetModeCount` "cannot be zero"
     // (IddCx.h:3594). The core layer refuses an empty selection before it
     // can ever become an effect, so this is the second gate, not the
@@ -773,9 +806,9 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
     {
         let mut ducked = shell.ducked.lock().unwrap();
         if let Some(d) = ducked.iter_mut().find(|d| d.session_id == session_id) {
-            let outcome = modepush::parked_push(&d.monitor_modes, &targets);
+            let outcome = modepush::parked_push(&d.monitor_modes, targets);
             if outcome.commits() {
-                d.target_modes = targets;
+                d.target_modes = targets.to_vec();
             }
             return outcome;
         }
@@ -811,7 +844,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
     };
 
     // --- Under the lock: validate, publish, snapshot, build. No IddCx. ---
-    let (monitor, previous, pushed, superset, target_modes) = {
+    let (monitor, previous, superset, target_modes) = {
         let mut monitors = shell.monitors.lock().unwrap();
         let Some(rt) = monitors.get_mut(&session_id) else {
             return PushOutcome::Failed {
@@ -833,7 +866,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
         // refusal: it is what tells a later request whether that refusal is
         // still evidence of anything (`SessionTable::update_modes`).
         let (committed, commit_token) = COMMITTED.get_with_token(monitor.0 as u64);
-        match modepush::live_gate(&rt.monitor_modes, &targets, committed) {
+        match modepush::live_gate(&rt.monitor_modes, targets, committed) {
             LiveGate::Push => {}
             LiveGate::PushCommittedUnrecognised(committed) => {
                 // FAIL-OPEN, and this is the event that says so. The OS
@@ -892,8 +925,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
             }
         }
         let superset = rt.monitor_modes.len() as u32;
-        let pushed = targets.clone();
-        let previous = core::mem::replace(&mut rt.target_modes, targets);
+        let previous = core::mem::replace(&mut rt.target_modes, targets.to_vec());
         // monitor_modes is deliberately untouched: the EDID that
         // describes it cannot be reissued, and nothing here claims to
         // change what the monitor IS — only what it currently offers.
@@ -902,7 +934,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
         for (slot, mode) in target_modes.iter_mut().zip(rt.target_modes.iter()) {
             fill_target_mode2(slot, mode);
         }
-        (monitor, previous, pushed, superset, target_modes)
+        (monitor, previous, superset, target_modes)
     };
 
     // The list is published but the OS has not been told. A teardown that
@@ -911,7 +943,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
     // being destroyed: put the runtime list back and defer, rather than
     // calling into a dying adapter.
     if shell.adapter_epoch() != epoch {
-        let (rolled_back, _) = restore_targets(shell, session_id, monitor, &pushed, previous);
+        let (rolled_back, _) = restore_targets(shell, session_id, monitor, targets, previous);
         tracelogging::write_event!(
             PROVIDER,
             "UpdateModesAdapterTornDown",
@@ -946,7 +978,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: Vec<Mode>) -> PushOutco
     }
 
     // --- Failure: restore the previously published list. ---
-    let (rolled_back, raced) = restore_targets(shell, session_id, monitor, &pushed, previous);
+    let (rolled_back, raced) = restore_targets(shell, session_id, monitor, targets, previous);
     PushOutcome::Failed {
         stage: if raced { stage::ROLLBACK_RACED } else { stage::OS_CALL },
         code: status,

@@ -98,6 +98,25 @@ pub struct Monitor {
     /// the way. Cleared the moment anything could change the answer — see
     /// [`BlockedPush::token`].
     pub blocked: Option<BlockedPush>,
+    /// The high-water mark of settled updates: no settle at or below this
+    /// id decides anything for this monitor. THE ordering guard behind
+    /// [`SessionTable::settle_modes`], and it does two jobs at once.
+    ///
+    /// * It starts at the table-wide `update_seq` standing when the monitor
+    ///   was CREATED. Every update this monitor can ever issue has a
+    ///   strictly greater id (the counter is monotonic and never reset), so
+    ///   a settle for a destroyed session whose id was reused cannot reach
+    ///   its replacement.
+    /// * It advances on every settle this monitor honours, so a late
+    ///   settle can never put an OLDER list back over a newer push that
+    ///   already took.
+    ///
+    /// `pending_targets.seq == seq` used to provide both by accident. Once
+    /// a SUPERSEDED settle can also be honoured (a push the OS accepted has
+    /// to record what the OS took even when a newer request has already
+    /// replaced the pending selection), the pending list stops being proof
+    /// of ownership or of ordering, so both are recorded explicitly.
+    pub settled_seq: u64,
     pub adapter_luid: u64,
     pub physical_width_mm: u32,
     pub physical_height_mm: u32,
@@ -214,6 +233,61 @@ pub enum ModeUpdateResult {
         /// Validity token — see [`BlockedPush::token`].
         token: u64,
     },
+}
+
+impl ModeUpdateResult {
+    /// Did this push CHANGE what is published — at the OS, or in the parked
+    /// spec a TDR re-arrival will plug with?
+    ///
+    /// The core's half of `modepush::PushOutcome::commits`, and the reason
+    /// the two cannot drift: this is the single predicate
+    /// [`SessionTable::settle_modes`] uses to decide whether the list the
+    /// push put in front of the OS becomes the durable one — including when
+    /// the settle is SUPERSEDED, where the pending list is somebody else's
+    /// and only the push itself knows what it published.
+    pub fn commits(self) -> bool {
+        matches!(self, ModeUpdateResult::Applied)
+    }
+}
+
+/// What a [`SessionTable::settle_modes`] call decided.
+///
+/// Three outcomes rather than a bool, because "this settle was superseded"
+/// stopped meaning "this settle changed nothing" (build 17, review pass 3):
+/// a superseded push whose list the OS ACCEPTED still has to record what
+/// the OS took, or the durable list permanently under-reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// `seq` was the monitor's outstanding update: the pending selection
+    /// was consumed and this settle decided the published list, the sticky
+    /// error, and any remembered refusal.
+    Settled,
+    /// `seq` had been SUPERSEDED by a newer request, but the push it
+    /// reports had already changed a published list, so the durable list
+    /// was brought up to what the OS actually holds. The newer update stays
+    /// outstanding and decides on its own settle.
+    SupersededCommitted,
+    /// Nothing to decide and nothing to record: the update was superseded
+    /// and its push changed nothing, or the session is gone, or the id
+    /// belongs to an earlier incarnation of this session, or a newer settle
+    /// has already spoken.
+    Stale,
+}
+
+impl SettleOutcome {
+    /// Did this settle decide the monitor's OUTSTANDING update? The
+    /// original bool return, unchanged, so a caller that only cares whether
+    /// the pending list was consumed keeps reading exactly one thing.
+    pub fn settled(self) -> bool {
+        matches!(self, SettleOutcome::Settled)
+    }
+
+    /// Did this settle write the durable published list? True for a normal
+    /// settle of an applied push AND for the superseded-but-applied case —
+    /// the distinction the caller traces, not the one it acts on.
+    pub fn recorded(self) -> bool {
+        matches!(self, SettleOutcome::Settled | SettleOutcome::SupersededCommitted)
+    }
 }
 
 /// Driver-side outcome of an `UPDATE_MODES` request, everything the reply
@@ -454,6 +528,11 @@ impl SessionTable {
             modes,
             pending_targets: None,
             blocked: None,
+            // Every update id this monitor can issue is strictly greater
+            // than the counter's value right now, so starting the
+            // high-water mark here is what separates this incarnation's
+            // settles from those of a destroyed session on the same id.
+            settled_seq: self.update_seq,
             adapter_luid,
             physical_width_mm: req.physical_width_mm,
             physical_height_mm: req.physical_height_mm,
@@ -649,10 +728,12 @@ impl SessionTable {
         })
     }
 
-    /// Report what the shell's `IddCxMonitorUpdateModes2` push did with the
-    /// pending update `seq` (build 17). Returns true when `seq` was still
-    /// the monitor's outstanding update, i.e. when this settle decided
-    /// anything.
+    /// Report what the shell's `IddCxMonitorUpdateModes2` push did with
+    /// update `seq`, and what list it put in front of the OS (build 17).
+    ///
+    /// `published` is that list — the one the effect carried and the push
+    /// actually published. It becomes the durable list whenever `result`
+    /// [`commits`](ModeUpdateResult::commits), and is ignored otherwise.
     ///
     /// [`Applied`](ModeUpdateResult::Applied) is the ONLY thing that
     /// changes the list in force. [`NotApplied`](ModeUpdateResult::NotApplied)
@@ -665,35 +746,91 @@ impl SessionTable {
     /// list is precisely what must not keep happening, because the refusal
     /// stands as long as the OS keeps running the mode it names.
     ///
-    /// A stale `seq` — the session was destroyed and recreated, or a newer
-    /// update superseded this one — settles nothing and is reported false.
-    /// That is not a failure: the newer update's own settle decides the
-    /// published list, and both lists are subsets of the same frozen
-    /// superset, so whichever wins the monitor still advertises modes it
-    /// really has. (Residual, accepted: if a superseded push SUCCEEDED and
-    /// the superseding one then FAILED, the durable subset lags what the
-    /// OS holds until the next request. Both are valid non-empty subsets,
-    /// the sticky `UPDATE_FAILED` tells the host to re-ask, and the
-    /// runtime list the shell reports to `QueryTargetModes2` is the one
-    /// the OS actually sees.)
+    /// # A SUPERSEDED push still reports what the OS took
+    ///
+    /// The IOCTL holds the device lock only for its own dispatch, while the
+    /// effects worker calls `IddCxMonitorUpdateModes2` with NO lock held —
+    /// so a second request's whole dispatch can land inside push #1's DDI
+    /// call and replace the pending selection under it. When push #1 then
+    /// returns SUCCESS, `seq` is no longer the outstanding update.
+    ///
+    /// Build 17 reported that as "settled nothing", which lost the one fact
+    /// only that settle knew: **the OS had already taken push #1's list.**
+    /// If push #2 then did not apply — a TDR duck in flight, a torn-down
+    /// adapter, or an OS refusal whose rollback restores push #1's list —
+    /// the durable list kept the PRE-UPDATE one while the OS and the
+    /// runtime held push #1's. The host was told to retry; its retry for
+    /// the pre-update list matched `Monitor::target_base`, short-circuited
+    /// as "already published", emitted no effect, and returned
+    /// `fully_in_force()` for a list the monitor was not offering. Nothing
+    /// resynced it — a duck/requalify cycle carries the runtime list — so
+    /// only a full replug-from-`DeviceState` healed it. The rescind was
+    /// unreachable for the life of the session.
+    ///
+    /// So a superseded settle whose push COMMITTED writes `published` into
+    /// [`Monitor::target_modes`] anyway and reports
+    /// [`SettleOutcome::SupersededCommitted`]. The newer update stays
+    /// outstanding and still decides on its own settle: pending is NOT
+    /// consumed, the sticky error is NOT touched (it belongs to the request
+    /// still in flight), and the rule "anything that changed a published
+    /// list commits" finally holds for every push, not just the ones whose
+    /// settle happened to be current.
+    ///
+    /// A superseded settle whose push changed NOTHING still records
+    /// nothing — there is nothing to record, and its sticky error would be
+    /// answering for a request that has been replaced.
+    ///
+    /// # What keeps a late settle from clobbering a newer one
+    ///
+    /// [`Monitor::settled_seq`]. A settle is honoured only when its id is
+    /// strictly greater, which rejects both a re-ordered older settle and a
+    /// settle for a destroyed session whose id was reused (the mark starts
+    /// at the table-wide counter's value at create time). Ids beyond
+    /// anything the table ever issued are rejected too.
     pub fn settle_modes(
         &mut self,
         session_id: u64,
         seq: u64,
         result: ModeUpdateResult,
-    ) -> bool {
+        published: &[Mode],
+    ) -> SettleOutcome {
+        let issued = self.update_seq;
         let Some(m) = self.monitors.get_mut(&session_id) else {
-            return false;
+            return SettleOutcome::Stale;
         };
-        if m.pending_targets.as_ref().map(|p| p.seq) != Some(seq) {
-            return false;
+        // Older than (or equal to) something already settled, from an
+        // earlier incarnation of this session id, or never issued at all.
+        if seq <= m.settled_seq || seq > issued {
+            return SettleOutcome::Stale;
+        }
+        m.settled_seq = seq;
+        let is_current = m.pending_targets.as_ref().map(|p| p.seq) == Some(seq);
+        // A committing outcome carries the list the OS took. Empty cannot
+        // reach here — an empty selection is refused in `update_modes` and
+        // again in front of the DDI (IddCx.h:3594) — and is refused a third
+        // time rather than trusted, because this list is what every
+        // replug-from-`DeviceState` plugs with and a monitor with no
+        // targets is exactly what constraint 1 forbids.
+        let took = result.commits() && !published.is_empty();
+        if !is_current {
+            if took {
+                m.target_modes = published.to_vec();
+                // The published list moved, so a remembered refusal is
+                // about a question nobody is asking any more. Dropping it
+                // costs one push and can only ever allow one.
+                m.blocked = None;
+                return SettleOutcome::SupersededCommitted;
+            }
+            return SettleOutcome::Stale;
         }
         let pending = m.pending_targets.take().expect("matched above");
         match result {
             // Never empty: `update_modes` refuses an empty selection and
             // is the only producer of a pending list.
             ModeUpdateResult::Applied => {
-                m.target_modes = pending.targets;
+                if took {
+                    m.target_modes = published.to_vec();
+                }
                 // Whatever was blocked, this monitor's published list just
                 // changed under it; the remembered refusal describes a
                 // question nobody is asking any more.
@@ -713,7 +850,7 @@ impl SessionTable {
                 m.blocked = Some(BlockedPush { targets: pending.targets, superset_idx, token });
             }
         }
-        true
+        SettleOutcome::Settled
     }
 
     /// The target list a pending update is trying to publish, if any. Test
@@ -1091,7 +1228,7 @@ mod tests {
         assert_eq!(t.pending_targets(1).unwrap().len(), 1);
 
         // The push succeeded: NOW it is durable.
-        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied));
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied, &u.targets).settled());
         let m = t.get(1).unwrap();
         assert_eq!(m.target_modes.len(), 1);
         assert_eq!(m.target_modes[0].refresh_millihz, 120_000);
@@ -1109,7 +1246,7 @@ mod tests {
         // never be: publish the base rate again.
         let u = t.update_modes(1, &[BASE], CAPS, NO_COMMIT).unwrap();
         let seq = u.queued.expect("a real change");
-        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied));
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied, &u.targets).settled());
         assert_eq!(t.get(1).unwrap().target_modes, vec![t.get(1).unwrap().modes[0]]);
     }
 
@@ -1131,7 +1268,7 @@ mod tests {
         assert!(!u.refused, "what exists is still published");
         assert_eq!(u.targets.len(), 1);
         let seq = u.queued.unwrap();
-        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied));
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied, &u.targets).settled());
         let m = t.get(1).unwrap();
         assert_eq!(m.target_modes.len(), 1);
         assert!(m.modes.contains(&m.target_modes[0]), "targets ⊆ superset");
@@ -1166,7 +1303,7 @@ mod tests {
         // which is exactly why a deferral is as retryable as a failure.
         let first = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
         let seq = first.queued.expect("first request queues a push");
-        assert!(t.settle_modes(1, seq, ModeUpdateResult::NotApplied));
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::NotApplied, &first.targets).settled());
         assert_eq!(t.get(1).unwrap().target_modes, before, "targets unchanged, carry on");
         assert!(t.pending_targets(1).is_none(), "pending discarded");
         assert_eq!(
@@ -1183,22 +1320,26 @@ mod tests {
         assert_eq!(t.get(1).unwrap().target_modes, before, "still not in force");
 
         // ...and when that one lands, it lands.
-        assert!(t.settle_modes(1, retry_seq, ModeUpdateResult::Applied));
+        assert!(t.settle_modes(1, retry_seq, ModeUpdateResult::Applied, &retry.targets).settled());
         assert_eq!(t.get(1).unwrap().target_modes.len(), 1);
     }
 
     /// A settle can arrive late — after a newer update superseded it, or
-    /// after the session was destroyed and its id reused. Neither may
-    /// commit a list nobody is pushing.
+    /// after the session was destroyed and its id reused. A superseded push
+    /// that changed NOTHING records nothing (there is nothing to record,
+    /// and its sticky error would answer for a request that has been
+    /// replaced), and a settle belonging to a previous incarnation of the
+    /// session id must not reach its replacement at all.
     #[test]
-    fn a_stale_settle_commits_nothing() {
+    fn a_stale_settle_that_changed_nothing_commits_nothing() {
         let mut t = table();
         let mut r = superset_req(1);
         r.mode_count = 3;
         r.modes[2] = ModeSpec { width: 1280, height: 720, refresh_millihz: 60_000 };
         t.create(0, &r, CAPS, &adapters(), 0).unwrap();
 
-        let first = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap().queued.unwrap();
+        let first = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
+        let first_seq = first.queued.unwrap();
         // A second request SUPERSEDES the pending one (replace semantics):
         // the effects worker is serialized, so push #1 completes before
         // push #2 starts, and only the later settle decides the list.
@@ -1207,22 +1348,183 @@ mod tests {
         assert_eq!(second.targets.len(), 2);
         assert_eq!(t.pending_targets(1).unwrap().len(), 2, "the pending selection was replaced");
 
-        assert!(!t.settle_modes(1, first, ModeUpdateResult::Applied), "superseded");
+        // Push #1 failed or was deferred: it published nothing, so there is
+        // nothing for its superseded settle to record.
+        assert_eq!(
+            t.settle_modes(1, first_seq, ModeUpdateResult::NotApplied, &first.targets),
+            SettleOutcome::Stale,
+            "superseded, and it changed nothing"
+        );
         assert_eq!(t.get(1).unwrap().target_modes.len(), 3, "nothing committed yet");
-        assert!(t.settle_modes(1, second_seq, ModeUpdateResult::Applied));
+        assert_eq!(t.get(1).unwrap().last_error, 0, "and no sticky error for a live request");
+        assert_eq!(t.pending_targets(1).unwrap().len(), 2, "#2 is still outstanding");
+        assert!(t.settle_modes(1, second_seq, ModeUpdateResult::Applied, &second.targets).settled());
         assert_eq!(t.get(1).unwrap().target_modes.len(), 2);
 
         // Destroy + recreate the same session id, then settle the dead
-        // update: the ids are table-wide and never reused, so it misses.
-        let third = t.update_modes(1, &[BASE], CAPS, NO_COMMIT).unwrap().queued.unwrap();
+        // update: ids are table-wide and never reused, and the replacement's
+        // high-water mark starts above every id the original could hold.
+        let third = t.update_modes(1, &[BASE], CAPS, NO_COMMIT).unwrap();
+        let third_seq = third.queued.unwrap();
         t.destroy(1).unwrap();
         t.create(0, &superset_req(1), CAPS, &adapters(), 0).unwrap();
-        assert!(!t.settle_modes(1, third, ModeUpdateResult::Applied));
+        assert_eq!(
+            t.settle_modes(1, third_seq, ModeUpdateResult::Applied, &third.targets),
+            SettleOutcome::Stale,
+            "a dead session's settle must not reach its replacement"
+        );
         assert_eq!(
             t.get(1).unwrap().target_modes.len(),
             2,
             "the replacement keeps its own published list"
         );
+    }
+
+    /// THE REGRESSION TEST for the unreachable rescind (review pass 3).
+    ///
+    /// The IOCTL holds the device lock only for its own dispatch, and the
+    /// effects worker calls `IddCxMonitorUpdateModes2` with NO lock held,
+    /// so a second request's whole dispatch fits inside push #1's DDI call.
+    /// Push #1 then returns SUCCESS with its `seq` already superseded.
+    ///
+    /// Build 17 called that "settled nothing", which threw away the one
+    /// fact only that settle knew: the OS had TAKEN push #1's list. When
+    /// push #2 then did not apply — a duck in flight, a torn-down adapter,
+    /// or an OS refusal whose rollback restores push #1's list — the
+    /// durable list still held the PRE-UPDATE selection. The host was told
+    /// to retry (sticky `UPDATE_FAILED`), and its retry for that selection
+    /// matched the durable list exactly, so it short-circuited as "already
+    /// published": no effect, `queued: None`, `pending: false` — the shape
+    /// `UpdateModesReply::fully_in_force()` is true for — while the monitor
+    /// was offering something else entirely. Nothing resynced it.
+    #[test]
+    fn a_superseded_push_the_os_accepted_still_records_what_the_os_took() {
+        let mut t = table();
+        t.create(0, &superset_req(1), CAPS, &adapters(), 0).unwrap();
+        let full = t.get(1).unwrap().target_modes.clone();
+        assert_eq!(full.len(), 2, "both rates published to begin with");
+
+        // Request #1 gates down to the doubled rate. The effects worker
+        // picks it up and calls the OS.
+        let first = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
+        let first_seq = first.queued.expect("a real change queues a push");
+
+        // Request #2 lands INSIDE push #1's DDI call and supersedes it.
+        let second = t.update_modes(1, &[BASE], CAPS, NO_COMMIT).unwrap();
+        let second_seq = second.queued.expect("a different list queues its own push");
+
+        // Push #1 returns STATUS_SUCCESS: the OS is now holding {DOUBLED}.
+        assert_eq!(
+            t.settle_modes(1, first_seq, ModeUpdateResult::Applied, &first.targets),
+            SettleOutcome::SupersededCommitted,
+            "the push was superseded but the OS took its list"
+        );
+        assert_eq!(
+            t.get(1).unwrap().target_modes,
+            first.targets,
+            "the durable list has to say what the OS is holding"
+        );
+        assert_eq!(
+            t.pending_targets(1).map(<[Mode]>::to_vec),
+            Some(second.targets.clone()),
+            "and #2 is still outstanding — a superseded settle decides nothing for it"
+        );
+
+        // Push #2 does NOT apply: a duck in flight, the adapter torn down,
+        // or an OS refusal whose rollback puts push #1's list back. Either
+        // way what the OS holds is still push #1's.
+        assert!(t
+            .settle_modes(1, second_seq, ModeUpdateResult::NotApplied, &second.targets)
+            .settled());
+        assert_eq!(t.get(1).unwrap().target_modes, first.targets, "still what the OS holds");
+        assert_eq!(t.get(1).unwrap().last_error, luminal_driver_proto::err::UPDATE_FAILED);
+
+        // THE CONSEQUENCE. The host does what the sticky error told it to:
+        // it re-asks for the WIDER list (the rescind). Before the fix this
+        // matched the stale durable list, short-circuited, emitted no
+        // effect, and reported the shape that reads as fully-in-force —
+        // permanently, because nothing else could ever move the durable
+        // list back into agreement.
+        let rescind = t.update_modes(1, &[BASE, DOUBLED], CAPS, NO_COMMIT).unwrap();
+        assert!(
+            rescind.queued.is_some(),
+            "the rescind must re-push: the OS is holding a narrower list"
+        );
+        assert!(rescind.pending, "so the reply cannot claim it is already in force");
+        assert_eq!(rescind.targets, full);
+        assert_eq!(rescind.blocked, None);
+        assert!(!rescind.refused);
+    }
+
+    /// The hazard created by honouring superseded settles at all: a settle
+    /// that arrives out of order must never put an OLDER list back over a
+    /// newer push that already took.
+    ///
+    /// The effects worker serializes pushes, so the shell cannot produce
+    /// this — but the ordering rule is what makes that a property of the
+    /// contract rather than of one caller's threading, and it is the same
+    /// rule that stops a destroyed session's settle reaching its
+    /// replacement.
+    #[test]
+    fn a_stale_settle_never_clobbers_a_newer_successful_push() {
+        let mut t = table();
+        t.create(0, &superset_req(1), CAPS, &adapters(), 0).unwrap();
+
+        let first = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
+        let first_seq = first.queued.unwrap();
+        let second = t.update_modes(1, &[BASE], CAPS, NO_COMMIT).unwrap();
+        let second_seq = second.queued.unwrap();
+        assert!(second_seq > first_seq);
+
+        // The NEWER push lands first and takes.
+        assert!(t.settle_modes(1, second_seq, ModeUpdateResult::Applied, &second.targets).settled());
+        assert_eq!(t.get(1).unwrap().target_modes, second.targets);
+
+        // The older one turns up afterwards, also successful. It must not
+        // be believed: whatever the OS took from it has already been
+        // replaced by what it took from the newer push.
+        assert_eq!(
+            t.settle_modes(1, first_seq, ModeUpdateResult::Applied, &first.targets),
+            SettleOutcome::Stale,
+            "an older settle decides nothing once a newer one has spoken"
+        );
+        assert_eq!(
+            t.get(1).unwrap().target_modes,
+            second.targets,
+            "the newer push's list stands"
+        );
+
+        // The same settle replayed is equally inert, in both directions.
+        assert_eq!(
+            t.settle_modes(1, second_seq, ModeUpdateResult::NotApplied, &second.targets),
+            SettleOutcome::Stale,
+            "a settle is honoured once"
+        );
+        assert_eq!(t.get(1).unwrap().target_modes, second.targets);
+        assert_eq!(t.get(1).unwrap().last_error, 0, "and cannot invent a sticky failure");
+
+        // An id the table never issued decides nothing either.
+        assert_eq!(
+            t.settle_modes(1, second_seq + 100, ModeUpdateResult::Applied, &first.targets),
+            SettleOutcome::Stale
+        );
+        assert_eq!(t.get(1).unwrap().target_modes, second.targets);
+    }
+
+    /// Constraint 1, at the last line of defence: the durable list is what
+    /// every replug-from-`DeviceState` plugs with, so no settle may leave a
+    /// monitor with no targets — not even one reporting a push of an empty
+    /// list, which two earlier gates already make unreachable.
+    #[test]
+    fn a_settle_can_never_empty_the_published_list() {
+        let mut t = table();
+        t.create(0, &superset_req(1), CAPS, &adapters(), 0).unwrap();
+        let before = t.get(1).unwrap().target_modes.clone();
+        let u = t.update_modes(1, &[DOUBLED], CAPS, NO_COMMIT).unwrap();
+        let seq = u.queued.unwrap();
+        assert!(t.settle_modes(1, seq, ModeUpdateResult::Applied, &[]).settled());
+        assert_eq!(t.get(1).unwrap().target_modes, before, "unchanged, never emptied");
+        assert!(!t.get(1).unwrap().target_modes.is_empty());
     }
 
     #[test]

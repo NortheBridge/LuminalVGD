@@ -1351,7 +1351,7 @@ mod tests {
         assert_eq!(d.table.get(0xD4).unwrap().target_modes.len(), 2);
 
         // The shell reports the push succeeded — NOW it is durable.
-        assert!(d.table.settle_modes(0xD4, seq, ModeUpdateResult::Applied));
+        assert!(d.table.settle_modes(0xD4, seq, ModeUpdateResult::Applied, &targets).settled());
         let m = d.table.get(0xD4).unwrap();
         assert_eq!(m.target_modes.len(), 1);
         assert_eq!(m.modes.len(), 2, "the monitor description never moved");
@@ -1370,8 +1370,8 @@ mod tests {
         // is what this opcode moves.
         let (reply, effects) = do_update(&mut d, &mut h, &update_req(0xD4, &[BASE_120, FG_240]));
         assert_eq!(reply.mode_count, 2);
-        let (seq, _) = queued_update(&effects).expect("a real change, so a real push");
-        assert!(d.table.settle_modes(0xD4, seq, ModeUpdateResult::Applied));
+        let (seq, targets) = queued_update(&effects).expect("a real change, so a real push");
+        assert!(d.table.settle_modes(0xD4, seq, ModeUpdateResult::Applied, &targets).settled());
         assert_eq!(d.table.get(0xD4).unwrap().target_modes.len(), 2);
     }
 
@@ -1401,7 +1401,7 @@ mod tests {
         assert!(!reply.fully_in_force());
         let (seq, targets) = queued_update(&effects).expect("what exists is still published");
         assert_eq!(targets, vec![Mode::validate(2560, 1440, 240_000, 8, 0, CAPS).unwrap()]);
-        assert!(d.table.settle_modes(0x5A, seq, ModeUpdateResult::Applied));
+        assert!(d.table.settle_modes(0x5A, seq, ModeUpdateResult::Applied, &targets).settled());
         let published = d.table.get(0x5A).unwrap().target_modes.clone();
         assert_eq!(published.len(), 1);
 
@@ -1484,11 +1484,11 @@ mod tests {
 
         let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[FG_240]));
         assert!(reply.is_pending());
-        let (seq, _) = queued_update(&effects).expect("first request queues a push");
+        let (seq, targets) = queued_update(&effects).expect("first request queues a push");
 
         // The OS refused it (monitors::update_modes rolled the runtime
         // list back and settles NotApplied).
-        assert!(d.table.settle_modes(7, seq, ModeUpdateResult::NotApplied));
+        assert!(d.table.settle_modes(7, seq, ModeUpdateResult::NotApplied, &targets).settled());
         assert_eq!(
             d.table.get(7).unwrap().target_modes.len(),
             2,
@@ -1515,7 +1515,10 @@ mod tests {
         assert_eq!(d.table.get(7).unwrap().target_modes.len(), 2, "still not in force");
 
         // Second time lucky.
-        assert!(d.table.settle_modes(7, retry_seq, ModeUpdateResult::Applied));
+        assert!(d
+            .table
+            .settle_modes(7, retry_seq, ModeUpdateResult::Applied, &retry_targets)
+            .settled());
         assert_eq!(d.table.get(7).unwrap().target_modes.len(), 1);
         let (reply, effects) = do_update(&mut d, &mut h, &update_req(7, &[FG_240]));
         assert!(effects.is_empty());
@@ -1540,10 +1543,10 @@ mod tests {
 
         let (reply, effects) = do_update(&mut d, &mut h, &update_req(8, &[FG_240]));
         assert!(reply.is_pending());
-        let (seq, _) = queued_update(&effects).expect("first request queues a push");
+        let (seq, targets) = queued_update(&effects).expect("first request queues a push");
 
         // Deferred: stored nowhere, pushed nowhere, retryable.
-        assert!(d.table.settle_modes(8, seq, ModeUpdateResult::NotApplied));
+        assert!(d.table.settle_modes(8, seq, ModeUpdateResult::NotApplied, &targets).settled());
         assert_eq!(
             d.table.get(8).unwrap().target_modes,
             before,
@@ -1552,11 +1555,14 @@ mod tests {
         assert_eq!(d.table.get(8).unwrap().last_error, err::UPDATE_FAILED);
 
         let (reply, effects) = do_update(&mut d, &mut h, &update_req(8, &[FG_240]));
-        let (retry_seq, _) =
+        let (retry_seq, retry_targets) =
             queued_update(&effects).expect("a retry after a deferral must re-push");
         assert_ne!(retry_seq, seq);
         assert!(reply.is_pending() && !reply.fully_in_force());
-        assert!(d.table.settle_modes(8, retry_seq, ModeUpdateResult::Applied));
+        assert!(d
+            .table
+            .settle_modes(8, retry_seq, ModeUpdateResult::Applied, &retry_targets)
+            .settled());
         assert_eq!(d.table.get(8).unwrap().target_modes.len(), 1);
     }
 
@@ -1611,7 +1617,7 @@ mod tests {
             count: 1,
         };
         assert!(!outcome.retryable());
-        assert!(d.table.settle_modes(0xC0, seq, outcome.settle_result()));
+        assert!(d.table.settle_modes(0xC0, seq, outcome.settle_result(), &targets).settled());
 
         // Constraint 1: the PUSH was refused, never the session. The
         // published list is untouched and the sticky code is the distinct
@@ -1646,15 +1652,18 @@ mod tests {
         assert!(!reply.is_blocked() && reply.worth_retrying());
         let (seq, targets) = queued_update(&effects).expect("a different subset really pushes");
         assert_eq!(live_gate(&superset, &targets, Some(committed)), LiveGate::Push);
-        assert!(d.table.settle_modes(0xC0, seq, ModeUpdateResult::Applied));
+        assert!(d.table.settle_modes(0xC0, seq, ModeUpdateResult::Applied, &targets).settled());
         assert_eq!(d.table.get(0xC0).unwrap().target_modes.len(), 1);
     }
 
     /// While a push is outstanding, a second request replaces the PENDING
     /// selection rather than the in-force one, and every reply keeps
     /// saying PENDING until something actually lands. The effects worker
-    /// is serialized, so push #1 completes before push #2 starts and only
-    /// the later settle decides what is published.
+    /// is serialized, so push #1 completes before push #2 starts, and the
+    /// newer update is the one that decides what is FINALLY published —
+    /// but a superseded push the OS ACCEPTED still records what the OS took
+    /// on its way past, or the durable list under-reports the monitor until
+    /// something else happens to move it.
     #[test]
     fn a_second_request_while_a_push_is_outstanding_supersedes_and_stays_pending() {
         let mut d = dev();
@@ -1663,7 +1672,7 @@ mod tests {
         do_create(&mut d, &mut h, &superset_req(12));
 
         let (_, first) = do_update(&mut d, &mut h, &update_req(12, &[FG_240]));
-        let (first_seq, _) = queued_update(&first).unwrap();
+        let (first_seq, first_targets) = queued_update(&first).unwrap();
         let (reply, second) = do_update(&mut d, &mut h, &update_req(12, &[BASE_120]));
         let (second_seq, second_targets) = queued_update(&second).unwrap();
         assert_eq!(second_targets.len(), 1);
@@ -1671,16 +1680,79 @@ mod tests {
         assert!(reply.is_pending());
         assert_eq!(d.table.pending_targets(12).unwrap().len(), 1);
 
-        // The superseded push settles nothing; the newer one decides.
-        assert!(!d.table.settle_modes(12, first_seq, ModeUpdateResult::Applied));
-        assert_eq!(d.table.get(12).unwrap().target_modes.len(), 2, "nothing committed yet");
-        assert!(d.table.settle_modes(12, second_seq, ModeUpdateResult::Applied));
+        // The superseded push does not DECIDE — the pending selection is
+        // still #2's — but the OS took its list, so the durable list has to
+        // say so.
+        let outcome =
+            d.table.settle_modes(12, first_seq, ModeUpdateResult::Applied, &first_targets);
+        assert!(!outcome.settled(), "it decided nothing for the outstanding update");
+        assert!(outcome.recorded(), "but it recorded what the OS took");
+        assert_eq!(d.table.get(12).unwrap().target_modes, first_targets);
+        assert_eq!(d.table.pending_targets(12).unwrap().len(), 1, "#2 still outstanding");
+
+        // And the newer one still has the last word.
+        assert!(d
+            .table
+            .settle_modes(12, second_seq, ModeUpdateResult::Applied, &second_targets)
+            .settled());
         assert_eq!(d.table.get(12).unwrap().target_modes, second_targets);
 
         // Resending the list now in force is a no-op that reads as such.
         let (reply, effects) = do_update(&mut d, &mut h, &update_req(12, &[BASE_120]));
         assert!(effects.is_empty());
         assert!(reply.fully_in_force());
+    }
+
+    /// THE REGRESSION TEST for the unreachable rescind, at the wire.
+    ///
+    /// The interleaving is real, not theoretical: `dispatch` holds the
+    /// device lock only for its own duration, while the effects worker
+    /// calls `IddCxMonitorUpdateModes2` with no lock held — so request #2's
+    /// whole dispatch fits inside push #1's DDI call.
+    ///
+    /// Against the pre-fix code this fails on the LAST four assertions, and
+    /// it fails in the two places a host can actually see: the rescind
+    /// emits no `Effect::UpdateModes`, and its reply says
+    /// `fully_in_force()` — "everything you asked for is offered right
+    /// now" — for a list the OS is not holding. That reply is the predicate
+    /// DESIGN.md tells hosts to gate client capability on.
+    #[test]
+    fn a_rescind_after_a_superseded_success_still_reaches_the_os() {
+        let mut d = dev();
+        let mut h = HandleCtx::default();
+        shake(&mut d, &mut h);
+        do_create(&mut d, &mut h, &superset_req(0x11));
+        assert_eq!(d.table.get(0x11).unwrap().target_modes.len(), 2, "both rates, initially");
+
+        // #1 gates down to the framegen rate; the effects worker is inside
+        // IddCxMonitorUpdateModes2 with no lock held.
+        let (_, first) = do_update(&mut d, &mut h, &update_req(0x11, &[FG_240]));
+        let (first_seq, first_targets) = queued_update(&first).expect("#1 queues a push");
+
+        // #2's whole dispatch lands inside that call.
+        let (_, second) = do_update(&mut d, &mut h, &update_req(0x11, &[BASE_120]));
+        let (second_seq, second_targets) = queued_update(&second).expect("#2 queues a push");
+
+        // #1 returns STATUS_SUCCESS. Superseded — but the OS holds {240}.
+        d.table.settle_modes(0x11, first_seq, ModeUpdateResult::Applied, &first_targets);
+        // #2 does not apply: a duck in flight, a torn-down adapter, or an
+        // OS refusal whose rollback restores #1's list. `UPDATE_FAILED` is
+        // the sticky code, i.e. the host is told to retry.
+        d.table.settle_modes(0x11, second_seq, ModeUpdateResult::NotApplied, &second_targets);
+        assert_eq!(d.table.get(0x11).unwrap().last_error, err::UPDATE_FAILED);
+
+        // THE CONSEQUENCE: the host rescinds back to the full list.
+        let (reply, effects) = do_update(&mut d, &mut h, &update_req(0x11, &[BASE_120, FG_240]));
+        assert_eq!(reply.result, err::OK);
+        assert_eq!(reply.mode_count, 2);
+        let (_, rescind_targets) =
+            queued_update(&effects).expect("the rescind must reach the OS, not short-circuit");
+        assert_eq!(rescind_targets.len(), 2);
+        assert!(reply.is_pending(), "it is queued, not in force");
+        assert!(
+            !reply.fully_in_force(),
+            "and must never claim in-force for a list the OS is not holding"
+        );
     }
 
     /// Constraint 1: every refusal is a REPLY code with the published
