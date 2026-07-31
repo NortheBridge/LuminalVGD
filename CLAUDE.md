@@ -1372,6 +1372,95 @@ misdiagnosed. One MAJOR, and it is about what the HOST can see.
   create-list index N"), so the run that gates out the committed rate is
   self-explaining rather than a silent no-op to be read out of ETW.
 
+#### Third review pass (2026-07-31, build 17 still UNSIGNED — the last defect before signing)
+
+Eight findings raised, six refuted, two fixed. One MAJOR, and it is the
+same hole as the parked-patch split brain in its third guise: **a push
+that CHANGED a published list committed nothing.**
+
+- **A SUPERSEDED-BUT-SUCCESSFUL push made the RESCIND permanently
+  unreachable, and reported `fully_in_force()` for a mode the monitor was
+  not offering.** The interleaving is real and was reproduced against this
+  branch's own core: the IOCTL holds the device lock only for `dispatch()`
+  (control.rs), and the effects worker calls `IddCxMonitorUpdateModes2`
+  with NO lock held, so request #2's whole dispatch lands inside push #1's
+  DDI call. Push #1 publishes the runtime list and returns Applied on
+  STATUS_SUCCESS — but `settle_modes` rejected it as stale, because the
+  pending seq was now #2's, so `Monitor.target_modes` never learned what
+  the OS took. Push #2 then settles NotApplied without publishing (the
+  `tdr_duck_pending` arm, the NO_ADAPTER arm, or an OS refusal whose
+  `restore_targets` puts push #1's list back — note the last one needs no
+  TDR at all). Sticky `err::UPDATE_FAILED` tells the host to retry; its
+  retry for the WIDER list now equals the stale `target_base()`, so
+  `update_modes` short-circuits it as "already published": queued `None`,
+  no effect, `result == OK`, no PENDING/PARTIAL flag ⇒
+  `UpdateModesReply::fully_in_force()` TRUE while the OS and
+  `MonitorRt.target_modes` hold the narrower list. Nothing resyncs it —
+  `replug_ducked` and `duck_selected` both carry the RUNTIME list, so a
+  duck/requalify/deadline cycle preserves the divergence and only a full
+  replug-from-`DeviceState` heals it. **The doc at `settle_modes` named
+  this interleaving and bounded its cost at "the durable subset lags what
+  the OS holds until the next request" — but the next request is the
+  rescind, which is exactly what the short-circuit swallows. The stated
+  bound was not a bound; it is gone.**
+
+  Fix, confined to the portable core (`session.rs` / the shell's one call
+  site): the settle now carries the LIST the push put in front of the OS,
+  not just the outcome, because a superseded push cannot read its own
+  selection back out of `pending_targets`. A superseded settle whose
+  outcome COMMITS writes `Monitor.target_modes` from it and reports
+  `SettleOutcome::SupersededCommitted`; the newer update is untouched
+  (pending kept, sticky error unwritten) and still decides on its own
+  settle. A superseded settle that changed nothing still records nothing.
+  `ModeUpdateResult::commits()` is the core's half of
+  `PushOutcome::commits()`, so the two layers cannot drift.
+- **…and the guard that keeps that from becoming its own bug.** Honouring
+  superseded settles means the pending selection is no longer proof of
+  either ownership or ordering, so both are explicit now:
+  `Monitor.settled_seq`, a per-monitor high-water mark that STARTS at the
+  table-wide `update_seq` standing at CREATE time. A settle is honoured
+  only if strictly greater, which rejects (a) a re-ordered older settle
+  putting an older list back over a newer push that already took, and (b)
+  a destroyed session's settle reaching a replacement that reused its id —
+  which the `pending_targets.seq == seq` check used to do by accident.
+  Ids the table never issued are rejected too, and a committing settle
+  refuses an empty list a third time (constraint 1: never a monitor with
+  no targets).
+- **MINOR — the `CommittedPaths` writer token had a loser window of its
+  own.** `end_write` asked "was anyone turned away?" and the guard's drop
+  released the token one statement later. A writer arriving between them
+  was refused by a token nobody would look at again: its update was
+  dropped, the record was left STALE (fail-CLOSED — a superseded committed
+  mode is what makes `live_gate` refuse a push that should have gone
+  through, contradicting the type's own "can only ever allow a push"
+  invariant), and the `contended` flag it set survived with no holder to
+  honour it, so the clear landed on the NEXT commit — a complete,
+  uncontended one — instead. Token and flag are now ONE atomic word and
+  the check is PART of the release (`WriteToken::drop` → `release()`,
+  bounded CAS retry), so a writer is always turned away by a holder still
+  in a position to clear. `begin_write` sets the flag with a CAS against
+  `WRITING` rather than an unconditional `fetch_or`, and retries (bounded)
+  when that CAS fails — which means the holder just released and the
+  commit can be recorded properly instead of dropped.
+- ETW: no renames, no new events. `UpdateModesSettleStale` gains
+  `committed` (0/1) — without it `SupersededCommitted` and a settle that
+  really decided nothing are the same line in a capture, which is the
+  distinction the whole fix is about. Still settle names before signing
+  (task #58's autologger).
+- Regression tests that fail against the pre-fix behaviour (verified by
+  reverting each fix and re-running):
+  `session::tests::a_superseded_push_the_os_accepted_still_records_what_
+  the_os_took` and `dispatch::tests::a_rescind_after_a_superseded_success_
+  still_reaches_the_os` (the wire: pre-fix the rescind emits no effect and
+  the reply says `fully_in_force()`),
+  `session::tests::a_stale_settle_never_clobbers_a_newer_successful_push`,
+  `session::tests::a_settle_can_never_empty_the_published_list`, and
+  `modepush::tests::a_writer_turned_away_after_the_release_check_is_still_
+  honoured` (pre-fix leaves the stale record standing).
+  `a_second_request_while_a_push_is_outstanding_supersedes_and_stays_pending`
+  and `a_stale_settle_that_changed_nothing_commits_nothing` were rewritten:
+  they asserted the old "a superseded settle commits nothing" contract.
+
 Host-side work remaining (LuminalShine, NOT done here): the pinned submodule
 `src/drivers/luminal-display` is at da0349b = build 15 / proto 0.4, so it cannot
 even see build 16 — any host work needs that pointer advanced first. Then the

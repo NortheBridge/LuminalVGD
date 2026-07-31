@@ -272,7 +272,17 @@ number of atomic stores; the reader (the effects worker, immediately
 before its DDI call) does a bounded seqlock-style read. The record is
 REPLACED on every commit — a monitor absent from the path set has nothing
 committed — and forgotten explicitly on departure, since an
-`IDDCX_MONITOR` handle can be reissued. Every path is traced
+`IDDCX_MONITOR` handle can be reissued. Two writers cannot interleave: the
+writer token and the "somebody was turned away" flag are ONE atomic word,
+and the flag is checked as PART of handing the token back, so a writer that
+loses is always turned away by a holder still in a position to act on it.
+The holder then CLEARS the record rather than serve a path set that may be
+missing a write — the fail-open direction, so losing that race can allow a
+push but never invent a refusal. (Two separate flags left a window between
+"was anyone turned away?" and the release itself: a writer arriving there
+had its update dropped, left the record STALE, and left a flag with no
+holder to honour it, which then erased the next complete commit instead.)
+Every path is traced
 (`CommitModes2Path`) with its committed mode whether active or not, which
 is what makes "which mode is this display running" answerable from a
 capture at all. The gate FAILS OPEN: a committed mode the monitor's
@@ -355,9 +365,45 @@ correctness argument:
   no effect, `OK`, and the gate stuck for the life of the session.
   `commits()` is now both the authorisation to write the parked spec and
   the settle decision, so the two halves cannot drift apart again.
-- A stale settle (superseded by a newer update, or its session destroyed)
-  commits nothing; the newer update's own settle decides, and both lists
-  are non-empty subsets of the same frozen superset, so either is safe.
+- **A SUPERSEDED push still reports what the OS took.** `dispatch` holds
+  the device lock only for its own duration and the effects worker calls
+  `IddCxMonitorUpdateModes2` with no lock held, so request #2's entire
+  dispatch can land inside push #1's DDI call — at which point push #1
+  returns success with its `update_seq` no longer outstanding. A settle in
+  that position is not current, but it is the only thing that knows the OS
+  accepted its list, so when its outcome COMMITS it writes
+  `Monitor.target_modes` anyway (`SettleOutcome::SupersededCommitted`).
+  The newer update is untouched: its pending selection stays, its sticky
+  error stays unwritten, and it still decides on its own settle. A
+  superseded settle whose push changed nothing records nothing.
+
+  Build 17 called every superseded settle "commits nothing", and bounded
+  the cost at "the durable subset lags what the OS holds until the next
+  request". That bound did not hold, because the next request is the
+  RESCIND and `update_modes` short-circuits a request matching the durable
+  list: after a superseded-but-successful push #1 and a push #2 that did
+  not apply (a duck in flight, a torn-down adapter, or an OS refusal whose
+  rollback restores push #1's list), the host was told to retry, its retry
+  matched the stale durable list, and it was answered "already published"
+  — no effect, `result == OK`, no PENDING flag, i.e.
+  `UpdateModesReply::fully_in_force()` TRUE for a list the monitor was not
+  offering. Nothing resynced it: `replug_ducked` and `duck_selected` both
+  carry the RUNTIME list, so a duck/requalify cycle preserved the
+  divergence and only a full replug from `DeviceState` healed it. The
+  rescind was unreachable for the life of the session. This was the same
+  hole as the parked-patch split brain, in its third guise: a push that
+  changed a published list committed nothing.
+- **A settle is honoured only if it is NEWER than every settle already
+  honoured** (`Monitor.settled_seq`, a per-monitor high-water mark that
+  starts at the table-wide counter's value at CREATE time). That is what
+  keeps the rule above from becoming its own bug — a re-ordered older
+  settle can never put an older list back over a newer push that already
+  took — and it is also what stops a destroyed session's settle reaching a
+  replacement that reused its id, which the pending-selection check used to
+  do by accident. A settle for a session that is gone, for an id below the
+  mark, or for an id the table never issued decides nothing; either way
+  both lists are non-empty subsets of the same frozen superset, so whichever
+  is in force is fully activatable.
 
 Committing at IOCTL time instead — as build 17 first shipped — made the
 durable state assert a publish the OS had refused, and turned the
