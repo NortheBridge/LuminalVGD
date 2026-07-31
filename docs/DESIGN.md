@@ -240,9 +240,23 @@ property rather than a convenience:
   disturbing. `EvtIddCxAdapterCommitModes2` records the committed path per
   monitor (below), and a push that would gate the committed mode out is
   refused at `modepush::stage::GATES_COMMITTED`. A refused PUSH is not a
-  refused session: the published list stays in force, the monitor and the
-  stream carry on, and the sticky `err::UPDATE_FAILED` tells the host to
-  re-ask. A host that wants the display on a DIFFERENT mode performs the
+  refused session: the published list stays in force, and the monitor and
+  the stream carry on.
+
+  **This refusal is PERMANENT while that mode stays committed — retrying
+  cannot clear it, and the wire says so.** `result` and the sticky
+  `MonitorStatus.last_error` are `err::MODE_COMMITTED` (-14), distinct from
+  the *retryable* `err::UPDATE_FAILED` (-13); `reserved[2]` carries
+  `update_status::BLOCKED`, read as `reply.is_blocked()` /
+  `reply.worth_retrying()`; and `reserved[5]` carries the blocking mode's
+  index into the monitor's `CREATE_MONITOR` list (`blocking_mode_idx()`,
+  sentinel `NO_MODE_INDEX`) so the host can name the mode rather than guess.
+  Because the push is asynchronous only a LATER request can be told, so the
+  refusal is remembered in `Monitor.blocked` and a request resolving to the
+  same list is answered from it with no effect emitted; it expires on any
+  change to `modepush::committed_token()` or any different selection.
+
+  A host that wants the display on a DIFFERENT mode performs the
   modeset itself (`SetDisplayConfig` — what the display helper already
   drives for topology) and gates afterwards, at which point the committed
   mode is one it is keeping.
@@ -317,6 +331,17 @@ correctness argument:
   copy keeps the pre-update list, and the monitor's sticky last error
   becomes `err::UPDATE_FAILED`. The **next identical request therefore
   selects, queues and pushes for real** — a retry is a retry, not a no-op.
+- A push REFUSED because it would gate out the OS-committed mode settles
+  `ModeUpdateResult::Blocked` — the third outcome, distinct from both of
+  the above. Nothing is published and nothing changes, but unlike
+  `NotApplied` the refusal is NOT retryable: it holds for as long as that
+  mode stays committed. It is remembered in `Monitor.blocked` and a later
+  request resolving to the same selection is answered from that memory with
+  no effect emitted, carrying `err::MODE_COMMITTED` and
+  `update_status::BLOCKED`. The memory expires on any change to
+  `modepush::committed_token()` or any different selection — expiring early
+  costs one push, expiring late would refuse a request that had become
+  legal.
 - A push landing on a TDR-PARKED session patches the parked spec — there
   is no monitor object to call, and the re-arrival is that monitor's only
   publication mechanism — and therefore COMMITS
@@ -346,8 +371,13 @@ every requested mode the monitor really has and counts the rest
 a flags word in `UpdateModesReply.reserved` — the struct may never grow,
 both sides length-check it — where `update_status::PARTIAL` means "some
 requested modes are not in the monitor's create-time list and can never be
-offered" and `update_status::PENDING` means "queued at the OS, not in
-force yet". Partial is success with detail: everything that exists is
+offered", `update_status::PENDING` means "queued at the OS, not in
+force yet", and `update_status::BLOCKED` means "refused because the
+selection would gate out the mode the OS has committed — permanent while
+that mode stays committed, so do NOT retry" (paired with
+`result == err::MODE_COMMITTED` and, in `reserved[5]`, the blocking mode's
+index into the create-time list; see the committed-path section above).
+Partial is success with detail: everything that exists is
 published and the session is never failed (constraint 1). `result == OK`
 with neither flag set is the only shape that means "everything you asked
 for is offered right now" (`UpdateModesReply::fully_in_force`).
