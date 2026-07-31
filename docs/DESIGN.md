@@ -220,13 +220,51 @@ property rather than a convenience:
   `err::BAD_MODE`, changing nothing. A refused REQUEST is never a failed
   session.
 - The monitor-mode list is untouched, so `modes[0]` stays the EDID's
-  preferred detailed timing and `PreferredMonitorModeIdx = 0` keeps its
-  meaning for the life of the monitor. Every monitor mode is reported
-  `IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR`, which is now simply true.
+  preferred detailed timing for the life of the monitor. Every monitor
+  mode is reported `IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR`, which is
+  now simply true. **`PreferredMonitorModeIdx` is not a constant 0,
+  though**: Windows offers the INTERSECTION of the two lists, so once a
+  gate excludes `modes[0]` an index of 0 names a mode the OS cannot
+  activate — its default choice unreachable, with nothing in a trace
+  saying why. The parse DDIs report the first monitor mode that is
+  actually being offered (`modepush::preferred_monitor_mode_idx`,
+  computed against what was written into the OS's buffer), and it rides
+  `ParseDescription2` as `preferred`.
 - Gating is REVERSIBLE — a later request republishes the wider subset —
-  which an append-only merge structurally could not express. The OS may
-  re-select when the committed mode stops being offered; that is what
-  asking for gating means.
+  which an append-only merge structurally could not express.
+- **`UPDATE_MODES` steers what the OS MAY select; it never evicts what the
+  OS HAS selected.** Publishing a subset without the committed mode forces
+  Windows to re-select on what, under
+  `virtual_display_layout=exclusive`, is the only active display — a
+  modeset in the middle of the stream this feature exists to avoid
+  disturbing. `EvtIddCxAdapterCommitModes2` records the committed path per
+  monitor (below), and a push that would gate the committed mode out is
+  refused at `modepush::stage::GATES_COMMITTED`. A refused PUSH is not a
+  refused session: the published list stays in force, the monitor and the
+  stream carry on, and the sticky `err::UPDATE_FAILED` tells the host to
+  re-ask. A host that wants the display on a DIFFERENT mode performs the
+  modeset itself (`SetDisplayConfig` — what the display helper already
+  drives for topology) and gates afterwards, at which point the committed
+  mode is one it is keeping.
+
+**The committed path.** `EvtIddCxAdapterCommitModes2` is handed the
+complete `IDDCX_PATH2` set for the adapter; build 17 first read only
+`PathCount` and threw the rest away, which is why the driver could
+neither detect nor trace the case above. The ACTIVE paths are now captured
+into `modepush::CommittedPaths`, a lock-free fixed-slot record keyed by
+`IDDCX_MONITOR`: the writer is a CALLBACK FRAME inside a modeset
+transaction, so it takes no lock, allocates nothing, and does a bounded
+number of atomic stores; the reader (the effects worker, immediately
+before its DDI call) does a bounded seqlock-style read. The record is
+REPLACED on every commit — a monitor absent from the path set has nothing
+committed — and forgotten explicitly on departure, since an
+`IDDCX_MONITOR` handle can be reissued. Every path is traced
+(`CommitModes2Path`) with its committed mode whether active or not, which
+is what makes "which mode is this display running" answerable from a
+capture at all. The gate FAILS OPEN: a committed mode the monitor's
+superset does not describe cannot be reasoned about, so the push proceeds
+exactly as it did before and the trace says so — a gate that fired on an
+unrecognised commit would silently turn the feature off.
 
 Application rules (DESIGN.md §3.3): the IOCTL only validates and selects,
 then queues an `Effect::UpdateModes`; the OS call happens on the effects
@@ -242,6 +280,22 @@ monitor's sticky `GET_STATUS` last error plus an ETW event carrying stage
 and status. `Reason` is `IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS`
 (IddCx.h:327).
 
+A final device exit runs on a WDF power callback, CONCURRENTLY with the
+effects worker, and destroys the adapter's monitor objects — so a push
+must never straddle one. Checking `Shell::adapter()` before the DDI call
+(build 17) left the whole interval to the call unguarded. The two sides
+now handshake: the push marks itself in flight, fences, and reads handle
+and epoch in ONE acquisition (read apart, a `clear_adapter` between them
+returns a live handle with the epoch that already invalidated it);
+`EvtDeviceD0Exit(D3Final)` clears the adapter, fences, and then drains
+in-flight pushes on a 500 ms deadline inside the multi-second worker drain
+it already performs. With SeqCst fences on both sides at least one side
+observes the other, so either the push sees the cleared adapter and never
+calls, or the teardown waits for the push. The epoch is re-checked once
+more after the new list is published and before the call; that path
+restores the runtime list and defers
+(`modepush::stage::ADAPTER_TORN_DOWN`).
+
 **Commit ordering — nothing is committed until the OS takes it.** There
 are three copies of the published list (the session table's durable one,
 the shell's runtime one, and a TDR-parked spec) and the reply is written
@@ -253,14 +307,29 @@ correctness argument:
   carries the selection plus a table-wide monotonic `update_seq`.
 - `monitors::update_modes` (effects worker) is the only caller of
   `IddCxMonitorUpdateModes2` and owes the table exactly one
-  `settle_modes(session_id, update_seq, …)`. `Applied` — and only
-  `Applied` — commits `Monitor.target_modes`.
+  `settle_modes(session_id, update_seq, …)`. The outcome→settle mapping is
+  `modepush::PushOutcome::settle_result`, and there is exactly one of it:
+  **anything that CHANGED a published list commits; anything that changed
+  nothing does not.**
 - A push that FAILED (the OS refused; the runtime list is rolled back) or
-  was DEFERRED (a TDR duck in flight, the adapter torn down, the session
-  parked) settles `NotApplied`: the pending selection is discarded, every
+  was DEFERRED (a TDR duck in flight, the adapter torn down under a
+  D3Final) settles `NotApplied`: the pending selection is discarded, every
   copy keeps the pre-update list, and the monitor's sticky last error
   becomes `err::UPDATE_FAILED`. The **next identical request therefore
   selects, queues and pushes for real** — a retry is a retry, not a no-op.
+- A push landing on a TDR-PARKED session patches the parked spec — there
+  is no monitor object to call, and the re-arrival is that monitor's only
+  publication mechanism — and therefore COMMITS
+  (`PushOutcome::AppliedParked`, a separate variant only so the
+  replace-vs-append measurement on `UpdateModesApplied` is not polluted by
+  a call-less application). Build 17 patched the spec and settled
+  `NotApplied`, which is a permanent split brain: the re-arrived monitor
+  published the new subset while the durable list kept the old one, and
+  since `update_modes` short-circuits a request matching the durable list,
+  the host's RESCIND was answered "already published, nothing to do" —
+  no effect, `OK`, and the gate stuck for the life of the session.
+  `commits()` is now both the authorisation to write the parked spec and
+  the settle decision, so the two halves cannot drift apart again.
 - A stale settle (superseded by a newer update, or its session destroyed)
   commits nothing; the newer update's own settle decides, and both lists
   are non-empty subsets of the same frozen superset, so either is safe.

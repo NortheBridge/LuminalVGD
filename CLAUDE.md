@@ -933,6 +933,13 @@ ground where the 13/14/15 field checklists are still pending.
 > "REPLACE-TARGET-MODES" heading supersedes the additive-merge design that
 > the rest of this section originally described; the historical text is
 > kept only where it still documents a live rule. Read the new part first.
+>
+> **AMENDED 2026-07-31 (review pass, `f04cb2a`/`c0daafb`).** Five findings
+> fixed; the two that changed the DESIGN are called out under
+> "Review-pass corrections" at the end of this section. If you are about to
+> reason about the parked-spec patch, about what the OS has committed, or
+> about `PreferredMonitorModeIdx`, read that first — three of the bullets
+> below are now historical on those points.
 
 Branched from `feat/duck-the-device-build16` @ 7a3f696, so build 16 rides
 along. **Which of a monitor's create-time modes it offers can now change
@@ -1032,11 +1039,14 @@ CAN_PROCESS_FP16 rule above. Index 34 is the only legal entry.)
   is gone; `Mode::select_targets` replaced it. The reasoning was applied to
   the wrong list: appending to what the code called "the monitor's modes"
   could never enlarge the frozen description, so it bought nothing the OS
-  would honour. The *concern* it addressed survives and is now explicit —
+  would honour. ~~The *concern* it addressed survives and is now explicit —
   the driver still cannot identify the committed mode
   (`evt_commit_modes2` stores nothing), so gating a rate the OS has
-  committed will make it re-select. That is now a deliberate, host-requested
-  effect rather than something the design forbids.
+  committed will make it re-select. That is now a deliberate,
+  host-requested effect rather than something the design forbids.~~
+  **SUPERSEDED 2026-07-31** — the driver DOES identify the committed mode
+  now, and refuses the push instead of re-selecting. See "Review-pass
+  corrections" below.
 - ~~**Appended modes are `ORIGIN_DRIVER`**~~ — SUPERSEDED, along with
   `MonitorRt.static_mode_count`. Nothing is ever appended to the monitor
   list, so every monitor mode really does come from the EDID that created
@@ -1103,8 +1113,11 @@ CAN_PROCESS_FP16 rule above. Index 34 is the only legal entry.)
   pending discarded, every copy keeps the pre-update list, sticky
   `err::UPDATE_FAILED`, and the next identical request genuinely re-pushes.
   Rules that fall out and must not be re-broken: a deferral is NOT an
-  application (the parked-spec patch is best-effort and still settles
-  NotApplied — a retry re-selects to the same list, so they converge); a
+  application (~~the parked-spec patch is best-effort and still settles
+  NotApplied — a retry re-selects to the same list, so they converge~~ —
+  **SUPERSEDED 2026-07-31**: the parked-spec patch COMMITS, because it
+  changes what the re-arrived monitor publishes; a deferral is now
+  strictly "nothing was changed anywhere". See "Review-pass corrections"); a
   request arriving while a push is outstanding replaces the PENDING
   selection, never the live one (replace semantics: last intent wins, and
   the effects worker is serialized so push #1 finishes before push #2
@@ -1178,6 +1191,79 @@ BOTH rates, then publish only the doubled one. Look for
 devnode-change follows. Still undocumented and still not to be asserted
 either way in code or docs until measured: the devnode-change question, and
 replace-vs-append (safe either way — see the invariant above).
+
+#### Review-pass corrections (2026-07-31, build 17 still UNSIGNED)
+
+Five review findings, all verified against the code before being fixed.
+The decisions moved into `crate::modepush` — portable, unit-tested,
+below the shell line for exactly the reason `crate::tdr` is:
+`shell::monitors::push_targets` needs the eWDK, a live adapter and an
+arrived monitor, so it can never be tested, and every decision it made
+inline was therefore untested. Both MAJOR fixes have a test that fails
+against the pre-fix behaviour
+(`modepush::tests::a_parked_patch_commits_durably_so_a_rescind_still_re_pushes`,
+`modepush::tests::a_push_that_would_evict_the_committed_mode_is_refused`).
+
+- **A TDR-parked patch is an APPLICATION, not a deferral** (supersedes
+  "the parked-spec patch is best-effort and still settles NotApplied"
+  above). `push_targets` patched `DuckedMonitor.target_modes` — so the
+  monitor the replug re-arrived published the new subset — and returned
+  `Deferred`, so `Monitor.target_modes` kept the old one. Because
+  `SessionTable::update_modes` short-circuits a request matching the
+  durable list ("already published", no effect, `OK`), the RESCIND
+  direction was unreachable for the life of the session: the host asked
+  for the wider list back, was told yes, and kept streaming to a gated
+  monitor. `PushOutcome::commits()` is now both the authorisation to write
+  the parked spec and the settle decision, so the halves cannot drift
+  apart; `AppliedParked` is a separate variant from `Applied` only so a
+  call-less application does not pollute `UpdateModesApplied(modes,
+  superset)`, which is the replace-vs-append measurement. This also closed
+  the MINOR "patched runtime, never committed durably" — same defect,
+  other side.
+- **The committed path is captured, and a push never gates it out**
+  (supersedes "the driver still cannot identify the committed mode … that
+  is now a deliberate, host-requested effect"). `evt_commit_modes2`
+  discarded `IDDCX_PATH2`; it now records the ACTIVE paths into
+  `modepush::CommittedPaths` (lock-free fixed slots, atomic stores, no
+  allocation — it is a modeset CALLBACK FRAME) and traces every path with
+  its mode (`CommitModes2Path`). **`UPDATE_MODES` steers what the OS MAY
+  select; it never evicts what the OS HAS selected**: under
+  `virtual_display_layout=exclusive` that would force a modeset on the
+  only active display, mid-stream, which is the one thing this feature
+  must not cause. Such a push is refused (`GATES_COMMITTED`) — the PUSH
+  only, never the session. A host that wants a different ACTIVE mode does
+  the modeset itself (`SetDisplayConfig`, which the display helper already
+  drives) and gates afterwards. FAILS OPEN by design: a committed mode the
+  superset does not describe cannot be reasoned about, so the push
+  proceeds as before and the trace says so — otherwise one decoding
+  mismatch would silently disable the whole feature.
+- **D3Final can no longer tear the adapter down under a live push.** It
+  runs on a power callback concurrently with the effects worker; checking
+  `adapter()` before the call left the whole interval to the DDI
+  unguarded. Handshake: the push marks in-flight → fence → reads handle
+  and epoch in ONE acquisition (`Shell::adapter_with_epoch`); `evt_d0_exit`
+  clears the adapter → fence → drains in-flight pushes on a 500 ms
+  deadline (`UpdateModesDrainTimeout`) inside the worker drain it already
+  performs. SeqCst fences both sides ⇒ at least one sees the other. The
+  epoch is re-checked after publishing and before the call
+  (`ADAPTER_TORN_DOWN`: restore the runtime list, defer).
+- **`PreferredMonitorModeIdx` follows the published subset.** It was a
+  constant 0 while a gate could exclude `monitor_modes[0]`, naming a mode
+  outside the intersection Windows offers. Now the first monitor mode
+  actually offered, computed against what was written into the OS's
+  buffer, and traced as `preferred` on `ParseDescription2`.
+- New ETW (settle before signing, task #58's autologger keys on these):
+  `CommitModes2Path(monitor,flags,active,width,height,refresh_mhz)`,
+  `CommitModes2` + `active`/`skipped`/`generation`, `UpdateModesParked`,
+  `UpdateModesGatesCommitted(stage,modes,committed_w,committed_h,
+  committed_mhz,active_paths)`, `UpdateModesAdapterTornDown`,
+  `UpdateModesDrainTimeout`, `ParseDescription2` + `preferred`. New
+  stages: `GATES_COMMITTED = 10`, `ADAPTER_TORN_DOWN = 11`.
+- Add to the traced-install measurement: with both rates created and 120
+  committed, `vgd-probe --target-mode 2560x1440@240` must now be REFUSED
+  with `UpdateModesGatesCommitted` rather than forcing a modeset — so
+  measure replace-vs-append by gating out the rate the OS is NOT running
+  (create three rates, or commit the one you intend to keep first).
 
 Host-side work remaining (LuminalShine, NOT done here): the pinned submodule
 `src/drivers/luminal-display` is at da0349b = build 15 / proto 0.4, so it cannot
