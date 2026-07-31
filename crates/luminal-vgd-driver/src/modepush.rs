@@ -34,7 +34,7 @@
 //!    `err::MODE_COMMITTED`), so the host can pick a different subset
 //!    rather than guess.
 
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
 use luminal_vgd_core::modes::Mode;
 use luminal_vgd_core::session::ModeUpdateResult;
@@ -336,6 +336,17 @@ const READ_RETRIES: u32 = 4;
 ///    holder then clears everything rather than publishing a maybe-mixture.
 ///    Clearing is the fail-open direction, so the worst case of losing this
 ///    race is a push that goes through exactly as it did in build 16.
+///
+///    **The token and the contention flag are ONE atomic word**
+///    (`state`), and the check is part of the release rather
+///    than a step before it. Two separate flags left a window between "was
+///    anybody turned away?" and "the token is free" (the guard's drop, one
+///    statement later): a writer arriving inside it was turned away by a
+///    token nobody would look at again, so its update was dropped AND the
+///    record was left stale, AND the flag it set survived to erase the next
+///    commit — a complete, uncontended one — instead. One word makes those
+///    two events mutually exclusive: either the writer is turned away and
+///    the holder is still there to clear, or it takes the token and writes.
 pub struct CommittedPaths {
     slots: [CommittedSlot; MAX_COMMITTED_PATHS],
     /// Active paths in the last commit, which MAY exceed the number of
@@ -349,13 +360,41 @@ pub struct CommittedPaths {
     /// [`committed_token`] — a remembered refusal is only evidence while
     /// this has not moved.
     generation: AtomicU64,
-    /// Writer token: true while a writer owns the array.
-    writing: AtomicBool,
-    /// A writer arrived while the token was held and dropped its update.
-    /// The token holder clears the record on its way out rather than leave
-    /// a state that may be a mixture of two path sets.
-    contended: AtomicBool,
+    /// Writer token and contention flag in ONE word — [`WRITING`] and
+    /// [`CONTENDED`].
+    ///
+    /// One word rather than two booleans because the release has to answer
+    /// "did anyone lose while I held this?" and hand the token back in a
+    /// single atomic step. As two flags the answer was read first and the
+    /// token released afterwards, and a writer arriving between them was
+    /// turned away for nothing: its update dropped, the record left stale,
+    /// and a `contended` flag left set with no holder to honour it — so the
+    /// NEXT commit, complete and uncontended, was the one that got erased.
+    state: AtomicU32,
 }
+
+/// [`CommittedPaths::state`]: nobody holds the writer token.
+const FREE: u32 = 0;
+/// [`CommittedPaths::state`]: a writer owns the array.
+const WRITING: u32 = 1 << 0;
+/// [`CommittedPaths::state`]: a writer was turned away while the token was
+/// held, so its update was dropped and the record may be missing a write.
+/// The HOLDER honours this on release by clearing the record — the
+/// fail-open direction.
+const CONTENDED: u32 = 1 << 1;
+
+/// Bounded attempts to take the writer token. A retry exists only for the
+/// case worth retrying: the holder released between our failed acquire and
+/// our attempt to flag it, which means the token is free RIGHT NOW and one
+/// more try records the commit properly instead of dropping it. Bounded
+/// because [`CommittedPaths::apply`] runs on a modeset callback frame.
+const ACQUIRE_ATTEMPTS: u32 = 4;
+
+/// Bounded attempts to release the writer token. Each retry means another
+/// writer was turned away while we were clearing; the record is cleared
+/// again and the token re-offered. On exhaustion the token is handed back
+/// unconditionally with the record CLEARED, which is the fail-open state.
+const RELEASE_ATTEMPTS: u32 = 4;
 
 struct CommittedSlot {
     /// Seqlock version: even = stable, odd = a write in progress. Read by
@@ -444,13 +483,19 @@ impl Default for CommittedPaths {
     }
 }
 
-/// The writer token of a [`CommittedPaths`], released on drop so every
-/// return path (and any future `?`) puts it back.
+/// The writer token of a [`CommittedPaths`].
+///
+/// The release — including honouring anyone turned away while it was
+/// held — happens in `Drop`, and ONLY there. That is the fix for the
+/// window this type used to open: the contention check and the release
+/// were two separate stores with the guard's drop in between, so a writer
+/// arriving between them was refused by a token nobody would look at
+/// again, and the flag it set outlived the write it described.
 struct WriteToken<'a>(&'a CommittedPaths);
 
 impl Drop for WriteToken<'_> {
     fn drop(&mut self) {
-        self.0.writing.store(false, Ordering::Release);
+        self.0.release();
     }
 }
 
@@ -460,8 +505,7 @@ impl CommittedPaths {
             slots: [const { CommittedSlot::new() }; MAX_COMMITTED_PATHS],
             active: AtomicU32::new(0),
             generation: AtomicU64::new(0),
-            writing: AtomicBool::new(false),
-            contended: AtomicBool::new(false),
+            state: AtomicU32::new(FREE),
         }
     }
 
@@ -472,35 +516,103 @@ impl CommittedPaths {
     /// loses simply does not write — its update is dropped, and the flag it
     /// leaves makes the winner clear the record instead of publishing
     /// something that might be half of each.
+    ///
+    /// The flag is set with a CAS against `WRITING`, not an unconditional
+    /// `fetch_or`, so it can only ever be attached to a holder that is
+    /// still there to honour it. When that CAS fails the holder has just
+    /// released, which means the token is free and one more attempt records
+    /// this commit properly — so the loop retries rather than dropping a
+    /// write it could have made. Bounded ([`ACQUIRE_ATTEMPTS`]): on
+    /// exhaustion the flag is set unconditionally, which costs the next
+    /// writer its record but keeps the guarantee that losing this race can
+    /// only ever CLEAR the record — never leave a stale one behind.
     fn begin_write(&self) -> Option<WriteToken<'_>> {
-        if self
-            .writing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            self.contended.store(true, Ordering::Release);
-            // Bump anyway: the record is now known to be unreliable, and
-            // the generation is what expires cached refusals built on it.
-            self.generation.fetch_add(1, Ordering::AcqRel);
-            return None;
+        for _ in 0..ACQUIRE_ATTEMPTS {
+            // Sets a bit that is already set when someone holds the token,
+            // so the failure case is a no-op rather than a state change.
+            let prev = self.state.fetch_or(WRITING, Ordering::AcqRel);
+            if prev & WRITING == 0 {
+                return Some(WriteToken(self));
+            }
+            if self
+                .state
+                .compare_exchange(
+                    WRITING,
+                    WRITING | CONTENDED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // Bump: the record is now known to be losing a write, and
+                // the generation is what expires cached refusals built on
+                // it.
+                self.generation.fetch_add(1, Ordering::AcqRel);
+                return None;
+            }
+            // Either the holder released between the two atomics (retry
+            // takes the token) or CONTENDED was already set by someone else
+            // (the clear is already arranged, and a retry may still win the
+            // token from the holder's release).
         }
-        Some(WriteToken(self))
+        self.state.fetch_or(CONTENDED, Ordering::AcqRel);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        None
     }
 
-    /// Finish a write: if anyone was turned away while we held the token,
-    /// clear the whole record rather than serve a path set that may be a
-    /// mixture. Returns the number of paths still recorded.
+    /// What this write will be worth once the token goes back: `recorded`,
+    /// or 0 if a writer has already been turned away and the record is
+    /// therefore going to be cleared.
+    ///
+    /// It does NOT release — [`WriteToken::drop`] does, and it re-reads the
+    /// flag there. This is a REPORT (it feeds the `CommitModes2` counts),
+    /// not a promise: a writer turned away in the instant after this
+    /// returns still causes the clear, and `get`/`active` are the authority
+    /// on what the record holds.
     fn end_write(&self, recorded: u32) -> u32 {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        if self.contended.swap(false, Ordering::AcqRel) {
+        if self.state.load(Ordering::Acquire) & CONTENDED != 0 {
+            0
+        } else {
+            recorded
+        }
+    }
+
+    /// Hand the writer token back, honouring anyone turned away while it
+    /// was held.
+    ///
+    /// The check and the release are ONE compare-exchange, which is the
+    /// whole point: there is no instant in which the token is held by a
+    /// writer that has stopped listening, so a `CONTENDED` flag can never
+    /// outlive the write it describes and erase the next one instead.
+    ///
+    /// A writer WAS turned away ⇒ the record may be missing that write, so
+    /// it is cleared. Clearing is the fail-open direction — "nothing
+    /// committed" is the pre-gate behaviour — so losing this race can
+    /// allow a push, never invent a refusal.
+    fn release(&self) {
+        for _ in 0..RELEASE_ATTEMPTS {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            if self
+                .state
+                .compare_exchange(WRITING, FREE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+            // Take the flag down but KEEP the token, so the clear below
+            // cannot interleave with a new writer's publish.
+            self.state.fetch_and(!CONTENDED, Ordering::AcqRel);
             for slot in &self.slots {
                 slot.clear();
             }
             self.active.store(0, Ordering::Release);
-            self.generation.fetch_add(1, Ordering::AcqRel);
-            return 0;
         }
-        recorded
+        // Bounded, because this runs on a modeset callback frame. The
+        // record is cleared by the loop above, so handing the token back
+        // unconditionally costs at most one more dropped update and still
+        // leaves the fail-open state.
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.state.store(FREE, Ordering::Release);
     }
 
     /// Replace the whole record with the ACTIVE paths of one commit.
@@ -1214,6 +1326,73 @@ mod tests {
         // Recovery is the next commit, like every other clear.
         paths.apply(&[(0x11, b)], 1);
         assert_eq!(paths.get(0x11), Some(b));
+    }
+
+    /// THE REGRESSION TEST for the writer-token loser (review pass 3).
+    ///
+    /// The turned-away writer in the test above arrives while the holder is
+    /// still listening. This one arrives an instant later — AFTER the holder
+    /// has asked "was anyone turned away?" and BEFORE the token actually
+    /// goes back, which used to be two separate stores with a whole
+    /// statement between them. A writer landing in that window was refused
+    /// by a token nobody would look at again, and three things went wrong at
+    /// once:
+    ///
+    /// * its update was dropped, so
+    /// * the record was left STALE — holding a path set the OS had already
+    ///   replaced. That is the fail-CLOSED direction: a stale committed mode
+    ///   is what makes `live_gate` refuse a push that should have gone
+    ///   through, which is precisely the invariant the type's own doc
+    ///   promises ("losing this race can only ever allow a push, never
+    ///   invent a refusal"); and
+    /// * the flag it set survived with no holder left to honour it, so the
+    ///   clear landed on the NEXT commit instead — a complete, uncontended
+    ///   one, erased for a race it had nothing to do with.
+    ///
+    /// The token and the flag are one word now and the check is PART of the
+    /// release, so the window does not exist: whoever is turned away is
+    /// turned away by a holder that is still going to act on it.
+    #[test]
+    fn a_writer_turned_away_after_the_release_check_is_still_honoured() {
+        let paths = CommittedPaths::new();
+        let a = CommittedMode { width: 2560, height: 1440, refresh_millihz: BASE };
+        let b = CommittedMode { width: 3840, height: 2160, refresh_millihz: 60_000 };
+        let c = CommittedMode { width: 1920, height: 1080, refresh_millihz: DOUBLED };
+        paths.apply(&[(0x11, a)], 1);
+        assert_eq!(paths.get(0x11), Some(a));
+
+        // A holder enters, writes, and asks what its write will be worth
+        // with nobody yet waiting on it.
+        let token = paths.begin_write().expect("uncontended");
+        assert_eq!(paths.end_write(1), 1, "nobody had been turned away when it looked");
+
+        // THE WINDOW. A second commit arrives before the token goes back.
+        assert_eq!(paths.apply(&[(0x22, b)], 1), 0, "still held, so its update is dropped");
+
+        drop(token);
+
+        // Someone has to honour that. The holder is the only candidate, and
+        // it is still there, so the record is CLEARED — the fail-open state
+        // — rather than left asserting a path set that has been superseded.
+        assert_eq!(
+            paths.get(0x11),
+            None,
+            "a dropped commit must never leave a stale one standing"
+        );
+        assert_eq!(paths.get(0x22), None, "and the loser's paths never landed either");
+        assert_eq!(paths.active(), 0);
+
+        // ...and the flag does not outlive it: the NEXT commit is complete
+        // and uncontended, so it keeps its own record.
+        assert_eq!(paths.apply(&[(0x11, c)], 1), 1);
+        assert_eq!(paths.get(0x11), Some(c), "a stale flag must not erase a good commit");
+        assert_eq!(paths.active(), 1);
+
+        // The reader-facing invariant across the whole sequence: whatever
+        // `get` returns is a pairing some commit really made, or nothing.
+        // Both ways of getting that wrong — a mixture, or a superseded set
+        // left standing — reach `live_gate` as a phantom mode.
+        assert_eq!(paths.get(0x22), None);
     }
 
     /// A departed monitor's handle can be reissued to a different monitor
