@@ -38,13 +38,19 @@ CopyFiles=UMDriverCopy
 AddReg = LuminalVgd_HardwareSettings
 
 [LuminalVgd_HardwareSettings]
-; NOTE: no device-object Security SDDL here — IddCx exposes the OS-facing
-; display interfaces on this same device object, and the graphics stack
-; does not run elevated. The DESIGN.md §6 control-surface ACL is enforced
-; in the driver instead: control opens (interface reference string
-; "LuminalVGDControl") require SYSTEM or an elevated Administrator, and
-; IOCTLs are refused on any handle that did not pass that check
-; (shell/control.rs).
+; The display-class default device ACL is not stable across install/reboot:
+; on affected Windows 11 systems an elevated Administrator can open the
+; freshly rebound interface, but the cold-boot device object rejects the
+; same CreateFile with ERROR_ACCESS_DENIED before EvtDeviceFileCreate runs.
+;
+; Keep the OS-facing IddCx device openable by the unelevated graphics stack
+; (World: generic read/write), and explicitly grant SYSTEM/Administrators
+; full access. This is only the device-object OPEN gate. It does not grant
+; control-plane authority: every LuminalVGD IOCTL is FILE_ANY_ACCESS and
+; shell/control.rs independently impersonates that request's caller and
+; accepts only SYSTEM or an elevated Administrator. An unauthorized handle
+; can open the display device but every control IOCTL is refused.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
 ; IddCx requires the IndirectKmd upper filter on the devnode.
 HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
 ; Dedicated WUDF host pool: LuminalVGD never shares a WUDFHost process

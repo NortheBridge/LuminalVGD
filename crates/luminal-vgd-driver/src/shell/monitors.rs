@@ -53,6 +53,7 @@ pub fn plug(
     target_modes: Vec<Mode>,
     adapter_luid: u64,
     ring_slots: u32,
+    transport_flags: u32,
     edid: Box<[u8; 256]>,
 ) {
     let shell = Shell::get();
@@ -103,12 +104,13 @@ pub fn plug(
         }
         let monitor = out_args.MonitorObject;
 
-        // The ring section exists from plug time (state ACTIVE, no frames
-        // yet), before the monitor arrives. Plug runs on the effects
+        // The ring section exists from plug time (state REBUILDING, no
+        // frames yet), before the monitor arrives. It becomes ACTIVE only
+        // after the first copied/fenced slot is published. Plug runs on the effects
         // worker shortly after the CREATE_MONITOR reply completes; the
         // host's ring open already retries on its own timeout budget.
         let ring = std::sync::Arc::new(super::swapchain::RingHandle::new(
-            super::swapchain::FrameRing::new(session_id, ring_slots),
+            super::swapchain::FrameRing::new(session_id, ring_slots, transport_flags),
         ));
         // Every mode this monitor object is created with is
         // descriptor-origin: the EDID handed to IddCxMonitorCreate above

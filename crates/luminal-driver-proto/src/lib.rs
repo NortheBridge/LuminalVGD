@@ -46,7 +46,18 @@ pub const PROTO_VERSION_MAJOR: u16 = 0;
 /// IOCTL value, or error code moved, so a 0.3/0.4 host that never sends
 /// the new opcode is unaffected. Hosts detect the capability with the
 /// caps bit (see its docs) and fall back to the create-time mode list.
-pub const PROTO_VERSION_MINOR: u16 = 5;
+/// v0.6: Build 20's failed-swapchain retirement contract. A driver that
+/// reports this version explicitly deletes an unrecoverable IDDCX_SWAPCHAIN
+/// WDF object and accepts a fresh assignment without departing the monitor.
+/// No wire layout changes; the minor identifies stronger recovery semantics.
+/// v0.7: Build 21's explicitly-synchronised D3D12 transport. Hosts opt in
+/// per monitor with [`create_flags::D3D12_FENCE_TRANSPORT`] after checking
+/// [`caps::D3D12_FENCE_TRANSPORT`]. The existing named D3D11/keyed-mutex
+/// transport remains the default and its ABI is unchanged.
+/// v0.8: Build 22's first-frame admission contract. Ring state remains
+/// REBUILDING after SetDevice and becomes ACTIVE only after a copied,
+/// synchronized slot is published. No layout changes.
+pub const PROTO_VERSION_MINOR: u16 = 8;
 
 /// The minimum driver minor a host actually REQUIRES. Hosts that degrade
 /// gracefully when 0.4 fields are ignored (the nits value simply stays at
@@ -113,6 +124,10 @@ pub mod caps {
     /// something else. Repurposing a shipped ABI constant is how a
     /// capability check silently starts lying.
     pub const DYNAMIC_MODES: u32 = 1 << 9;
+    /// The driver can publish D3D12-openable named textures plus an
+    /// ID3D11Fence/ID3D12Fence-compatible shared timeline. This is opt-in per
+    /// monitor; older hosts continue receiving keyed-mutex textures.
+    pub const D3D12_FENCE_TRANSPORT: u32 = 1 << 10;
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +412,10 @@ pub mod create_flags {
     /// associate this monitor with any remembered display settings
     /// (libvirtualdisplay's ephemeral-identity behavior).
     pub const EPHEMERAL_IDENTITY: u32 = 1 << 1;
+    /// Request D3D12-openable ring textures and explicit timeline-fence
+    /// synchronisation instead of the legacy keyed-mutex texture contract.
+    /// Valid only when the driver advertises `caps::D3D12_FENCE_TRANSPORT`.
+    pub const D3D12_FENCE_TRANSPORT: u32 = 1 << 2;
 }
 
 /// One display mode. `modes[0]` is the preferred/native mode.
@@ -905,6 +924,9 @@ pub mod slot_flags {
     pub const HDR_METADATA_VALID: u32 = 1 << 0;
     /// The dirty-rect summary in this slot is valid (else assume full-frame).
     pub const DIRTY_RECTS_VALID: u32 = 1 << 1;
+    /// `SlotMetadata::ready_fence_value()` names the shared timeline value
+    /// that must be reached before the slot texture is safe to consume.
+    pub const READY_FENCE_VALID: u32 = 1 << 2;
 }
 
 /// Exact mirror of `DXGI_HDR_METADATA_HDR10` (CTA-861.3 static metadata):
@@ -953,6 +975,19 @@ pub struct SlotMetadata {
     /// Bounding box of all dirty rects (valid if `DIRTY_RECTS_VALID`).
     pub dirty_bound: RectU32,
     pub reserved: [u32; 2],
+}
+
+impl SlotMetadata {
+    /// Build 21 keeps the v1 slot layout stable by storing the additive
+    /// 64-bit producer-fence value in the two previously-reserved words.
+    pub fn ready_fence_value(&self) -> u64 {
+        (self.reserved[0] as u64) | ((self.reserved[1] as u64) << 32)
+    }
+
+    pub fn set_ready_fence_value(&mut self, value: u64) {
+        self.reserved[0] = value as u32;
+        self.reserved[1] = (value >> 32) as u32;
+    }
 }
 
 /// Header at offset 0 of the shared ring section. One writer (driver),
@@ -1169,6 +1204,36 @@ pub mod names {
         i = put(out, i, "-s");
         put_hex(out, i, slot as u64, 2)
     }
+
+    /// D3D12-openable slot texture. Kept distinct from the legacy keyed
+    /// texture so both transports can coexist during host upgrades.
+    pub fn slot_texture_d3d12_name(
+        session_id: u64,
+        generation: u32,
+        slot: u32,
+        out: &mut [u16; 96],
+    ) -> usize {
+        out.fill(0);
+        let mut i = put(out, 0, "Global\\LuminalVGD-tex12-");
+        i = put_hex(out, i, session_id, 16);
+        i = put(out, i, "-g");
+        i = put_hex(out, i, generation as u64, 8);
+        i = put(out, i, "-s");
+        put_hex(out, i, slot as u64, 2)
+    }
+
+    /// Producer timeline fence shared by every slot in one ring generation.
+    pub fn ring_fence_name(
+        session_id: u64,
+        generation: u32,
+        out: &mut [u16; 96],
+    ) -> usize {
+        out.fill(0);
+        let mut i = put(out, 0, "Global\\LuminalVGD-fence-");
+        i = put_hex(out, i, session_id, 16);
+        i = put(out, i, "-g");
+        put_hex(out, i, generation as u64, 8)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,7 +1388,7 @@ mod tests {
             3
         ));
         assert_eq!(PROTO_VERSION_MINOR_REQUIRED, 3, "the floor does NOT move with the minor");
-        assert_eq!(PROTO_VERSION_MINOR, 5);
+        assert_eq!(PROTO_VERSION_MINOR, 8);
     }
 
     /// The feature gate a host actually reads. Locked because a wrong bit
@@ -1517,6 +1582,24 @@ mod tests {
         );
         // NUL padding after the name.
         assert!(a[la..].iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn d3d12_transport_names_are_generation_scoped() {
+        let mut tex = [0u16; 96];
+        let mut fence = [0u16; 96];
+        names::slot_texture_d3d12_name(0xAB, 7, 2, &mut tex);
+        names::ring_fence_name(0xAB, 7, &mut fence);
+        assert_eq!(utf16_str(&tex), "Global\\LuminalVGD-tex12-00000000000000ab-g00000007-s02");
+        assert_eq!(utf16_str(&fence), "Global\\LuminalVGD-fence-00000000000000ab-g00000007");
+    }
+
+    #[test]
+    fn ready_fence_value_uses_reserved_slot_words_without_growing_abi() {
+        let mut slot: SlotMetadata = unsafe { core::mem::zeroed() };
+        slot.set_ready_fence_value(0x1122_3344_AABB_CCDD);
+        assert_eq!(slot.ready_fence_value(), 0x1122_3344_AABB_CCDD);
+        assert_eq!(core::mem::size_of::<SlotMetadata>(), 80);
     }
 
     #[test]

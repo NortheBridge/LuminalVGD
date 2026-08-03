@@ -116,6 +116,8 @@ pub enum Effect {
         targets: Vec<Mode>,
         adapter_luid: u64,
         ring_slots: u32,
+        /// Host-selected data-plane flags from `CreateMonitorRequest`.
+        transport_flags: u32,
         /// Boxed: keeps Effect variants near-uniform in size (effects
         /// travel by value through Vec<Effect>).
         edid: Box<[u8; 256]>,
@@ -279,6 +281,7 @@ fn plug_effect(m: &Monitor, ring_slots: u32) -> Effect {
         targets: m.target_modes.clone(),
         adapter_luid: m.adapter_luid,
         ring_slots,
+        transport_flags: m.flags,
         edid: Box::new(monitor_edid(m)),
     }
 }
@@ -899,13 +902,14 @@ mod tests {
 
         assert_eq!(effects.len(), 2, "plug + persist");
         match &effects[0] {
-            Effect::PlugMonitor { session_id, display_id, connector_index, modes, targets, adapter_luid, ring_slots, edid } => {
+            Effect::PlugMonitor { session_id, display_id, connector_index, modes, targets, adapter_luid, ring_slots, edid, transport_flags } => {
                 assert_eq!((*session_id, *display_id), (0xA1, 0xCAFE));
                 assert_eq!(*connector_index, 0);
                 assert_eq!(modes.len(), 1);
                 assert_eq!(targets, modes, "a fresh session publishes its whole superset");
                 assert_eq!(*adapter_luid, 0x20);
                 assert_eq!(*ring_slots, DEFAULT_RING_SLOTS);
+                assert_eq!(*transport_flags, 0);
                 let base: u32 = edid[..128].iter().map(|&b| u32::from(b)).sum();
                 let ext: u32 = edid[128..].iter().map(|&b| u32::from(b)).sum();
                 assert_eq!((base % 256, ext % 256), (0, 0), "both EDID blocks checksum");
@@ -1878,8 +1882,8 @@ mod tests {
             assert_eq!(r.status, Status::Ok);
             let reply: HandshakeReply = from_bytes(&out);
             assert_eq!(reply.driver_proto_minor, PROTO_VERSION_MINOR);
-            assert_eq!(reply.driver_proto_minor, 5);
-            assert!(h.handshaken, "0.{announced} host still handshakes against 0.5");
+            assert_eq!(reply.driver_proto_minor, 8);
+            assert!(h.handshaken, "0.{announced} host still handshakes against 0.8");
 
             // And its session IOCTLs still work.
             let (create, effects) = do_create(&mut d, &mut h, &create_req(3));

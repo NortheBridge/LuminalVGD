@@ -1452,6 +1452,7 @@ fn apply_now(effects: Vec<Effect>) {
                 targets,
                 adapter_luid,
                 ring_slots,
+                transport_flags,
                 edid,
             } => monitors::plug(
                 session_id,
@@ -1461,6 +1462,7 @@ fn apply_now(effects: Vec<Effect>) {
                 targets,
                 adapter_luid,
                 ring_slots,
+                transport_flags,
                 edid,
             ),
             Effect::UnplugMonitor { session_id } => monitors::unplug(session_id),
@@ -1761,7 +1763,9 @@ pub unsafe extern "C" fn evt_file_create(
     // Which name is this open using? Interface opens through our control
     // symlink carry the reference string; the OS graphics stack's opens
     // of the same device object carry other (usually empty) names and
-    // must pass unhindered (phase-2 lesson: they run unelevated).
+    // must pass unhindered (phase-2 lesson: they run unelevated). The INF's
+    // device-object SDDL deliberately permits those opens; authorization of
+    // FILE_ANY_ACCESS control IOCTLs remains exclusively here.
     let name_ptr = call_unsafe_wdf_function_binding!(WdfFileObjectGetFileName, file_object);
     let name: &[u16] = if name_ptr.is_null() {
         &[]
@@ -1787,57 +1791,29 @@ pub unsafe extern "C" fn evt_file_create(
         return;
     }
 
-    // Control-plane open: DESIGN.md §6 — SYSTEM or elevated Administrators
-    // only. Refused callers fail the open (fail closed). When the token
-    // CANNOT be evaluated (impersonation machinery, not policy), the open
-    // is allowed but UNAUTHORIZED: every IOCTL then re-runs the same check
-    // against its own caller, so a create-time evaluation quirk cannot
-    // permanently brick a legitimate SYSTEM caller — and an illegitimate
-    // one still cannot issue a single IOCTL.
-    match authorize_request(request) {
-        AuthOutcome::Authorized { how } => {
-            tracelogging::write_event!(
-                PROVIDER,
-                "ControlOpenAuthorized",
-                level(Informational),
-                u32("how", &how)
-            );
-            if let Some(shell) = Shell::try_get() {
-                shell.handles.lock().unwrap().insert(
-                    file_object as usize,
-                    HandleCtx { authorized: true, ..HandleCtx::default() },
-                );
-            }
-            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_SUCCESS);
-        }
-        AuthOutcome::Refused => {
-            tracelogging::write_event!(
-                PROVIDER,
-                "ControlOpenDenied",
-                level(Warning),
-                u32("stage", &STAGE_POLICY),
-                u32("code", &0u32)
-            );
-            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_ACCESS_DENIED);
-        }
-        AuthOutcome::Unavailable { stage, code } => {
-            tracelogging::write_event!(
-                PROVIDER,
-                "ControlOpenAuthUnavailable",
-                level(Warning),
-                u32("stage", &stage),
-                u32("code", &code)
-            );
-            if let Some(shell) = Shell::try_get() {
-                shell
-                    .handles
-                    .lock()
-                    .unwrap()
-                    .insert(file_object as usize, HandleCtx::default());
-            }
-            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_SUCCESS);
-        }
+    // Never make the security decision on EvtFileCreate. On some UMDF/IddCx
+    // stacks WdfRequestImpersonate succeeds for this request but exposes the
+    // WUDFHost identity rather than the client token. Treating that result as
+    // a policy refusal made CreateFileW fail with ERROR_ACCESS_DENIED for a
+    // genuinely elevated administrator (build 17 production regression).
+    //
+    // The handle starts unauthorized. evt_ioctl authorizes the caller on the
+    // first IOCTL request, caches a successful SYSTEM/admin result on this
+    // handle, and rejects every IOCTL when that check fails. Opening a handle
+    // therefore grants no control-plane capability by itself.
+    if let Some(shell) = Shell::try_get() {
+        shell
+            .handles
+            .lock()
+            .unwrap()
+            .insert(file_object as usize, HandleCtx::default());
     }
+    tracelogging::write_event!(
+        PROVIDER,
+        "ControlOpenDeferredAuthorization",
+        level(Informational)
+    );
+    call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_SUCCESS);
 }
 
 pub unsafe extern "C" fn evt_file_close(file_object: WDFFILEOBJECT) {

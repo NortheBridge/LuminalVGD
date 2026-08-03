@@ -21,7 +21,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree, HLOCAL};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    ID3D11Device, ID3D11Device5, ID3D11Fence, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_FENCE_FLAG_SHARED,
     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
@@ -108,7 +109,8 @@ impl Drop for RingSection {
 
 impl RingSection {
     /// Create + map `Global\LuminalVGD-ring-<session>` and initialize the
-    /// header (state ACTIVE, generation 1, fresh heartbeat).
+    /// header (state REBUILDING, generation 1, fresh heartbeat). ACTIVE is
+    /// published only after the first texture copy and slot publication.
     pub fn create(session_id: u64, slot_count: u32) -> windows::core::Result<Self> {
         let mut name = [0u16; 64];
         names::ring_section_name(session_id, &mut name);
@@ -149,7 +151,7 @@ impl RingSection {
             core::ptr::write_volatile(&mut (*h).driver_heartbeat_qpc, qpc_now());
             // State + magic last: an all-zero or magic-less section is the
             // documented "not initialized yet" signal for the host.
-            ring.state_atomic().store(ring_state::ACTIVE, Ordering::Release);
+            ring.state_atomic().store(ring_state::REBUILDING, Ordering::Release);
             core::ptr::write_volatile(&mut (*h).magic, RING_MAGIC);
         }
         Ok(ring)
@@ -227,15 +229,20 @@ impl RingSection {
         present_qpc: u64,
         frames_published: u64,
         frames_dropped: u64,
+        ready_fence_value: u64,
     ) {
         let slot = self.slot_ptr(index);
         unsafe {
             core::ptr::write_volatile(&mut (*slot).sequence, sequence);
             core::ptr::write_volatile(&mut (*slot).present_qpc, present_qpc);
-            core::ptr::write_volatile(&mut (*slot).flags, 0);
+            core::ptr::write_volatile(
+                &mut (*slot).flags,
+                if ready_fence_value != 0 { luminal_driver_proto::slot_flags::READY_FENCE_VALID } else { 0 },
+            );
             core::ptr::write_volatile(&mut (*slot).hdr, Hdr10StaticMetadata::default());
             core::ptr::write_volatile(&mut (*slot).dirty_count, 0);
             core::ptr::write_volatile(&mut (*slot).dirty_bound, RectU32::default());
+            (*slot).set_ready_fence_value(ready_fence_value);
             AtomicU32::from_ptr(&mut (*slot).state)
                 .store(luminal_driver_proto::slot_state::PUBLISHED, Ordering::Release);
 
@@ -279,9 +286,41 @@ impl RingSection {
 /// One named keyed-mutex shared texture (one ring slot's pixel storage).
 pub struct SharedTexture {
     pub texture: ID3D11Texture2D,
-    pub mutex: IDXGIKeyedMutex,
+    pub mutex: Option<IDXGIKeyedMutex>,
     /// The named NT handle keeps the name alive for the session.
     name_handle: HANDLE,
+}
+
+/// One generation-scoped producer timeline, shareable as ID3D12Fence by the
+/// LuminalShine native D3D12 encoder path.
+pub struct SharedFence {
+    pub fence: ID3D11Fence,
+    name_handle: HANDLE,
+}
+
+unsafe impl Send for SharedFence {}
+
+impl Drop for SharedFence {
+    fn drop(&mut self) {
+        unsafe { let _ = CloseHandle(self.name_handle); }
+    }
+}
+
+pub fn create_shared_fence(
+    device: &ID3D11Device,
+    session_id: u64,
+    generation: u32,
+) -> windows::core::Result<SharedFence> {
+    let device5: ID3D11Device5 = device.cast()?;
+    let mut fence: Option<ID3D11Fence> = None;
+    unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence)? };
+    let fence = fence.expect("CreateFence succeeded without a fence");
+    let mut name = [0u16; 96];
+    names::ring_fence_name(session_id, generation, &mut name);
+    let name_handle = with_ring_security(|sa| unsafe {
+        fence.CreateSharedHandle(Some(sa), 0x1000_0000, PCWSTR(name.as_ptr()))
+    })?;
+    Ok(SharedFence { fence, name_handle })
 }
 
 // SAFETY: COM pointers used from the single worker thread; the handle is
@@ -332,6 +371,7 @@ pub fn create_shared_textures(
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    d3d12_transport: bool,
 ) -> windows::core::Result<Vec<SharedTexture>> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
@@ -343,8 +383,11 @@ pub fn create_shared_textures(
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
-        MiscFlags: (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0
-            | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
+        MiscFlags: if d3d12_transport {
+            D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
+        } else {
+            (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32
+        },
     };
 
     let mut out = Vec::with_capacity(count as usize);
@@ -354,7 +397,11 @@ pub fn create_shared_textures(
         let texture = texture.expect("CreateTexture2D succeeded without a texture");
 
         let mut name = [0u16; 96];
-        names::slot_texture_name(session_id, generation, slot, &mut name);
+        if d3d12_transport {
+            names::slot_texture_d3d12_name(session_id, generation, slot, &mut name);
+        } else {
+            names::slot_texture_name(session_id, generation, slot, &mut name);
+        }
         let resource: IDXGIResource1 = texture.cast()?;
         let name_handle = with_ring_security(|sa| unsafe {
             resource.CreateSharedHandle(
@@ -363,7 +410,7 @@ pub fn create_shared_textures(
                 PCWSTR(name.as_ptr()),
             )
         })?;
-        let mutex: IDXGIKeyedMutex = texture.cast()?;
+        let mutex = if d3d12_transport { None } else { Some(texture.cast()?) };
         out.push(SharedTexture { texture, mutex, name_handle });
     }
     Ok(out)
