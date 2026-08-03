@@ -36,7 +36,12 @@ fn utf16_str(buf: &[u16]) -> String {
 fn print_status(s: &GetStatusReply) {
     println!(
         "  driver build {} proto {}.{} caps {:#06x} max_monitors {} watchdog {}s uptime {} ms",
-        s.driver_build, s.proto_major, s.proto_minor, s.caps, s.max_monitors, s.watchdog_secs,
+        s.driver_build,
+        s.proto_major,
+        s.proto_minor,
+        s.caps,
+        s.max_monitors,
+        s.watchdog_secs,
         s.uptime_ms
     );
     if s.monitor_count == 0 {
@@ -45,8 +50,14 @@ fn print_status(s: &GetStatusReply) {
     for m in &s.monitors[..s.monitor_count.min(s.monitors.len() as u32) as usize] {
         println!(
             "  session {:#x} display {:#x} connector {} {}x{}@{}mHz adapter {:#x} lease {} ms",
-            m.session_id, m.display_id, m.connector_index, m.width, m.height, m.refresh_millihz,
-            m.adapter_luid, m.lease_timeout_ms
+            m.session_id,
+            m.display_id,
+            m.connector_index,
+            m.width,
+            m.height,
+            m.refresh_millihz,
+            m.adapter_luid,
+            m.lease_timeout_ms
         );
     }
 }
@@ -67,6 +78,14 @@ struct Args {
     /// Watch the shared cursor section during the hold: print position/
     /// visibility changes and fetch each new shape (caps::HW_CURSOR).
     cursor: bool,
+    /// Request Build 21+'s D3D12-openable texture and explicit-fence
+    /// transport instead of the legacy keyed-mutex transport.
+    d3d12: bool,
+    /// Advertise an HDR monitor. `--bit-depth 10` maps to the protocol's
+    /// HDR10 depth when this flag is present.
+    hdr: bool,
+    /// User-facing bits per component (8, 10, or 12).
+    bit_depth: u32,
     /// `--target-mode WxH@HZ` (repeatable): the TARGET subset to publish
     /// partway through the hold via UPDATE_MODES (proto 0.5). Every entry
     /// must also be one of the create-time modes (the positional
@@ -89,9 +108,21 @@ struct Args {
 /// fallbacks. Also exercises the driver's MULTI_MODE path — the probe's
 /// production counterpart passes the client's exact modes instead.
 const DEFAULT_MODES: [ModeSpec; 3] = [
-    ModeSpec { width: 3840, height: 2160, refresh_millihz: 120_000 },
-    ModeSpec { width: 3840, height: 2160, refresh_millihz: 60_000 },
-    ModeSpec { width: 1920, height: 1080, refresh_millihz: 60_000 },
+    ModeSpec {
+        width: 3840,
+        height: 2160,
+        refresh_millihz: 120_000,
+    },
+    ModeSpec {
+        width: 3840,
+        height: 2160,
+        refresh_millihz: 60_000,
+    },
+    ModeSpec {
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60_000,
+    },
 ];
 
 fn parse_args() -> Result<Args, String> {
@@ -102,6 +133,9 @@ fn parse_args() -> Result<Args, String> {
         ephemeral: false,
         consume: false,
         cursor: false,
+        d3d12: false,
+        hdr: false,
+        bit_depth: 8,
         target_modes: Vec::new(),
         target_after_secs: 5,
     };
@@ -112,6 +146,17 @@ fn parse_args() -> Result<Args, String> {
             "--ephemeral" => args.ephemeral = true,
             "--consume" => args.consume = true,
             "--cursor" => args.cursor = true,
+            "--d3d12" => args.d3d12 = true,
+            "--hdr" => args.hdr = true,
+            "--bit-depth" => {
+                let v = it.next().ok_or("--bit-depth needs 8, 10, or 12")?;
+                args.bit_depth = v
+                    .parse()
+                    .map_err(|_| format!("bad --bit-depth value: {v}"))?;
+                if !matches!(args.bit_depth, 8 | 10 | 12) {
+                    return Err(format!("bad --bit-depth value: {v}"));
+                }
+            }
             "--hold" => {
                 let v = it.next().ok_or("--hold needs a value")?;
                 args.hold_secs = v.parse().map_err(|_| format!("bad --hold value: {v}"))?;
@@ -127,8 +172,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--target-after" | "--add-after" => {
                 let v = it.next().ok_or("--target-after needs a value")?;
-                args.target_after_secs =
-                    v.parse().map_err(|_| format!("bad --target-after value: {v}"))?;
+                args.target_after_secs = v
+                    .parse()
+                    .map_err(|_| format!("bad --target-after value: {v}"))?;
             }
             mode if mode.contains('x') => args.explicit_modes.push(parse_mode(mode)?),
             other => return Err(format!("unknown argument: {other}")),
@@ -140,7 +186,9 @@ fn parse_args() -> Result<Args, String> {
 /// `WxH` or `WxH@HZ` (HZ may be fractional, e.g. 59.94).
 fn parse_mode(mode: &str) -> Result<ModeSpec, String> {
     let (dims, hz) = mode.split_once('@').unwrap_or((mode, "60"));
-    let (w, h) = dims.split_once('x').ok_or_else(|| format!("bad mode: {mode}"))?;
+    let (w, h) = dims
+        .split_once('x')
+        .ok_or_else(|| format!("bad mode: {mode}"))?;
     let hz: f64 = hz.parse().map_err(|_| format!("bad refresh: {hz}"))?;
     Ok(ModeSpec {
         width: w.parse().map_err(|_| format!("bad width: {w}"))?,
@@ -156,6 +204,7 @@ fn main() -> ExitCode {
             eprintln!("vgd-probe: {e}");
             eprintln!(
                 "usage: vgd-probe [status] [WxH@HZ ...] [--hold SECS] [--ephemeral] [--consume] [--cursor]\n\
+                 \x20      [--d3d12] [--hdr] [--bit-depth 8|10|12]\n\
                  \x20      [--target-mode WxH@HZ ...] [--target-after SECS]\n\
                  \x20  --target-mode publishes a SUBSET of the create-time modes on the live\n\
                  \x20  monitor; every value must also appear as a positional WxH@HZ."
@@ -184,9 +233,18 @@ fn main() -> ExitCode {
     };
     println!(
         "  proto {}.{} build {} caps {:#06x} max_monitors {} watchdog {}s",
-        hs.driver_proto_major, hs.driver_proto_minor, hs.driver_build, hs.caps, hs.max_monitors,
+        hs.driver_proto_major,
+        hs.driver_proto_minor,
+        hs.driver_build,
+        hs.caps,
+        hs.max_monitors,
         hs.watchdog_secs
     );
+
+    if args.d3d12 && hs.caps & luminal_driver_proto::caps::D3D12_FENCE_TRANSPORT == 0 {
+        eprintln!("  driver does not advertise D3D12 fence transport");
+        return ExitCode::FAILURE;
+    }
 
     if args.status_only {
         println!("[3/6] GET_STATUS…");
@@ -225,15 +283,33 @@ fn main() -> ExitCode {
     for (i, c) in "LuminalVGD Probe".encode_utf16().enumerate() {
         friendly_name[i] = c;
     }
+    let bit_depth = match (args.hdr, args.bit_depth) {
+        (false, 8) => 8,
+        (false, 10) => 10,
+        (true, 10) => 110,
+        (true, 12) => 112,
+        _ => {
+            eprintln!("  invalid range/depth combination: HDR requires 10 or 12-bit; SDR supports 8 or 10-bit");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut flags = if args.ephemeral {
+        create_flags::EPHEMERAL_IDENTITY
+    } else {
+        0
+    };
+    if args.d3d12 {
+        flags |= create_flags::D3D12_FENCE_TRANSPORT;
+    }
     let req = CreateMonitorRequest {
         session_id,
         display_id: if args.ephemeral { 0 } else { PROBE_DISPLAY_ID },
         adapter_luid: 0,
         lease_timeout_ms: LEASE_TIMEOUT_USE_DEFAULT,
-        bit_depth: 8,
-        hdr: 0,
+        bit_depth,
+        hdr: u32::from(args.hdr),
         edid_serial: 0,
-        flags: if args.ephemeral { create_flags::EPHEMERAL_IDENTITY } else { 0 },
+        flags,
         mode_count: mode_list.len() as u32,
         modes,
         physical_width_mm: 0,
@@ -267,7 +343,10 @@ fn main() -> ExitCode {
     }
     match dev.query_lease(session_id) {
         Ok(l) if l.result == err::OK => {
-            println!("  lease: {} ms remaining, connector {}", l.remaining_ms, l.connector_index)
+            println!(
+                "  lease: {} ms remaining, connector {}",
+                l.remaining_ms, l.connector_index
+            )
         }
         Ok(l) => eprintln!("  QUERY_LEASE result {}", l.result),
         Err(e) => eprintln!("  QUERY_LEASE failed: {e}"),
@@ -323,9 +402,9 @@ fn main() -> ExitCode {
     // Move the pointer over the virtual display to exercise this: the OS
     // only routes cursor updates to the monitor the pointer is on.
     let watch_cursor = |last: &mut Option<luminal_vgd_host::device::CursorState>,
-                            moves: &mut u64,
-                            shapes: &mut u64,
-                            buf: &mut Vec<u8>| {
+                        moves: &mut u64,
+                        shapes: &mut u64,
+                        buf: &mut Vec<u8>| {
         let Some(view) = &cursor_view else { return };
         let state = view.state();
         let prev = last.replace(state);
@@ -401,10 +480,7 @@ fn main() -> ExitCode {
                         );
                         for i in 0..3u32 {
                             if let Some(m) = view.slot(i) {
-                                eprintln!(
-                                    "    slot {i}: state={} seq={}",
-                                    m.state, m.sequence
-                                );
+                                eprintln!("    slot {i}: state={} seq={}", m.state, m.sequence);
                             }
                         }
                         last_progress = std::time::Instant::now();
@@ -456,8 +532,12 @@ fn main() -> ExitCode {
             let mut modes = [ModeSpec::default(); MAX_MODES_PER_MONITOR as usize];
             // Sent verbatim, deliberately NOT unioned with the create
             // list: the whole point is to see a strict subset published.
-            let wanted: Vec<ModeSpec> =
-                args.target_modes.iter().copied().take(MAX_MODES_PER_MONITOR as usize).collect();
+            let wanted: Vec<ModeSpec> = args
+                .target_modes
+                .iter()
+                .copied()
+                .take(MAX_MODES_PER_MONITOR as usize)
+                .collect();
             modes[..wanted.len()].copy_from_slice(&wanted);
             let upd = UpdateModesRequest {
                 session_id,
@@ -468,7 +548,12 @@ fn main() -> ExitCode {
             };
             print!("  UPDATE_MODES ->");
             for m in &wanted {
-                print!(" {}x{}@{:.3}", m.width, m.height, m.refresh_millihz as f64 / 1000.0);
+                print!(
+                    " {}x{}@{:.3}",
+                    m.width,
+                    m.height,
+                    m.refresh_millihz as f64 / 1000.0
+                );
             }
             println!();
             match dev.update_modes(&upd) {
@@ -545,7 +630,11 @@ fn main() -> ExitCode {
                 _ => "UNINITIALIZED",
             };
             let fps = h.latest_sequence.saturating_sub(prev_seq);
-            let beating = if h.driver_heartbeat_qpc != prev_heartbeat { "beating" } else { "STALE" };
+            let beating = if h.driver_heartbeat_qpc != prev_heartbeat {
+                "beating"
+            } else {
+                "STALE"
+            };
             let consumed = if args.consume {
                 format!(" consumed {consumed_total}")
             } else {
@@ -581,7 +670,9 @@ fn main() -> ExitCode {
             if stalls_detected == 0 {
                 println!("  soak: {consumed_total} frames delivered monotonically, 0 stalls ✔");
             } else {
-                println!("  soak FAILED: {stalls_detected} ring stall(s) detected ✘ (autopsies above)");
+                println!(
+                    "  soak FAILED: {stalls_detected} ring stall(s) detected ✘ (autopsies above)"
+                );
             }
         }
     }

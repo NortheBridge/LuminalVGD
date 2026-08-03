@@ -18,8 +18,9 @@
 //! (host marking slots FREE) lands with the phase-5 consumer.
 
 use core::mem::zeroed;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,8 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 
 use super::bindings::{self, ffi};
 use super::ring::{
-    acquire_mutex, create_shared_fence, create_shared_textures, qpc_now, AcquireOutcome, RingSection, SharedFence, SharedTexture,
+    acquire_mutex, create_shared_fence, create_shared_textures, qpc_now, AcquireOutcome,
+    RingSection, SharedFence, SharedTexture,
 };
 use super::{OsHandle, Shell, PROVIDER};
 use luminal_driver_proto::{ring_state, KMTX_ACQUIRE_TIMEOUT_MS};
@@ -276,7 +278,10 @@ pub unsafe extern "C" fn evt_assign(
         // The assign's RenderAdapterLuid is the authoritative render
         // adapter for this monitor; the TDR recovery poller probes it.
         rt.adapter_luid = luid;
-        let old = rt.worker.replace(Worker { stop: stop.clone(), join: None });
+        let old = rt.worker.replace(Worker {
+            stop: stop.clone(),
+            join: None,
+        });
         (session_id, rt.ring.clone(), old)
     };
     if let Some(old) = old {
@@ -313,7 +318,11 @@ pub unsafe extern "C" fn evt_assign(
             level(Warning),
             u64("session", &session_id)
         );
-        Worker { stop, join: Some(join) }.stop();
+        Worker {
+            stop,
+            join: Some(join),
+        }
+        .stop();
     }
     // NOTE: nothing here may call back into IddCx. This callback is a
     // win32k callout; an IddCx call from inside it can deadlock against
@@ -383,6 +392,126 @@ fn create_device_on_luid(
     }
 }
 
+const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
+const DXGI_ERROR_DEVICE_REMOVED: i32 = 0x887A_0005u32 as i32;
+const DXGI_ERROR_DEVICE_HUNG: i32 = 0x887A_0006u32 as i32;
+const DXGI_ERROR_DEVICE_RESET: i32 = 0x887A_0007u32 as i32;
+const DEVICE_CREATE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
+static DEVICE_CREATION_GATES: OnceLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> = OnceLock::new();
+
+struct DeviceCreationLease(Arc<AtomicBool>);
+
+impl Drop for DeviceCreationLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn acquire_device_creation_lease(luid: u64, stop: &AtomicBool) -> Option<DeviceCreationLease> {
+    let gate = {
+        let gates = DEVICE_CREATION_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut gates = gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates
+            .entry(luid)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    };
+
+    while !stop.load(Ordering::SeqCst) {
+        if gate
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(DeviceCreationLease(gate));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+fn create_device_on_luid_with_retry(
+    session_id: u64,
+    luid: u64,
+    stop: &AtomicBool,
+) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext, IDXGIDevice)> {
+    let Some(_lease) = acquire_device_creation_lease(luid, stop) else {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8000_4004u32 as i32,
+        )));
+    };
+
+    let mut attempt = 0u32;
+    loop {
+        match create_device_on_luid(luid) {
+            Ok(device) => return Ok(device),
+            Err(error) => {
+                let code = error.code().0;
+                let Some(delay) = DEVICE_CREATE_RETRY_DELAYS.get(attempt as usize).copied() else {
+                    return Err(error);
+                };
+                if code != E_OUTOFMEMORY || stop.load(Ordering::SeqCst) {
+                    return Err(error);
+                }
+                attempt += 1;
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "SwapChainDeviceCreateRetry",
+                    level(Warning),
+                    u64("session", &session_id),
+                    u64("luid", &luid),
+                    u32("attempt", &attempt),
+                    u32("delay_ms", &(delay.as_millis() as u32)),
+                    i32("hresult", &code)
+                );
+                let deadline = Instant::now() + delay;
+                while Instant::now() < deadline {
+                    if stop.load(Ordering::SeqCst) {
+                        return Err(error);
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn is_device_loss_hresult(code: i32) -> bool {
+    matches!(
+        code,
+        DXGI_ERROR_DEVICE_REMOVED | DXGI_ERROR_DEVICE_HUNG | DXGI_ERROR_DEVICE_RESET
+    )
+}
+
+#[cfg(test)]
+mod device_creation_tests {
+    use super::*;
+
+    #[test]
+    fn out_of_memory_is_transient_not_a_tdr_verdict() {
+        assert!(!is_device_loss_hresult(E_OUTOFMEMORY));
+    }
+
+    #[test]
+    fn only_explicit_dxgi_device_loss_codes_arm_recovery() {
+        assert!(is_device_loss_hresult(DXGI_ERROR_DEVICE_REMOVED));
+        assert!(is_device_loss_hresult(DXGI_ERROR_DEVICE_HUNG));
+        assert!(is_device_loss_hresult(DXGI_ERROR_DEVICE_RESET));
+        assert!(!is_device_loss_hresult(0x8000_4005u32 as i32));
+    }
+}
+
 /// How often the header heartbeat must advance even with no frames.
 const HEARTBEAT_EVERY: Duration = Duration::from_millis(250);
 
@@ -428,7 +557,7 @@ fn frame_loop(
     // IddCxSwapChainSetDevice — the modeset transaction starved and rolled
     // the path back. SetDevice needs no ring state, so nothing on the
     // activation-critical path may wait on the ring.
-    let d3d = match create_device_on_luid(luid) {
+    let d3d = match create_device_on_luid_with_retry(session_id, luid, &stop) {
         Ok(d) => d,
         Err(e) => {
             let code = e.code().0;
@@ -464,7 +593,8 @@ fn frame_loop(
             // The stop check keeps a routine teardown (the OS's ~10 ms
             // unassign landing inside a slow create) from reading as a GPU
             // reset.
-            if !stop.load(Ordering::SeqCst)
+            if is_device_loss_hresult(code)
+                && !stop.load(Ordering::SeqCst)
                 && Shell::get().tdr_duck_mode() == crate::dispatch::TDR_DUCK_DEVICE
             {
                 super::mark_ring_rebuilding_arc(&handle);
@@ -513,7 +643,10 @@ fn frame_loop(
     //
     // Poison recovery matches mark_ring_dead: a prior worker's panic must
     // not cascade a second panic into WUDFHost on the next assign.
-    let mut guard = handle.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = handle
+        .ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Re-check after the (possibly long) lock wait: a worker stopped while
     // queued behind a wedged predecessor may have been deadline-detached —
     // its swapchain is then already torn down and must not be touched
@@ -580,7 +713,11 @@ fn frame_loop(
         let mut out: ffi::IDARG_OUT_RELEASEANDACQUIREBUFFER2 = unsafe { zeroed() };
         out.MetaData.Size = size_of::<ffi::IDDCX_METADATA2>() as u32;
         let status = unsafe {
-            bindings::swapchain_release_and_acquire_buffer2(swapchain.0.cast(), &mut in_args, &mut out)
+            bindings::swapchain_release_and_acquire_buffer2(
+                swapchain.0.cast(),
+                &mut in_args,
+                &mut out,
+            )
         };
         // Stopping: unassign/teardown may already have returned (deadline
         // detach) — no further swapchain or surface access. Skipping the
@@ -646,45 +783,45 @@ fn frame_loop(
         last_heartbeat = Instant::now();
 
         match publish_result {
-          Ok(true) if !first_frame_published => {
-            if let Some(s) = &ring.section {
-                s.set_state(ring_state::ACTIVE);
+            Ok(true) if !first_frame_published => {
+                if let Some(s) = &ring.section {
+                    s.set_state(ring_state::ACTIVE);
+                }
+                handle.live.publish_first_frame();
+                first_frame_published = true;
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "RingFirstFramePublished",
+                    level(Informational),
+                    u64("session", &session_id),
+                    u32("generation", &ring.policy.generation),
+                    u64("sequence", &ring.policy.frames_published)
+                );
             }
-            handle.live.publish_first_frame();
-            first_frame_published = true;
-            tracelogging::write_event!(
-                PROVIDER,
-                "RingFirstFramePublished",
-                level(Informational),
-                u64("session", &session_id),
-                u32("generation", &ring.policy.generation),
-                u64("sequence", &ring.policy.frames_published)
-            );
-          }
-          Ok(_) => {}
-          Err(e) => {
-            // D3D failure mid-publish (device removed and friends): same
-            // exit-and-let-the-OS-reassign policy as acquire failures.
-            let code = e.code().0;
-            tracelogging::write_event!(
-                PROVIDER,
-                "PublishFrameErrorExit",
-                level(Warning),
-                u64("session", &session_id),
-                i32("hresult", &code)
-            );
-            if let Some(s) = &ring.section {
-                s.set_state(ring_state::REBUILDING);
+            Ok(_) => {}
+            Err(e) => {
+                // D3D failure mid-publish (device removed and friends): same
+                // exit-and-let-the-OS-reassign policy as acquire failures.
+                let code = e.code().0;
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "PublishFrameErrorExit",
+                    level(Warning),
+                    u64("session", &session_id),
+                    i32("hresult", &code)
+                );
+                if let Some(s) = &ring.section {
+                    s.set_state(ring_state::REBUILDING);
+                }
+                ring.retire_textures();
+                ring.retired_for_reassign = true;
+                // Same ordering as the acquire-failure arm above.
+                handle.live.publish_state(ring_state::REBUILDING);
+                handle.live.publish_worker_exit();
+                maybe_queue_tdr_duck(session_id, &d3d.0);
+                failed_swapchain_reason = Some(code);
+                break;
             }
-            ring.retire_textures();
-            ring.retired_for_reassign = true;
-            // Same ordering as the acquire-failure arm above.
-            handle.live.publish_state(ring_state::REBUILDING);
-            handle.live.publish_worker_exit();
-            maybe_queue_tdr_duck(session_id, &d3d.0);
-            failed_swapchain_reason = Some(code);
-            break;
-          }
         }
     }
 
@@ -767,8 +904,8 @@ fn publish_frame(
             ring.retire_textures();
         }
         let slots = ring.policy.slot_count() as u32;
-        let d3d12_transport = ring.transport_flags
-            & luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT != 0;
+        let d3d12_transport =
+            ring.transport_flags & luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT != 0;
         ring.textures = create_shared_textures(
             device,
             session_id,
@@ -780,7 +917,11 @@ fn publish_frame(
             d3d12_transport,
         )?;
         ring.producer_fence = if d3d12_transport {
-            Some(create_shared_fence(device, session_id, ring.policy.generation)?)
+            Some(create_shared_fence(
+                device,
+                session_id,
+                ring.policy.generation,
+            )?)
         } else {
             None
         };
@@ -847,27 +988,27 @@ fn publish_frame(
     };
 
     if let Some(mutex) = &slot.mutex {
-      match acquire_mutex(mutex, key, KMTX_ACQUIRE_TIMEOUT_MS) {
-        AcquireOutcome::Acquired => {},
-        AcquireOutcome::TimedOut => {
-            // Bounded wait expired (host holding the pixels too long):
-            // drop this frame, never block the compositor path.
-            ring.policy.writer_abort(writer.index);
-            if let Some(s) = &ring.section {
-                s.reset_slot_free(writer.index);
+        match acquire_mutex(mutex, key, KMTX_ACQUIRE_TIMEOUT_MS) {
+            AcquireOutcome::Acquired => {}
+            AcquireOutcome::TimedOut => {
+                // Bounded wait expired (host holding the pixels too long):
+                // drop this frame, never block the compositor path.
+                ring.policy.writer_abort(writer.index);
+                if let Some(s) = &ring.section {
+                    s.reset_slot_free(writer.index);
+                }
+                return Ok(false);
             }
-            return Ok(false);
-        }
-        AcquireOutcome::DeviceLost(hr) => {
-            ring.policy.writer_abort(writer.index);
-            if let Some(s) = &ring.section {
-                // The take-CAS put the shared state at WRITING; release it
-                // so the slot isn't leaked unwritable if the ring survives.
-                s.reset_slot_free(writer.index);
+            AcquireOutcome::DeviceLost(hr) => {
+                ring.policy.writer_abort(writer.index);
+                if let Some(s) = &ring.section {
+                    // The take-CAS put the shared state at WRITING; release it
+                    // so the slot isn't leaked unwritable if the ring survives.
+                    s.reset_slot_free(writer.index);
+                }
+                return Err(windows::core::Error::from_hresult(hr));
             }
-            return Err(windows::core::Error::from_hresult(hr));
         }
-      }
     }
 
     // Stopping (possibly deadline-detached mid-wedge in texture creation
