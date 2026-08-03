@@ -709,6 +709,12 @@ mod tests {
         }
 
         std::thread::scope(|s| {
+            // Keep the first stable generation published until the reader
+            // has had a chance to accept it. Without this handshake the
+            // writer can finish all 50,000 iterations before a loaded CI
+            // runner schedules the reader, making the test fail without
+            // exercising the seqlock at all.
+            let (first_read_tx, first_read_rx) = std::sync::mpsc::sync_channel(0);
             let writer = s.spawn(move || {
                 let h = base_addr as *mut CursorHeader;
                 let generation =
@@ -725,6 +731,11 @@ mod tests {
                         std::ptr::write_bytes(shape_base, n as u8, (W * H * 4) as usize);
                     }
                     generation.store(2 * n, Ordering::Release);
+                    if n == 1 {
+                        // Bound the wait so a real reader regression reports
+                        // an assertion failure instead of hanging the suite.
+                        let _ = first_read_rx.recv_timeout(std::time::Duration::from_secs(2));
+                    }
                 }
             });
 
@@ -749,6 +760,9 @@ mod tests {
                         shape.generation
                     );
                     accepted += 1;
+                    if accepted == 1 {
+                        let _ = first_read_tx.send(());
+                    }
                     last_generation = shape.generation;
                 }
                 core::mem::forget(view);
