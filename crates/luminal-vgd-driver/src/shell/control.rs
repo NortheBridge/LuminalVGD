@@ -982,33 +982,38 @@ fn publishing_sessions(sessions: &[u64]) -> u64 {
         .count() as u64
 }
 
-/// The GATED FALLBACK departure — build 14/15's behaviour, reached only
-/// when the device-duck cannot be sustained (the long deadline expired, or
-/// the poller could not be spawned). Departs the still-unrecovered members
-/// of the duck's LUID-scoped set and drains the parked set immediately:
-/// there is no recovery left to wait for, the budget is already spent.
-///
-/// Scoped, not `duck_all`: the duck was scoped to one adapter's LUID
-/// precisely so a monitor on a healthy second GPU is not dragged into
-/// another adapter's reset, and departing everything here would have thrown
-/// that away at the one moment it mattered.
+/// Build 23 terminal device-duck action. Exhausting the recovery budget may
+/// retire direct transport, but must never remove an active desktop. The
+/// host can capture the still-arrived monitor through WGC/DDA and a later
+/// client session can construct a fresh ring without repairing topology.
 fn depart_fallback(epoch: u64, sessions: &[u64], reason: &str) {
     let shell = Shell::get();
-    let (departed, skipped) = if shell.adapter_epoch() == epoch {
+    let (rings, skipped) = if shell.adapter_epoch() == epoch {
         let unrecovered = unrecovered_sessions(sessions);
         let skipped = (sessions.len() - unrecovered.len()) as u64;
-        (monitors::duck_sessions(epoch, &unrecovered), skipped)
+        let rings = {
+            let monitors = shell.monitors.lock().unwrap();
+            unrecovered
+                .iter()
+                .filter_map(|sid| monitors.get(sid).map(|rt| rt.ring.clone()))
+                .collect::<Vec<_>>()
+        };
+        (rings, skipped)
     } else {
-        (0, 0)
+        (Vec::new(), 0)
     };
+    let kept = rings.len() as u64 + skipped;
+    for ring in &rings {
+        super::mark_ring_dead_arc(ring);
+    }
     let abandoned = abandon_ducked(reason);
     tracelogging::write_event!(
         PROVIDER,
         "TdrDeviceDuckGaveUp",
         level(Warning),
         str8("reason", reason),
-        u64("departed", &(departed as u64)),
-        u64("kept", &skipped),
+        u64("departed", &0u64),
+        u64("kept", &kept),
         u64("abandoned", &abandoned)
     );
     finish_device_duck();

@@ -134,6 +134,9 @@ pub struct VgdRingStatus {
     pub generation: u32,
     /// proto `ring_state::*` (1 ACTIVE, 2 REBUILDING, 3 DEAD, 0 uninit).
     pub state: u32,
+    /// Transport flags actually selected for this generation.
+    pub transport_flags: u32,
+    pub reserved: u32,
     pub latest_sequence: u64,
     pub frames_published: u64,
     pub frames_dropped: u64,
@@ -514,6 +517,8 @@ pub unsafe extern "C" fn vgd_ring_status(ring: *mut VgdRingHandle, out: *mut Vgd
         *out = VgdRingStatus {
             generation: h.ring_generation,
             state: h.state,
+            transport_flags: h.transport_flags(),
+            reserved: 0,
             latest_sequence: h.latest_sequence,
             frames_published: h.frames_published,
             frames_dropped: h.frames_dropped,

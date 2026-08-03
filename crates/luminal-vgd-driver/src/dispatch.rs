@@ -1882,8 +1882,8 @@ mod tests {
             assert_eq!(r.status, Status::Ok);
             let reply: HandshakeReply = from_bytes(&out);
             assert_eq!(reply.driver_proto_minor, PROTO_VERSION_MINOR);
-            assert_eq!(reply.driver_proto_minor, 8);
-            assert!(h.handshaken, "0.{announced} host still handshakes against 0.8");
+            assert_eq!(reply.driver_proto_minor, 9);
+            assert!(h.handshaken, "0.{announced} host still handshakes against 0.9");
 
             // And its session IOCTLs still work.
             let (create, effects) = do_create(&mut d, &mut h, &create_req(3));

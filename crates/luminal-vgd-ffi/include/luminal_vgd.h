@@ -244,6 +244,11 @@ typedef struct VgdRingStatus {
    * proto `ring_state::*` (1 ACTIVE, 2 REBUILDING, 3 DEAD, 0 uninit).
    */
   uint32_t state;
+  /**
+   * Transport flags actually selected for this generation.
+   */
+  uint32_t transport_flags;
+  uint32_t reserved;
   uint64_t latest_sequence;
   uint64_t frames_published;
   uint64_t frames_dropped;

@@ -73,9 +73,16 @@ pub(crate) struct FrameRing {
     /// to replace its swapchain.  The replacement assign must not retire it
     /// a second time.
     retired_for_reassign: bool,
-    /// Host-selected create flags. Build 21 uses the D3D12 transport bit;
-    /// unknown bits remain inert as required by the control ABI.
-    transport_flags: u32,
+    /// Host-selected create flags. `active_transport_flags` can downgrade
+    /// from D3D12 fences to keyed mutexes for this monitor without changing
+    /// topology; the ring header tells the host which one won.
+    active_transport_flags: u32,
+    d3d12_downgraded: bool,
+    /// A non-device transport failure permanently disables direct-ring
+    /// publication for this activation while the worker keeps draining the
+    /// IddCx swapchain. This is the Build-23 circuit breaker: no delete /
+    /// reassign storm for a broken optional transport.
+    transport_disabled: bool,
 }
 
 /// A monitor's ring: the mutex-guarded [`FrameRing`] plus the LOCK-FREE
@@ -137,7 +144,9 @@ impl FrameRing {
             ever_published: vec![false; slots],
             assigned_before: false,
             retired_for_reassign: false,
-            transport_flags,
+            active_transport_flags: transport_flags,
+            d3d12_downgraded: false,
+            transport_disabled: false,
         }
     }
 
@@ -156,6 +165,26 @@ impl FrameRing {
             s.set_generation(generation);
         }
         generation
+    }
+
+    fn disable_transport(&mut self, reason: i32) {
+        if self.transport_disabled {
+            return;
+        }
+        self.transport_disabled = true;
+        self.textures.clear();
+        self.producer_fence = None;
+        if let Some(s) = &self.section {
+            s.reset_slots();
+            s.set_state(ring_state::DEAD);
+            s.heartbeat();
+        }
+        tracelogging::write_event!(
+            PROVIDER,
+            "RingTransportCircuitOpen",
+            level(Error),
+            i32("hresult", &reason)
+        );
     }
 }
 
@@ -800,27 +829,34 @@ fn frame_loop(
             }
             Ok(_) => {}
             Err(e) => {
-                // D3D failure mid-publish (device removed and friends): same
-                // exit-and-let-the-OS-reassign policy as acquire failures.
                 let code = e.code().0;
                 tracelogging::write_event!(
                     PROVIDER,
-                    "PublishFrameErrorExit",
+                    "PublishFrameError",
                     level(Warning),
                     u64("session", &session_id),
                     i32("hresult", &code)
                 );
-                if let Some(s) = &ring.section {
-                    s.set_state(ring_state::REBUILDING);
+                if is_device_loss_hresult(code) || device_removed_hresult(&d3d.0).is_some() {
+                    // Genuine device loss: abandon this swapchain and let
+                    // IddCx assign a fresh one after the adapter recovers.
+                    if let Some(s) = &ring.section {
+                        s.set_state(ring_state::REBUILDING);
+                    }
+                    ring.retire_textures();
+                    ring.retired_for_reassign = true;
+                    handle.live.publish_state(ring_state::REBUILDING);
+                    handle.live.publish_worker_exit();
+                    maybe_queue_tdr_duck(session_id, &d3d.0);
+                    failed_swapchain_reason = Some(code);
+                    break;
                 }
-                ring.retire_textures();
-                ring.retired_for_reassign = true;
-                // Same ordering as the acquire-failure arm above.
-                handle.live.publish_state(ring_state::REBUILDING);
-                handle.live.publish_worker_exit();
-                maybe_queue_tdr_duck(session_id, &d3d.0);
-                failed_swapchain_reason = Some(code);
-                break;
+
+                // Optional transport failure: keep the compositor path
+                // alive and drain it. LuminalShine observes DEAD and uses
+                // fallback capture against this same attached monitor.
+                ring.disable_transport(code);
+                handle.live.publish_state(ring_state::DEAD);
             }
         }
     }
@@ -849,9 +885,7 @@ fn frame_loop(
 /// `return`. What `control::queue_tdr_duck` then decides is only whether
 /// the DISPLAY goes too — see the build-16 gate there.
 fn maybe_queue_tdr_duck(session_id: u64, device: &ID3D11Device) {
-    let removed = unsafe { device.GetDeviceRemovedReason() };
-    if let Err(reason) = removed {
-        let code = reason.code().0;
+    if let Some(code) = device_removed_hresult(device) {
         tracelogging::write_event!(
             PROVIDER,
             "TdrDeviceRemoved",
@@ -867,6 +901,13 @@ fn maybe_queue_tdr_duck(session_id: u64, device: &ID3D11Device) {
     }
 }
 
+fn device_removed_hresult(device: &ID3D11Device) -> Option<i32> {
+    unsafe { device.GetDeviceRemovedReason() }
+        .err()
+        .map(|error| error.code().0)
+        .filter(|code| is_device_loss_hresult(*code))
+}
+
 /// Copy the acquired frame into a ring slot and publish it. Any error is
 /// returned after the ring bookkeeping is made consistent (abort/drop).
 fn publish_frame(
@@ -877,7 +918,7 @@ fn publish_frame(
     meta: &ffi::IDDCX_METADATA2,
     stop: &AtomicBool,
 ) -> windows::core::Result<bool> {
-    if ring.section.is_none() {
+    if ring.section.is_none() || ring.transport_disabled {
         return Ok(false); // transport disabled; drain-only
     }
 
@@ -904,27 +945,52 @@ fn publish_frame(
             ring.retire_textures();
         }
         let slots = ring.policy.slot_count() as u32;
-        let d3d12_transport =
-            ring.transport_flags & luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT != 0;
-        ring.textures = create_shared_textures(
-            device,
-            session_id,
-            ring.policy.generation,
-            slots,
-            desc.Width,
-            desc.Height,
-            desc.Format,
-            d3d12_transport,
-        )?;
-        ring.producer_fence = if d3d12_transport {
-            Some(create_shared_fence(
+        let d3d12_transport = ring.active_transport_flags
+            & luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT
+            != 0;
+        let provision = |d3d12: bool| -> windows::core::Result<(Vec<SharedTexture>, Option<SharedFence>)> {
+            let textures = create_shared_textures(
                 device,
                 session_id,
                 ring.policy.generation,
-            )?)
-        } else {
-            None
+                slots,
+                desc.Width,
+                desc.Height,
+                desc.Format,
+                d3d12,
+            )?;
+            let fence = if d3d12 {
+                Some(create_shared_fence(device, session_id, ring.policy.generation)?)
+            } else {
+                None
+            };
+            Ok((textures, fence))
         };
+        let resources = match provision(d3d12_transport) {
+            Ok(resources) => resources,
+            Err(first) if d3d12_transport && !ring.d3d12_downgraded => {
+                ring.d3d12_downgraded = true;
+                ring.active_transport_flags &=
+                    !luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT;
+                if let Some(s) = &ring.section {
+                    s.set_transport_flags(ring.active_transport_flags);
+                }
+                tracelogging::write_event!(
+                    PROVIDER,
+                    "RingTransportDowngrade",
+                    level(Warning),
+                    u64("session", &session_id),
+                    u32("generation", &ring.policy.generation),
+                    i32("d3d12_hresult", &first.code().0)
+                );
+                provision(false)?
+            }
+            Err(error) => return Err(error),
+        };
+        (ring.textures, ring.producer_fence) = resources;
+        if let Some(s) = &ring.section {
+            s.set_transport_flags(ring.active_transport_flags);
+        }
         ring.tex_width = desc.Width;
         ring.tex_height = desc.Height;
         ring.tex_format = desc.Format.0 as u32;

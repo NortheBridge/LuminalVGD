@@ -41,6 +41,7 @@ use luminal_driver_proto::{
     names, ring_section_size, ring_state, Hdr10StaticMetadata, RectU32, RingHeader, SlotMetadata,
     RING_HEADER_VERSION, RING_MAGIC, RING_SLOTS_OFFSET,
 };
+use super::PROVIDER;
 
 /// SYSTEM + Administrators, full access (matches DESIGN.md §6 intent for
 /// the data plane; the encoder service is SYSTEM).
@@ -193,6 +194,12 @@ impl RingSection {
         }
     }
 
+    pub fn set_transport_flags(&self, flags: u32) {
+        unsafe {
+            core::ptr::write_volatile(&mut (*self.header_mut()).reserved0, flags);
+        }
+    }
+
     pub fn heartbeat(&self) {
         unsafe {
             core::ptr::write_volatile(&mut (*self.header_mut()).driver_heartbeat_qpc, qpc_now());
@@ -311,16 +318,48 @@ pub fn create_shared_fence(
     session_id: u64,
     generation: u32,
 ) -> windows::core::Result<SharedFence> {
-    let device5: ID3D11Device5 = device.cast()?;
+    let device5: ID3D11Device5 = device.cast().map_err(|e| {
+        trace_transport_failure("fence-device5", session_id, generation, 0, 0, 0, e.code().0);
+        e
+    })?;
     let mut fence: Option<ID3D11Fence> = None;
-    unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence)? };
+    unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence) }.map_err(|e| {
+        trace_transport_failure("fence-create", session_id, generation, 0, 0, 0, e.code().0);
+        e
+    })?;
     let fence = fence.expect("CreateFence succeeded without a fence");
     let mut name = [0u16; 96];
     names::ring_fence_name(session_id, generation, &mut name);
     let name_handle = with_ring_security(|sa| unsafe {
         fence.CreateSharedHandle(Some(sa), 0x1000_0000, PCWSTR(name.as_ptr()))
+    }).map_err(|e| {
+        trace_transport_failure("fence-share", session_id, generation, 0, 0, 0, e.code().0);
+        e
     })?;
     Ok(SharedFence { fence, name_handle })
+}
+
+fn trace_transport_failure(
+    stage: &str,
+    session_id: u64,
+    generation: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    hresult: i32,
+) {
+    tracelogging::write_event!(
+        PROVIDER,
+        "RingTransportStageFailed",
+        level(Error),
+        str8("stage", stage),
+        u64("session", &session_id),
+        u32("generation", &generation),
+        u32("width", &width),
+        u32("height", &height),
+        u32("format", &format),
+        i32("hresult", &hresult)
+    );
 }
 
 // SAFETY: COM pointers used from the single worker thread; the handle is
@@ -393,7 +432,12 @@ pub fn create_shared_textures(
     let mut out = Vec::with_capacity(count as usize);
     for slot in 0..count {
         let mut texture: Option<ID3D11Texture2D> = None;
-        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }.map_err(|e| {
+            trace_transport_failure(
+                "texture-create", session_id, generation, width, height, format.0 as u32, e.code().0,
+            );
+            e
+        })?;
         let texture = texture.expect("CreateTexture2D succeeded without a texture");
 
         let mut name = [0u16; 96];
@@ -402,15 +446,34 @@ pub fn create_shared_textures(
         } else {
             names::slot_texture_name(session_id, generation, slot, &mut name);
         }
-        let resource: IDXGIResource1 = texture.cast()?;
+        let resource: IDXGIResource1 = texture.cast().map_err(|e| {
+            trace_transport_failure(
+                "texture-resource1", session_id, generation, width, height, format.0 as u32, e.code().0,
+            );
+            e
+        })?;
         let name_handle = with_ring_security(|sa| unsafe {
             resource.CreateSharedHandle(
                 Some(sa),
                 DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
                 PCWSTR(name.as_ptr()),
             )
+        }).map_err(|e| {
+            trace_transport_failure(
+                "texture-share", session_id, generation, width, height, format.0 as u32, e.code().0,
+            );
+            e
         })?;
-        let mutex = if d3d12_transport { None } else { Some(texture.cast()?) };
+        let mutex = if d3d12_transport {
+            None
+        } else {
+            Some(texture.cast().map_err(|e| {
+                trace_transport_failure(
+                    "texture-keyed-mutex", session_id, generation, width, height, format.0 as u32, e.code().0,
+                );
+                e
+            })?)
+        };
         out.push(SharedTexture { texture, mutex, name_handle });
     }
     Ok(out)
