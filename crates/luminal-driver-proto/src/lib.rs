@@ -57,7 +57,11 @@ pub const PROTO_VERSION_MAJOR: u16 = 0;
 /// v0.8: Build 22's first-frame admission contract. Ring state remains
 /// REBUILDING after SetDevice and becomes ACTIVE only after a copied,
 /// synchronized slot is published. No layout changes.
-pub const PROTO_VERSION_MINOR: u16 = 8;
+/// v0.9: Build 23 publishes the transport actually selected by the driver
+/// in [`RingHeader::transport_flags`]. A requested D3D12-fence transport
+/// can therefore downgrade in place to the keyed-mutex transport without
+/// cycling the monitor.
+pub const PROTO_VERSION_MINOR: u16 = 9;
 
 /// The minimum driver minor a host actually REQUIRES. Hosts that degrade
 /// gracefully when 0.4 fields are ignored (the nits value simply stays at
@@ -977,6 +981,12 @@ pub struct SlotMetadata {
     pub reserved: [u32; 2],
 }
 
+impl RingHeader {
+    pub fn transport_flags(&self) -> u32 {
+        self.reserved0
+    }
+}
+
 impl SlotMetadata {
     /// Build 21 keeps the v1 slot layout stable by storing the additive
     /// 64-bit producer-fence value in the two previously-reserved words.
@@ -1006,6 +1016,9 @@ pub struct RingHeader {
     /// One of `ring_state::*`. The host's fallback/restore logic keys off
     /// this plus `driver_heartbeat_qpc`.
     pub state: u32,
+    /// Build 23: create flags for the transport actually active in this
+    /// generation. Zero means the legacy keyed-mutex transport. Older
+    /// drivers left this word zero, preserving backward compatibility.
     pub reserved0: u32,
     /// Monotonic frame sequence of the most recently published slot.
     /// Gaps are legal (drop-oldest policy) and detectable by the host.
@@ -1388,7 +1401,7 @@ mod tests {
             3
         ));
         assert_eq!(PROTO_VERSION_MINOR_REQUIRED, 3, "the floor does NOT move with the minor");
-        assert_eq!(PROTO_VERSION_MINOR, 8);
+        assert_eq!(PROTO_VERSION_MINOR, 9);
     }
 
     /// The feature gate a host actually reads. Locked because a wrong bit
@@ -1600,6 +1613,17 @@ mod tests {
         slot.set_ready_fence_value(0x1122_3344_AABB_CCDD);
         assert_eq!(slot.ready_fence_value(), 0x1122_3344_AABB_CCDD);
         assert_eq!(core::mem::size_of::<SlotMetadata>(), 80);
+    }
+
+    #[test]
+    fn ring_header_reports_the_transport_selected_by_build_23() {
+        let mut header: RingHeader = unsafe { core::mem::zeroed() };
+        assert_eq!(header.transport_flags(), 0);
+        header.reserved0 = create_flags::D3D12_FENCE_TRANSPORT;
+        assert_eq!(
+            header.transport_flags(),
+            create_flags::D3D12_FENCE_TRANSPORT
+        );
     }
 
     #[test]

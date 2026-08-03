@@ -1471,3 +1471,24 @@ style of the existing `proto_minor < 4` nits log. When it does, the one rule it
 must honour is `worth_retrying()`: retry an `UPDATE_FAILED`, never a
 `MODE_COMMITTED` — for the latter, either keep `blocking_mode` in the list or do
 the `SetDisplayConfig` first.
+
+### Build 23 — non-destructive transport containment (2026-08-03)
+
+The Build-22 field trace proved that an optional direct-ring failure could
+delete/reassign its IddCx swapchain thousands of times, exhaust D3D resources,
+arm recovery on `E_OUTOFMEMORY`, and finally depart the only active monitor at
+the ten-minute deadline. Build 23 makes each boundary explicit:
+
+- A requested D3D12-fence ring that cannot provision its textures or fence
+  downgrades once, in place, to the keyed-mutex ring. Proto 0.9 publishes the
+  transport actually selected in `RingHeader.reserved0`; the layout does not
+  grow and older drivers/hosts continue to read zero as keyed mutex.
+- Any remaining non-device publish error opens a permanent drain-only circuit
+  for that activation. The worker continues `ReleaseAndAcquireBuffer2` /
+  `FinishedProcessingFrame`; it does not delete the swapchain or disturb the
+  display. Only explicit DEVICE_REMOVED/HUNG/RESET enters reassignment/TDR.
+- The device-duck terminal arm marks direct transport DEAD and keeps every
+  monitor arrived. A recovery deadline can reduce performance, never topology.
+- `RingTransportStageFailed` identifies texture-create, texture-share,
+  keyed-mutex, fence-create, and fence-share failures with HRESULT, format,
+  dimensions, generation, and session, so one ETL identifies the rejected API.

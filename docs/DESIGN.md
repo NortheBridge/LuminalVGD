@@ -501,11 +501,12 @@ release + Insider builds. Design rules:
    restores the rule as written: the D3D device and swapchain go, the ring
    goes REBUILDING with a device-independent heartbeat, and **the IddCx
    monitor stays ARRIVED** so Windows keeps a display path to compose onto.
-   Departure is now the gated FALLBACK, taken only when (a) the GPU answers
-   again but the OS never re-assigns a swapchain — one requalify
-   depart+re-arrive against a *healthy* stack — or (b) the 10-minute
-   recovery budget expires. The builds-14/15 behaviour stays selectable via
-   the `LuminalVgdTdrDuckMode` REG_DWORD (see §6).
+   Build 23 removes the terminal departure as well: if requalification or
+   the recovery budget is exhausted, direct transport becomes DEAD while
+   the monitor remains arrived. The host can continue HDR-capable fallback
+   capture against that stable desktop and a later session can build a fresh
+   ring. The builds-14/15 behaviour stays selectable only through the
+   explicit `LuminalVgdTdrDuckMode` REG_DWORD (see §6).
 
    Contract basis for keeping the monitor arrived: IddCx already drives
    monitors into "arrived with no swapchain and no device" as routine
