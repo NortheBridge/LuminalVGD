@@ -38,6 +38,10 @@
  */
 #define VGD_CAP_DYNAMIC_MODES 512
 
+#define VGD_CAP_D3D12_FENCE_TRANSPORT 1024
+
+#define VGD_CREATE_D3D12_FENCE_TRANSPORT 4
+
 /**
  * `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).
  */
@@ -260,6 +264,7 @@ typedef struct VgdFrame {
   uint32_t generation;
   uint64_t sequence;
   uint64_t present_qpc;
+  uint64_t ready_fence_value;
 } VgdFrame;
 
 /**
@@ -443,6 +448,19 @@ uint32_t vgd_slot_texture_name(uint64_t session_id,
                                uint32_t generation,
                                uint32_t slot,
                                uint16_t *out);
+
+/**
+ * Compose the D3D12-openable shared texture name for a claimed slot.
+ */
+uint32_t vgd_slot_texture_d3d12_name(uint64_t session_id,
+                                     uint32_t generation,
+                                     uint32_t slot,
+                                     uint16_t *out);
+
+/**
+ * Compose the shared producer timeline-fence name for a ring generation.
+ */
+uint32_t vgd_ring_fence_name(uint64_t session_id, uint32_t generation, uint16_t *out);
 
 #ifdef __cplusplus
 }  // extern "C"

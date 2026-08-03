@@ -23,12 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use wdk_sys::{NTSTATUS, STATUS_PENDING, STATUS_SUCCESS};
+use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, STATUS_PENDING, STATUS_SUCCESS};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HANDLE, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Texture2D,
     D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dxgi::{
@@ -38,7 +38,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 
 use super::bindings::{self, ffi};
 use super::ring::{
-    acquire_mutex, create_shared_textures, qpc_now, AcquireOutcome, RingSection, SharedTexture,
+    acquire_mutex, create_shared_fence, create_shared_textures, qpc_now, AcquireOutcome, RingSection, SharedFence, SharedTexture,
 };
 use super::{OsHandle, Shell, PROVIDER};
 use luminal_driver_proto::{ring_state, KMTX_ACQUIRE_TIMEOUT_MS};
@@ -53,6 +53,7 @@ pub(crate) struct FrameRing {
     /// the host falls back to WGC).
     pub section: Option<RingSection>,
     textures: Vec<SharedTexture>,
+    producer_fence: Option<SharedFence>,
     tex_width: u32,
     tex_height: u32,
     /// DXGI_FORMAT raw value of the current textures; the OS switches the
@@ -66,6 +67,13 @@ pub(crate) struct FrameRing {
     /// True once any assign has run — later assigns bump the generation
     /// (new device ⇒ new textures ⇒ new names).
     assigned_before: bool,
+    /// A failed worker already retired this generation before asking IddCx
+    /// to replace its swapchain.  The replacement assign must not retire it
+    /// a second time.
+    retired_for_reassign: bool,
+    /// Host-selected create flags. Build 21 uses the D3D12 transport bit;
+    /// unknown bits remain inert as required by the control ABI.
+    transport_flags: u32,
 }
 
 /// A monitor's ring: the mutex-guarded [`FrameRing`] plus the LOCK-FREE
@@ -99,7 +107,7 @@ impl RingHandle {
 }
 
 impl FrameRing {
-    pub fn new(session_id: u64, ring_slots: u32) -> Self {
+    pub fn new(session_id: u64, ring_slots: u32, transport_flags: u32) -> Self {
         let section = match RingSection::create(session_id, ring_slots) {
             Ok(s) => Some(s),
             Err(e) => {
@@ -120,11 +128,14 @@ impl FrameRing {
             policy,
             section,
             textures: Vec::new(),
+            producer_fence: None,
             tex_width: 0,
             tex_height: 0,
             tex_format: 0,
             ever_published: vec![false; slots],
             assigned_before: false,
+            retired_for_reassign: false,
+            transport_flags,
         }
     }
 
@@ -132,6 +143,7 @@ impl FrameRing {
     /// mode-size change, device loss). Sequences continue.
     fn retire_textures(&mut self) -> u32 {
         self.textures.clear();
+        self.producer_fence = None;
         self.tex_width = 0;
         self.tex_height = 0;
         self.tex_format = 0;
@@ -163,8 +175,22 @@ impl Worker {
     /// detached — it exits on its own if it ever unblocks (the stop flag
     /// stays set, and the ring Arc keeps its state alive).
     pub fn stop(mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        let already_stopping = self.stop.swap(true, Ordering::SeqCst);
         let Some(join) = self.join.take() else { return };
+        // A failed worker sets stop before WdfObjectDelete. The resulting
+        // unassign may run on another framework thread while deletion is
+        // still in progress; waiting there would make the callback wait on
+        // the operation that invoked it. The worker owns its own exit now.
+        if already_stopping {
+            drop(join);
+            return;
+        }
+        // WdfObjectDelete on the failed swapchain may synchronously invoke
+        // EvtUnassign on this same worker. Never wait for or join ourselves.
+        if join.thread().id() == std::thread::current().id() {
+            drop(join);
+            return;
+        }
         let deadline = Instant::now() + STOP_DEADLINE;
         while !join.is_finished() {
             if Instant::now() >= deadline {
@@ -175,6 +201,31 @@ impl Worker {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = join.join();
+    }
+}
+
+/// Return a failed swapchain to IddCx exactly once.  Deleting the WDF object
+/// is Microsoft's required signal that frame processing cannot continue; an
+/// exited worker alone does not request a replacement assignment.
+fn delete_failed_swapchain(swapchain: OsHandle, stop: &AtomicBool, session_id: u64, reason: i32) {
+    // Normal unassign/teardown wins by setting stop first. Conversely, when
+    // this worker wins, the synchronous unassign callback observes stop and
+    // only detaches this thread through Worker::stop's self-join guard.
+    if stop
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tracelogging::write_event!(
+        PROVIDER,
+        "FailedSwapChainDelete",
+        level(Warning),
+        u64("session", &session_id),
+        i32("reason", &reason)
+    );
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, swapchain.0.cast());
     }
 }
 
@@ -423,6 +474,7 @@ fn frame_loop(
                 // armed against). Every arm site now names its cause.
                 super::control::queue_tdr_duck(session_id, code);
             }
+            delete_failed_swapchain(swapchain, &stop, session_id, code);
             return;
         }
     };
@@ -444,6 +496,7 @@ fn frame_loop(
                 level(Error),
                 i32("status", &status)
             );
+            delete_failed_swapchain(swapchain, &stop, session_id, status);
             return;
         }
     }
@@ -476,18 +529,18 @@ fn frame_loop(
     // of this generation, which is all the ordering the host protocol
     // needs — SetDevice having happened first only means acquirable frames
     // queue in the swapchain until this loop starts consuming them.
-    if ring.assigned_before {
+    if ring.assigned_before && !ring.retired_for_reassign {
         ring.retire_textures();
     }
     ring.assigned_before = true;
+    ring.retired_for_reassign = false;
 
     if let Some(s) = &ring.section {
-        s.set_state(ring_state::ACTIVE);
+        s.set_state(ring_state::REBUILDING);
     }
-    // PUBLISH: the transport is live. SetDevice has succeeded on a freshly
-    // created device, the textures are retired and the shared section is
-    // ACTIVE — this is the exact instant a TDR device-duck poller is
-    // waiting to observe, and `live` is the only way it CAN observe it
+    handle.live.publish_state(ring_state::REBUILDING);
+    // SetDevice has succeeded, but this transport is not capture-ready
+    // until a copied and fenced slot has actually been published.
     // (the section it mirrors is now behind a mutex this thread owns for
     // the rest of its life). Deliberately not published earlier, right
     // after IddCxSwapChainSetDevice: a worker that then blocked on the
@@ -497,7 +550,7 @@ fn frame_loop(
     //
     // `_live` is RAII so EVERY exit below — the stop re-checks, the
     // failure returns, an unwind — publishes the matching worker-exit.
-    let live_generation = handle.live.publish_worker_live();
+    let live_generation = handle.live.publish_worker_started();
     let _live = LiveMark(&handle.live);
     tracelogging::write_event!(
         PROVIDER,
@@ -509,6 +562,8 @@ fn frame_loop(
     );
 
     let mut last_heartbeat = Instant::now();
+    let mut failed_swapchain_reason: Option<i32> = None;
+    let mut first_frame_published = false;
     while !stop.load(Ordering::SeqCst) {
         if last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
             if let Some(s) = &ring.section {
@@ -559,6 +614,7 @@ fn frame_loop(
                 s.set_state(ring_state::REBUILDING);
             }
             ring.retire_textures();
+            ring.retired_for_reassign = true;
             // Mirror the state and drop the live flag BEFORE arming the
             // duck: the poller's very first tick must see a ring that is
             // REBUILDING and unowned, never a corpse still advertising
@@ -566,7 +622,8 @@ fn frame_loop(
             handle.live.publish_state(ring_state::REBUILDING);
             handle.live.publish_worker_exit();
             maybe_queue_tdr_duck(session_id, &d3d.0);
-            return;
+            failed_swapchain_reason = Some(status);
+            break;
         }
 
         // Frame in hand. pSurface stays valid until the next acquire.
@@ -588,7 +645,24 @@ fn frame_loop(
         }
         last_heartbeat = Instant::now();
 
-        if let Err(e) = publish_result {
+        match publish_result {
+          Ok(true) if !first_frame_published => {
+            if let Some(s) = &ring.section {
+                s.set_state(ring_state::ACTIVE);
+            }
+            handle.live.publish_first_frame();
+            first_frame_published = true;
+            tracelogging::write_event!(
+                PROVIDER,
+                "RingFirstFramePublished",
+                level(Informational),
+                u64("session", &session_id),
+                u32("generation", &ring.policy.generation),
+                u64("sequence", &ring.policy.frames_published)
+            );
+          }
+          Ok(_) => {}
+          Err(e) => {
             // D3D failure mid-publish (device removed and friends): same
             // exit-and-let-the-OS-reassign policy as acquire failures.
             let code = e.code().0;
@@ -603,12 +677,24 @@ fn frame_loop(
                 s.set_state(ring_state::REBUILDING);
             }
             ring.retire_textures();
+            ring.retired_for_reassign = true;
             // Same ordering as the acquire-failure arm above.
             handle.live.publish_state(ring_state::REBUILDING);
             handle.live.publish_worker_exit();
             maybe_queue_tdr_duck(session_id, &d3d.0);
-            return;
+            failed_swapchain_reason = Some(code);
+            break;
+          }
         }
+    }
+
+    // Never call back into WDF/IddCx while holding the ring mutex or live D3D
+    // resources. WdfObjectDelete may synchronously invoke EvtUnassign.
+    drop(_live);
+    drop(guard);
+    drop(d3d);
+    if let Some(reason) = failed_swapchain_reason {
+        delete_failed_swapchain(swapchain, &stop, session_id, reason);
     }
 }
 
@@ -653,16 +739,16 @@ fn publish_frame(
     context: &ID3D11DeviceContext,
     meta: &ffi::IDDCX_METADATA2,
     stop: &AtomicBool,
-) -> windows::core::Result<()> {
+) -> windows::core::Result<bool> {
     if ring.section.is_none() {
-        return Ok(()); // transport disabled; drain-only
+        return Ok(false); // transport disabled; drain-only
     }
 
     let raw_surface: *mut core::ffi::c_void = meta.pSurface.cast();
     let frame_tex: ID3D11Texture2D = unsafe {
         match IDXGIResource::from_raw_borrowed(&raw_surface) {
             Some(f) => f.cast()?,
-            None => return Ok(()),
+            None => return Ok(false),
         }
     };
     let mut desc = unsafe { zeroed() };
@@ -681,6 +767,8 @@ fn publish_frame(
             ring.retire_textures();
         }
         let slots = ring.policy.slot_count() as u32;
+        let d3d12_transport = ring.transport_flags
+            & luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT != 0;
         ring.textures = create_shared_textures(
             device,
             session_id,
@@ -689,7 +777,13 @@ fn publish_frame(
             desc.Width,
             desc.Height,
             desc.Format,
+            d3d12_transport,
         )?;
+        ring.producer_fence = if d3d12_transport {
+            Some(create_shared_fence(device, session_id, ring.policy.generation)?)
+        } else {
+            None
+        };
         ring.tex_width = desc.Width;
         ring.tex_height = desc.Height;
         ring.tex_format = desc.Format.0 as u32;
@@ -719,7 +813,7 @@ fn publish_frame(
         if let Some(s) = &ring.section {
             s.heartbeat();
         }
-        return Ok(());
+        return Ok(false);
     };
 
     // Take the slot ATOMICALLY in shared memory before touching it. The
@@ -738,7 +832,7 @@ fn publish_frame(
         if !s.try_take_slot_writing(writer.index, expected) {
             ring.policy.writer_abort(writer.index);
             s.heartbeat();
-            return Ok(());
+            return Ok(false);
         }
     }
     let slot: &SharedTexture = &ring.textures[writer.index];
@@ -752,8 +846,9 @@ fn publish_frame(
         luminal_driver_proto::KMTX_KEY_DRIVER
     };
 
-    match acquire_mutex(&slot.mutex, key, KMTX_ACQUIRE_TIMEOUT_MS) {
-        AcquireOutcome::Acquired => {}
+    if let Some(mutex) = &slot.mutex {
+      match acquire_mutex(mutex, key, KMTX_ACQUIRE_TIMEOUT_MS) {
+        AcquireOutcome::Acquired => {},
         AcquireOutcome::TimedOut => {
             // Bounded wait expired (host holding the pixels too long):
             // drop this frame, never block the compositor path.
@@ -761,7 +856,7 @@ fn publish_frame(
             if let Some(s) = &ring.section {
                 s.reset_slot_free(writer.index);
             }
-            return Ok(());
+            return Ok(false);
         }
         AcquireOutcome::DeviceLost(hr) => {
             ring.policy.writer_abort(writer.index);
@@ -772,6 +867,7 @@ fn publish_frame(
             }
             return Err(windows::core::Error::from_hresult(hr));
         }
+      }
     }
 
     // Stopping (possibly deadline-detached mid-wedge in texture creation
@@ -781,22 +877,37 @@ fn publish_frame(
     // slot's key state machine unchanged; our own textures and the shared
     // section are process-owned and safe.
     if stop.load(Ordering::SeqCst) {
-        let _ = unsafe { slot.mutex.ReleaseSync(key) };
+        if let Some(mutex) = &slot.mutex {
+            let _ = unsafe { mutex.ReleaseSync(key) };
+        }
         ring.policy.writer_abort(writer.index);
         if let Some(s) = &ring.section {
             s.reset_slot_free(writer.index);
         }
-        return Ok(());
+        return Ok(false);
     }
 
     // Shared state is already WRITING via the take-CAS above.
     unsafe { context.CopyResource(&slot.texture, &frame_tex) };
-    let release = unsafe { slot.mutex.ReleaseSync(luminal_driver_proto::KMTX_KEY_HOST) };
+    let ready_fence_value = if let Some(producer) = &ring.producer_fence {
+        let value = ring.policy.next_sequence();
+        let context4: ID3D11DeviceContext4 = context.cast()?;
+        unsafe { context4.Signal(&producer.fence, value)? };
+        value
+    } else {
+        0
+    };
+    let release = if let Some(mutex) = &slot.mutex {
+        unsafe { mutex.ReleaseSync(luminal_driver_proto::KMTX_KEY_HOST) }
+    } else {
+        Ok(())
+    };
 
     match release {
         Ok(()) => {
             ring.ever_published[writer.index] = true;
             let seq = ring.policy.publish(writer.index);
+            debug_assert!(ready_fence_value == 0 || ready_fence_value == seq);
             let present_qpc = if meta.PresentDisplayQPCTime != 0 {
                 meta.PresentDisplayQPCTime
             } else {
@@ -809,9 +920,10 @@ fn publish_frame(
                     present_qpc,
                     ring.policy.frames_published,
                     ring.policy.frames_dropped,
+                    ready_fence_value,
                 );
             }
-            Ok(())
+            Ok(true)
         }
         Err(e) => {
             ring.policy.writer_abort(writer.index);

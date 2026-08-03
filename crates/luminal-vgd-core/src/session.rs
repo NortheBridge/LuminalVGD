@@ -544,7 +544,7 @@ impl SessionTable {
             // Creation counts as the first ping.
             last_ping_ms: now_ms,
             ring_generation: 1,
-            ring_state: ring_state::ACTIVE,
+            ring_state: ring_state::REBUILDING,
             latest_sequence: 0,
             frames_published: 0,
             frames_dropped: 0,

@@ -25,7 +25,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW,
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CR_SUCCESS,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -102,7 +102,13 @@ impl VgdDevice {
         let handle = unsafe {
             CreateFileW(
                 buf.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                // The display-class device object may deny GENERIC_READ /
+                // GENERIC_WRITE after a cold boot even to an elevated admin.
+                // Every LuminalVGD IOCTL is FILE_ANY_ACCESS, and the driver
+                // performs its SYSTEM/elevated-admin policy on the IOCTL's
+                // impersonated caller, so requesting no file-data access is
+                // both sufficient and the least-privilege open.
+                0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
@@ -250,6 +256,9 @@ pub struct ClaimedFrame {
     /// header generation no longer matches at use time, release and
     /// re-claim (the driver rebuilt the ring).
     pub generation: u32,
+    /// Producer timeline value that must complete before a D3D12 consumer
+    /// reads the shared texture. Zero on the legacy keyed-mutex transport.
+    pub ready_fence_value: u64,
 }
 
 impl RingView {
@@ -329,6 +338,7 @@ impl RingView {
                         sequence: meta.sequence,
                         present_qpc: meta.present_qpc,
                         generation: self.header().ring_generation,
+                        ready_fence_value: meta.ready_fence_value(),
                     });
                 }
             }
@@ -353,6 +363,7 @@ impl RingView {
                     sequence: meta.sequence,
                     present_qpc: meta.present_qpc,
                     generation: self.header().ring_generation,
+                    ready_fence_value: meta.ready_fence_value(),
                 });
             }
         }

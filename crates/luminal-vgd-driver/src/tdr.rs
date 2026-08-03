@@ -67,7 +67,7 @@ pub struct RingLive {
     /// (transport disabled; the host is on WGC). There is no transport to
     /// restore, so such a ring is permanently settled.
     transport: bool,
-    /// `ring_state::*`. Initialized ACTIVE to match `RingSection::create`.
+    /// `ring_state::*`. Initialized REBUILDING to match `RingSection::create`.
     state: AtomicU32,
     /// A frame worker is between "SetDevice succeeded" and "returned".
     /// Not part of [`RingLive::settled`] — a worker that has just failed is
@@ -85,7 +85,7 @@ impl RingLive {
     pub fn new(transport_present: bool) -> Self {
         Self {
             transport: transport_present,
-            state: AtomicU32::new(ring_state::ACTIVE),
+            state: AtomicU32::new(if transport_present { ring_state::REBUILDING } else { ring_state::DEAD }),
             worker_live: AtomicBool::new(false),
             live_generation: AtomicU64::new(0),
         }
@@ -100,14 +100,18 @@ impl RingLive {
         self.state.store(state, Ordering::Release);
     }
 
-    /// The frame worker is live: `IddCxSwapChainSetDevice` succeeded on a
-    /// freshly created D3D device and the ring is ACTIVE. Returns the new
-    /// live generation. THE recovery signal — nothing else sets ACTIVE.
-    pub fn publish_worker_live(&self) -> u64 {
+    /// A frame worker has started after SetDevice, but has not necessarily
+    /// published pixels. This deliberately leaves the ring REBUILDING.
+    pub fn publish_worker_started(&self) -> u64 {
         let generation = self.live_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.state.store(ring_state::ACTIVE, Ordering::Release);
         self.worker_live.store(true, Ordering::Release);
         generation
+    }
+
+    /// The worker completed a copy, signalled its fence, and published a
+    /// slot. This is the only transition to ACTIVE.
+    pub fn publish_first_frame(&self) {
+        self.state.store(ring_state::ACTIVE, Ordering::Release);
     }
 
     /// The frame worker returned. Deliberately does NOT touch `state`: an
@@ -209,8 +213,10 @@ mod tests {
 
         // The OS re-assigned a swap chain and the replacement worker got
         // its device: IddCxSwapChainSetDevice succeeded.
-        let generation = live.publish_worker_live();
+        let generation = live.publish_worker_started();
         assert_eq!(generation, 1);
+        assert!(!live.settled(), "SetDevice alone is not capture readiness");
+        live.publish_first_frame();
 
         // That worker now owns the FrameRing mutex for as long as it runs.
         assert_eq!(ring_tick(&live, false), RingTick::Settled);
@@ -241,7 +247,8 @@ mod tests {
     #[test]
     fn routine_worker_exit_leaves_the_ring_settled() {
         let live = RingLive::new(true);
-        live.publish_worker_live();
+        live.publish_worker_started();
+        live.publish_first_frame();
         live.publish_worker_exit();
         assert!(live.settled());
         assert!(!live.publishing());
@@ -254,8 +261,7 @@ mod tests {
     #[test]
     fn failure_exit_keeps_the_ring_pending_after_the_worker_is_gone() {
         let live = RingLive::new(true);
-        live.publish_worker_live();
-        live.publish_state(ring_state::REBUILDING);
+        live.publish_worker_started();
         live.publish_worker_exit();
         assert!(!live.settled());
         assert!(!live.publishing());
@@ -292,10 +298,9 @@ mod tests {
     fn live_generation_counts_only_go_live_transitions() {
         let live = RingLive::new(true);
         assert_eq!(live.live_generation(), 0);
-        live.publish_worker_live();
+        live.publish_worker_started();
         live.publish_worker_exit();
-        live.publish_state(ring_state::REBUILDING);
         assert_eq!(live.live_generation(), 1);
-        assert_eq!(live.publish_worker_live(), 2);
+        assert_eq!(live.publish_worker_started(), 2);
     }
 }

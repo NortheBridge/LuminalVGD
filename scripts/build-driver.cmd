@@ -31,6 +31,15 @@ mkdir "%PKG%" || exit /b 1
 copy /y "%REPO%\target\release\luminal_vgd_driver.dll" "%PKG%\" >nul || exit /b 1
 copy /y "%REPO%\packaging\luminalvgd.inf" "%PKG%\" >nul || exit /b 1
 
+rem Release-blocking cold-boot ACL contract. Without this exact device-object
+rem Security value, Windows may apply the Display class default after reboot
+rem and reject elevated-admin control opens before the driver's per-IOCTL
+rem authorization callback can run.
+findstr /l /c:"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)" "%PKG%\luminalvgd.inf" >nul || (
+    echo error: packaged INF is missing the LuminalVGD cold-boot device ACL.
+    exit /b 1
+)
+
 rem Clear IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (0x0080): the wdk-build
 rem link line sets /INTEGRITYCHECK, which only Microsoft-rooted signatures
 rem satisfy — our OV signature would fail to load (DESIGN.md §6).

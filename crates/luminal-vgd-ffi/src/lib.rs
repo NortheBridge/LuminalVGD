@@ -41,10 +41,18 @@ pub const VGD_CAP_HW_CURSOR: u32 = 32;
 /// 17+). Absent ⇒ a monitor's mode list is fixed at create time and the
 /// caller must advertise everything it may need up front.
 pub const VGD_CAP_DYNAMIC_MODES: u32 = 512;
+pub const VGD_CAP_D3D12_FENCE_TRANSPORT: u32 = 1024;
+pub const VGD_CREATE_D3D12_FENCE_TRANSPORT: u32 = 4;
 const _: () = assert!(VGD_CAP_HDR10 == luminal_driver_proto::caps::HDR10);
 const _: () = assert!(VGD_CAP_SDR10_BIT == luminal_driver_proto::caps::SDR10_BIT);
 const _: () = assert!(VGD_CAP_HW_CURSOR == luminal_driver_proto::caps::HW_CURSOR);
 const _: () = assert!(VGD_CAP_DYNAMIC_MODES == luminal_driver_proto::caps::DYNAMIC_MODES);
+const _: () = assert!(
+    VGD_CAP_D3D12_FENCE_TRANSPORT == luminal_driver_proto::caps::D3D12_FENCE_TRANSPORT
+);
+const _: () = assert!(
+    VGD_CREATE_D3D12_FENCE_TRANSPORT == luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT
+);
 
 /// `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).
 pub const VGD_CURSOR_KIND_ALPHA: u32 = 1;
@@ -144,6 +152,7 @@ pub struct VgdFrame {
     pub generation: u32,
     pub sequence: u64,
     pub present_qpc: u64,
+    pub ready_fence_value: u64,
 }
 
 fn guarded<T>(default: T, f: impl FnOnce() -> T) -> T {
@@ -529,6 +538,7 @@ pub unsafe extern "C" fn vgd_ring_claim(ring: *mut VgdRingHandle, out: *mut VgdF
                 generation: frame.generation,
                 sequence: frame.sequence,
                 present_qpc: frame.present_qpc,
+                ready_fence_value: frame.ready_fence_value,
             };
             true
         }
@@ -665,5 +675,38 @@ pub unsafe extern "C" fn vgd_slot_texture_name(
         let len = names::slot_texture_name(session_id, generation, slot, &mut buf);
         std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 96);
         len as u32
+    })
+}
+
+/// Compose the D3D12-openable shared texture name for a claimed slot.
+#[no_mangle]
+pub unsafe extern "C" fn vgd_slot_texture_d3d12_name(
+    session_id: u64,
+    generation: u32,
+    slot: u32,
+    out: *mut u16,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    guarded(0, || {
+        let out = &mut *(out as *mut [u16; 96]);
+        names::slot_texture_d3d12_name(session_id, generation, slot, out) as u32
+    })
+}
+
+/// Compose the shared producer timeline-fence name for a ring generation.
+#[no_mangle]
+pub unsafe extern "C" fn vgd_ring_fence_name(
+    session_id: u64,
+    generation: u32,
+    out: *mut u16,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    guarded(0, || {
+        let out = &mut *(out as *mut [u16; 96]);
+        names::ring_fence_name(session_id, generation, out) as u32
     })
 }

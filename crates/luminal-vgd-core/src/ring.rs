@@ -60,6 +60,13 @@ impl RingPolicy {
         self.slots[index]
     }
 
+    /// Sequence the next successful publish will receive. The fenced
+    /// transport needs this value before committing shared metadata so it
+    /// can enqueue the producer signal first.
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     /// Driver has a new frame: pick a slot to write into. Prefers a free
     /// slot; otherwise overwrites the OLDEST published frame; if the host
     /// holds every slot, returns `None` (frame dropped entirely).
