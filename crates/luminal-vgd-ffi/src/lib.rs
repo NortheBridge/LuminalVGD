@@ -42,7 +42,9 @@ pub const VGD_CAP_HW_CURSOR: u32 = 32;
 /// caller must advertise everything it may need up front.
 pub const VGD_CAP_DYNAMIC_MODES: u32 = 512;
 pub const VGD_CAP_D3D12_FENCE_TRANSPORT: u32 = 1024;
+pub const VGD_CAP_FENCE_TRANSPORT_REQUIRED: u32 = 2048;
 pub const VGD_CREATE_D3D12_FENCE_TRANSPORT: u32 = 4;
+pub const VGD_CREATE_FENCE_TRANSPORT_REQUIRED: u32 = 8;
 const _: () = assert!(VGD_CAP_HDR10 == luminal_driver_proto::caps::HDR10);
 const _: () = assert!(VGD_CAP_SDR10_BIT == luminal_driver_proto::caps::SDR10_BIT);
 const _: () = assert!(VGD_CAP_HW_CURSOR == luminal_driver_proto::caps::HW_CURSOR);
@@ -52,6 +54,12 @@ const _: () = assert!(
 );
 const _: () = assert!(
     VGD_CREATE_D3D12_FENCE_TRANSPORT == luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT
+);
+const _: () = assert!(
+    VGD_CAP_FENCE_TRANSPORT_REQUIRED == luminal_driver_proto::caps::FENCE_TRANSPORT_REQUIRED
+);
+const _: () = assert!(
+    VGD_CREATE_FENCE_TRANSPORT_REQUIRED == luminal_driver_proto::create_flags::FENCE_TRANSPORT_REQUIRED
 );
 
 /// `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).

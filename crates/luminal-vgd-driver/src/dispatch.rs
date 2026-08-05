@@ -281,7 +281,9 @@ fn plug_effect(m: &Monitor, ring_slots: u32) -> Effect {
         targets: m.target_modes.clone(),
         adapter_luid: m.adapter_luid,
         ring_slots,
-        transport_flags: m.flags,
+        transport_flags: m.flags
+            & (luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT
+                | luminal_driver_proto::create_flags::FENCE_TRANSPORT_REQUIRED),
         edid: Box::new(monitor_edid(m)),
     }
 }
@@ -1882,7 +1884,7 @@ mod tests {
             assert_eq!(r.status, Status::Ok);
             let reply: HandshakeReply = from_bytes(&out);
             assert_eq!(reply.driver_proto_minor, PROTO_VERSION_MINOR);
-            assert_eq!(reply.driver_proto_minor, 9);
+            assert_eq!(reply.driver_proto_minor, 10);
             assert!(h.handshaken, "0.{announced} host still handshakes against 0.9");
 
             // And its session IOCTLs still work.

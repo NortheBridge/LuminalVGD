@@ -73,9 +73,9 @@ pub(crate) struct FrameRing {
     /// to replace its swapchain.  The replacement assign must not retire it
     /// a second time.
     retired_for_reassign: bool,
-    /// Host-selected create flags. `active_transport_flags` can downgrade
-    /// from D3D12 fences to keyed mutexes for this monitor without changing
-    /// topology; the ring header tells the host which one won.
+    /// Host-selected create flags. Legacy hosts may allow a one-time fallback
+    /// before publication; fence-required hosts never change transport within
+    /// a generation.
     active_transport_flags: u32,
     d3d12_downgraded: bool,
     /// A non-device transport failure permanently disables direct-ring
@@ -948,6 +948,9 @@ fn publish_frame(
         let d3d12_transport = ring.active_transport_flags
             & luminal_driver_proto::create_flags::D3D12_FENCE_TRANSPORT
             != 0;
+        let fence_required = ring.active_transport_flags
+            & luminal_driver_proto::create_flags::FENCE_TRANSPORT_REQUIRED
+            != 0;
         let provision = |d3d12: bool| -> windows::core::Result<(Vec<SharedTexture>, Option<SharedFence>)> {
             let textures = create_shared_textures(
                 device,
@@ -968,6 +971,15 @@ fn publish_frame(
         };
         let resources = match provision(d3d12_transport) {
             Ok(resources) => resources,
+            Err(first) if d3d12_transport && fence_required => {
+                // The host imported a timeline-fence contract. Mutating that
+                // contract to keyed mutexes in-place races the capture worker
+                // and can strand both sides on incompatible synchronization.
+                // Keep draining IddCx, make the optional ring explicitly DEAD,
+                // and let the host select its isolated safe-capture backend.
+                ring.disable_transport(first.code().0);
+                return Ok(false);
+            }
             Err(first) if d3d12_transport && !ring.d3d12_downgraded => {
                 ring.d3d12_downgraded = true;
                 ring.active_transport_flags &=
