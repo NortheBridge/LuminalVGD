@@ -61,7 +61,12 @@ pub const PROTO_VERSION_MAJOR: u16 = 0;
 /// in [`RingHeader::transport_flags`]. A requested D3D12-fence transport
 /// can therefore downgrade in place to the keyed-mutex transport without
 /// cycling the monitor.
-pub const PROTO_VERSION_MINOR: u16 = 9;
+/// v0.10: Build 24 adds the immutable fence-only transport contract. Hosts
+/// opt in with [`create_flags::FENCE_TRANSPORT_REQUIRED`] after checking
+/// [`caps::FENCE_TRANSPORT_REQUIRED`]. The selected transport cannot change
+/// during a generation; provisioning failure makes the ring DEAD instead of
+/// silently substituting keyed-mutex synchronization.
+pub const PROTO_VERSION_MINOR: u16 = 10;
 
 /// The minimum driver minor a host actually REQUIRES. Hosts that degrade
 /// gracefully when 0.4 fields are ignored (the nits value simply stays at
@@ -132,6 +137,9 @@ pub mod caps {
     /// ID3D11Fence/ID3D12Fence-compatible shared timeline. This is opt-in per
     /// monitor; older hosts continue receiving keyed-mutex textures.
     pub const D3D12_FENCE_TRANSPORT: u32 = 1 << 10;
+    /// The driver accepts `create_flags::FENCE_TRANSPORT_REQUIRED` and keeps
+    /// the ring transport immutable for the lifetime of each generation.
+    pub const FENCE_TRANSPORT_REQUIRED: u32 = 1 << 11;
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +428,11 @@ pub mod create_flags {
     /// synchronisation instead of the legacy keyed-mutex texture contract.
     /// Valid only when the driver advertises `caps::D3D12_FENCE_TRANSPORT`.
     pub const D3D12_FENCE_TRANSPORT: u32 = 1 << 2;
+    /// Require the D3D12-openable texture/timeline-fence contract. This bit
+    /// is valid only together with `D3D12_FENCE_TRANSPORT` and when the driver
+    /// advertises `caps::FENCE_TRANSPORT_REQUIRED`. Provisioning failure is
+    /// reported as a DEAD ring; it must never downgrade this generation.
+    pub const FENCE_TRANSPORT_REQUIRED: u32 = 1 << 3;
 }
 
 /// One display mode. `modes[0]` is the preferred/native mode.
@@ -1401,7 +1414,7 @@ mod tests {
             3
         ));
         assert_eq!(PROTO_VERSION_MINOR_REQUIRED, 3, "the floor does NOT move with the minor");
-        assert_eq!(PROTO_VERSION_MINOR, 9);
+        assert_eq!(PROTO_VERSION_MINOR, 10);
     }
 
     /// The feature gate a host actually reads. Locked because a wrong bit
@@ -1424,6 +1437,17 @@ mod tests {
         ] {
             assert_eq!(caps::DYNAMIC_MODES & other, 0);
         }
+    }
+
+    #[test]
+    fn fence_required_contract_uses_fresh_additive_bits() {
+        assert_eq!(caps::FENCE_TRANSPORT_REQUIRED, 1 << 11);
+        assert_eq!(create_flags::FENCE_TRANSPORT_REQUIRED, 1 << 3);
+        assert_ne!(caps::FENCE_TRANSPORT_REQUIRED, caps::D3D12_FENCE_TRANSPORT);
+        assert_ne!(
+            create_flags::FENCE_TRANSPORT_REQUIRED,
+            create_flags::D3D12_FENCE_TRANSPORT
+        );
     }
 
     /// The new opcode is APPENDED: the nine shipped IOCTL values must be

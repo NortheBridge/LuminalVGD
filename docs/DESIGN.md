@@ -80,13 +80,18 @@ DWM renders to VGD swapchain
             └─ LuminalShine encoder (NVENC/AMF/QSV) consumes directly
 ```
 
-- Ring of N (default 3) keyed-mutex shared D3D textures, allocated by the
-  driver on the render adapter chosen at monitor creation.
+- Ring of N (default 3) shared D3D textures, allocated by the driver on the
+  render adapter chosen at monitor creation. Proto 0.10 hosts request the
+  D3D12-openable/timeline-fence transport as an immutable requirement;
+  provisioning failure makes that optional ring DEAD while IddCx continues
+  draining. Older hosts retain the keyed-mutex contract.
 - Metadata per slot (frame sequence, QPC present time, HDR10 metadata,
   dirty-rect summary if available) lives in a shared-memory header defined
   in `luminal-driver-proto` — the single ABI source of truth imported by
   BOTH the driver and LuminalShine. Never define the layout twice.
-- Host signals consumption via keyed mutex release; driver recycles slots.
+- Host signals consumption via the shared slot state after its bounded GPU
+  copy completes (and by keyed-mutex release for legacy sessions); the driver
+  recycles slots.
   Driver never blocks the IddCx swap-chain thread on the host: if the host
   stalls, the driver drops oldest and keeps sequence numbers monotonic so
   the host can detect the gap.

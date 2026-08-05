@@ -40,7 +40,11 @@
 
 #define VGD_CAP_D3D12_FENCE_TRANSPORT 1024
 
+#define VGD_CAP_FENCE_TRANSPORT_REQUIRED 2048
+
 #define VGD_CREATE_D3D12_FENCE_TRANSPORT 4
+
+#define VGD_CREATE_FENCE_TRANSPORT_REQUIRED 8
 
 /**
  * `VgdCursorShape.kind` values (mirror proto `cursor_kind::*`).

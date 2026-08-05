@@ -45,7 +45,8 @@ pub(crate) const SHELL_CAPS: u32 = luminal_driver_proto::caps::MULTI_MODE
     | luminal_driver_proto::caps::HW_CURSOR
     | luminal_driver_proto::caps::GAMMA_RAMP
     | luminal_driver_proto::caps::DYNAMIC_MODES
-    | luminal_driver_proto::caps::D3D12_FENCE_TRANSPORT;
+    | luminal_driver_proto::caps::D3D12_FENCE_TRANSPORT
+    | luminal_driver_proto::caps::FENCE_TRANSPORT_REQUIRED;
 
 /// Monotonic build stamp reported in HANDSHAKE/GET_STATUS. Release
 /// builds stamp it via the LUMINAL_VGD_BUILD environment variable
@@ -64,7 +65,7 @@ pub(crate) const DRIVER_BUILD: u32 = match option_env!("LUMINAL_VGD_BUILD") {
         }
         n
     }
-    None => 23,
+    None => 24,
 };
 
 /// NUL-terminated UTF-16 literal; size the array one past the text so the

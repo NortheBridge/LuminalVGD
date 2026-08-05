@@ -9,6 +9,7 @@ MIT-family → AGPL-OK).
 |---|---|---|
 | All-Rust UMDF IddCx driver core | pf-vdisplay | **Inherit** — fork basis |
 | Direct-to-encoder shared-texture/ring transport | pf-vdisplay | **Inherit**; primary mode |
+| Immutable D3D12-openable ring + shared timeline-fence contract | LuminalVGD proto 0.10 | **New**; fence-required generations fail DEAD instead of changing to keyed mutex in place |
 | Single shared ABI crate (host+driver) | pf-vdisplay (`pf-driver-proto`) | **Inherit** as `luminal-driver-proto` |
 | Build/sign/deploy scripting, FORCE_INTEGRITY clear | pf-vdisplay | **Inherit**, adapted to OV cert (TrustedPublisher-only seeding) |
 | WGC/DDA fallback when driver absent | pf-vdisplay (host side) | **Inherit pattern**; hardened per WGC-RELIABILITY.md |

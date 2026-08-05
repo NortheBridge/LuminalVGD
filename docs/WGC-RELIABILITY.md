@@ -97,6 +97,10 @@ R6  Fail the session loudly    Structured error to the client + log bundle.
 When the driver is present, R1–R3 failures also flip the session's primary
 path back to direct-to-encoder if it was only in WGC for compatibility
 reasons — the driver ring does not depend on any of the WGC machinery.
+Build 24 additionally makes a requested fence-only ring generation immutable:
+if its shared resources cannot be provisioned, the ring becomes DEAD and the
+host starts WGC in its isolated video worker. The driver never changes a live
+reader from timeline fences to keyed mutexes behind its back.
 
 ## 5. HDR notes for the fallback
 
