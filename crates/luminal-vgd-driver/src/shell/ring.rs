@@ -23,7 +23,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, Loca
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Device5, ID3D11Fence, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_FENCE_FLAG_SHARED,
-    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
@@ -423,7 +424,12 @@ pub fn create_shared_textures(
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
         MiscFlags: if d3d12_transport {
-            D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
+            // NTHANDLE is a *modifier* of a sharing mode, not a sharing
+            // mode: alone it fails CreateTexture2D with E_INVALIDARG
+            // (which, under FENCE_TRANSPORT_REQUIRED, killed the ring on
+            // every advanced-color session — 2026-08-07). SHARED|NTHANDLE
+            // is the documented combo for fence-synchronized D3D12 interop.
+            (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32
         } else {
             (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32
         },
