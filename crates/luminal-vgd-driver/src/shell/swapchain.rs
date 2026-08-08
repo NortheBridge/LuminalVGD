@@ -200,6 +200,89 @@ pub(crate) struct Worker {
 /// extend unassign/teardown unboundedly.
 const STOP_DEADLINE: Duration = Duration::from_millis(500);
 
+/// How long a fresh frame worker may wait for the ring mutex after
+/// IddCxSwapChainSetDevice before giving up on ring participation. The
+/// wait is harmless to the modeset (the OS already has its device) but
+/// NOT to the kernel's stall watchdog: once SetDevice returns, dxgkrnl
+/// queues frames to this swapchain and TerminateIndirectOnStall kills
+/// the whole driver host if one sits unconsumed ~10 s. Well under that,
+/// generous against every legitimate holder (mark_ring_dead's 500 ms
+/// poll, a healthy predecessor's exit).
+const RING_LOCK_DEADLINE: Duration = Duration::from_secs(3);
+
+/// How often a drain-only worker re-tries the ring mutex. A spurious
+/// drain-only trip (a slow-but-healthy predecessor releasing just after
+/// the 3 s deadline) must not strand the session on fallback capture for
+/// its whole life — on a successful late acquire the worker upgrades to
+/// the full ring path.
+const DRAIN_UPGRADE_RETRY: Duration = Duration::from_secs(5);
+
+/// Outcome of a drain-only stint.
+enum DrainOutcome<'a> {
+    /// The ring mutex became available: proceed with the full ring path.
+    Upgraded(std::sync::MutexGuard<'a, FrameRing>),
+    /// Stop flag observed; caller returns without touching the swapchain.
+    Stopped,
+    /// Acquire failed with this status; caller runs delete_failed_swapchain.
+    Failed(i32),
+}
+
+/// Drain an assigned swapchain without ring participation: acquire and
+/// finish frames so the compositor — and the kernel's stall watchdog —
+/// stay healthy while the ring mutex is pinned by a detached predecessor
+/// (which made the ring unusable regardless; the host's stale-heartbeat
+/// detection moves capture to WGC fallback in the meantime).
+fn drain_only_loop<'a>(
+    session_id: u64,
+    swapchain: OsHandle,
+    frame_event: OsHandle,
+    stop: &AtomicBool,
+    ring_mutex: &'a Mutex<FrameRing>,
+) -> DrainOutcome<'a> {
+    let mut next_upgrade = Instant::now() + DRAIN_UPGRADE_RETRY;
+    while !stop.load(Ordering::SeqCst) {
+        if Instant::now() >= next_upgrade {
+            match ring_mutex.try_lock() {
+                Ok(g) => return DrainOutcome::Upgraded(g),
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    return DrainOutcome::Upgraded(p.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    next_upgrade = Instant::now() + DRAIN_UPGRADE_RETRY;
+                }
+            }
+        }
+        let mut in_args: ffi::IDARG_IN_RELEASEANDACQUIREBUFFER2 = unsafe { zeroed() };
+        in_args.Size = size_of::<ffi::IDARG_IN_RELEASEANDACQUIREBUFFER2>() as u32;
+        let mut out: ffi::IDARG_OUT_RELEASEANDACQUIREBUFFER2 = unsafe { zeroed() };
+        out.MetaData.Size = size_of::<ffi::IDDCX_METADATA2>() as u32;
+        let status = unsafe {
+            bindings::swapchain_release_and_acquire_buffer2(swapchain.0.cast(), &mut in_args, &mut out)
+        };
+        if stop.load(Ordering::SeqCst) {
+            return DrainOutcome::Stopped;
+        }
+        if status == STATUS_PENDING || status == E_PENDING {
+            unsafe {
+                let _ = WaitForSingleObject(HANDLE(frame_event.0), 100);
+            }
+            continue;
+        }
+        if status != STATUS_SUCCESS {
+            tracelogging::write_event!(
+                PROVIDER,
+                "AcquireBufferFailedExit",
+                level(Warning),
+                u64("session", &session_id),
+                i32("status", &status)
+            );
+            return DrainOutcome::Failed(status);
+        }
+        unsafe { bindings::swapchain_finished_processing_frame(swapchain.0.cast()) };
+    }
+    DrainOutcome::Stopped
+}
+
 impl Worker {
     /// Deadline-bounded stop: the thread re-checks the flag at least
     /// every 100 ms. On deadline (an OS call wedged) the thread is
@@ -672,18 +755,64 @@ fn frame_loop(
     //
     // Poison recovery matches mark_ring_dead: a prior worker's panic must
     // not cascade a second panic into WUDFHost on the next assign.
-    let mut guard = handle
-        .ring
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Re-check after the (possibly long) lock wait: a worker stopped while
-    // queued behind a wedged predecessor may have been deadline-detached —
-    // its swapchain is then already torn down and must not be touched
-    // (mirrors the cursor worker's post-wait re-check). A wait here is
-    // harmless to activation: the OS already has its device.
+    //
+    // BOUNDED, not a blocking lock(): a deadline-detached predecessor
+    // wedged inside a TDR-scale D3D call pins this mutex forever, and a
+    // fresh worker parked here — after SetDevice advertised a consumer —
+    // is exactly the state dxgkrnl's TerminateIndirectOnStall kills the
+    // host over (2026-08-07). On deadline, degrade to drain-only.
+    let deadline = Instant::now() + RING_LOCK_DEADLINE;
+    let mut acquired = None;
+    while acquired.is_none() {
+        match handle.ring.try_lock() {
+            Ok(g) => acquired = Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => acquired = Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    // Re-check after the lock wait: a worker stopped while queued behind
+    // a wedged predecessor may have been deadline-detached — its
+    // swapchain is then already torn down and must not be touched
+    // (mirrors the cursor worker's post-wait re-check).
     if stop.load(Ordering::SeqCst) {
         return;
     }
+    let mut guard = match acquired {
+        Some(g) => g,
+        None => {
+            tracelogging::write_event!(
+                PROVIDER,
+                "FrameWorkerDrainOnly",
+                level(Warning),
+                u64("session", &session_id)
+            );
+            match drain_only_loop(session_id, swapchain, frame_event, &stop, &handle.ring) {
+                DrainOutcome::Stopped => return,
+                DrainOutcome::Failed(reason) => {
+                    drop(d3d);
+                    delete_failed_swapchain(swapchain, &stop, session_id, reason);
+                    return;
+                }
+                DrainOutcome::Upgraded(g) => {
+                    tracelogging::write_event!(
+                        PROVIDER,
+                        "FrameWorkerDrainUpgraded",
+                        level(Informational),
+                        u64("session", &session_id)
+                    );
+                    g
+                }
+            }
+        }
+    };
     let ring = &mut *guard;
 
     // A reassignment means a new device: retire the old textures and bump

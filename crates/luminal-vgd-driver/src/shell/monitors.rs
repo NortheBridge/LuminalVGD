@@ -69,7 +69,7 @@ pub fn plug(
     // fresh one — two ring Arcs aliasing one section. Dead-mark so the
     // host stops waiting on the stale mapping.
     {
-        let mut ducked = shell.ducked.lock().unwrap();
+        let mut ducked = shell.ducked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(pos) = ducked.iter().position(|d| d.session_id == session_id) {
             let d = ducked.remove(pos);
             drop(ducked);
@@ -117,7 +117,7 @@ pub fn plug(
         // was generated from this very list (its preferred detailed timing
         // is monitor_modes[0]). Nothing is ever added to it — the target
         // list below is what UPDATE_MODES steers, always within it.
-        let displaced = shell.monitors.lock().unwrap().insert(
+        let displaced = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
             session_id,
             MonitorRt {
                 monitor: OsHandle(monitor.cast()),
@@ -158,7 +158,7 @@ pub fn plug(
             i32("status", &status)
         );
         if status != STATUS_SUCCESS {
-            shell.monitors.lock().unwrap().remove(&session_id);
+            shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&session_id);
             return;
         }
 
@@ -167,7 +167,7 @@ pub fn plug(
         // retried on its clock until the OS commits a path and accepts.
         // Nothing cursor-related ever runs inside an IddCx callback.
         let cursor = super::cursor::spawn(session_id, OsHandle(monitor.cast()));
-        if let Some(rt) = shell.monitors.lock().unwrap().get_mut(&session_id) {
+        if let Some(rt) = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&session_id) {
             rt.cursor = cursor;
         }
     }
@@ -179,13 +179,26 @@ pub fn plug(
 /// never wedge), then IddCxMonitorDeparture. `rt` (and with it the
 /// cursor event handle) drops only after departure returns, so the OS
 /// never signals a closed event.
+///
+/// Shell locks here (and file-wide) tolerate poisoning: a worker panic
+/// while holding one must degrade THAT monitor, not abort the process
+/// out of the watchdog's unplug and take the control device — and every
+/// other session — with it (swapchain.rs already takes this trade for
+/// the device-creation gate).
+///
+/// SERIALIZATION ASSUMPTION (load-bearing since the departure reorder):
+/// unplug and duck_* run only on the single effects worker, so at most
+/// one departure per monitor is ever in flight. rt staying in the map
+/// through the departure means a hypothetical concurrent unplug/duck of
+/// the same session would double-depart one monitor object — callers
+/// must never invoke these off the effects thread.
 pub fn unplug(session_id: u64) {
     let shell = Shell::get();
     // A destroy landing while the session is parked in a TDR duck-out:
     // the monitor is already departed, so only the parked spec needs to
     // go (its ring is marked dead like the normal path below).
     {
-        let mut ducked = shell.ducked.lock().unwrap();
+        let mut ducked = shell.ducked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(pos) = ducked.iter().position(|d| d.session_id == session_id) {
             let d = ducked.remove(pos);
             drop(ducked);
@@ -199,19 +212,35 @@ pub fn unplug(session_id: u64) {
             return;
         }
     }
-    let Some(mut rt) = shell.monitors.lock().unwrap().remove(&session_id) else {
-        return;
+    // Depart with the frame worker STILL DRAINING — and still
+    // DISCOVERABLE. Departing an active (often primary) monitor drives a
+    // full modeset transaction, and DWM keeps presenting to the assigned
+    // swapchain until the OS unassigns it inside that transaction.
+    // Stopping the worker first left those frames unconsumed — ≥10 s of
+    // that and dxgkrnl's TerminateIndirectOnStall terminated the whole
+    // driver host (IddCx TERMINATE_OUTPUT code 0x200; the 2026-08-07
+    // WUDFVerifierFailure deaths). rt therefore STAYS in the map through
+    // the departure so the departure-driven EvtUnassign finds the worker
+    // and stops it (bounded) at the contract point where swapchain use
+    // must cease — frames stay consumed right up to the unassign, and
+    // nothing touches the swapchain after it.
+    //
+    // The cursor is taken out and stopped first (it makes its own IddCx
+    // calls), but its event handle must outlive the departure — it is
+    // dropped only at the end of this function.
+    let (monitor, mut cursor) = {
+        let mut monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(rt) = monitors.get_mut(&session_id) else {
+            return;
+        };
+        (rt.monitor, rt.cursor.take())
     };
-    if let Some(worker) = rt.worker.take() {
-        worker.stop();
+    if let Some(c) = cursor.as_mut() {
+        c.stop();
     }
-    if let Some(cursor) = rt.cursor.as_mut() {
-        cursor.stop();
-    }
-    rt.mark_ring_dead();
-    forget_committed(rt.monitor);
+    forget_committed(monitor);
     unsafe {
-        let status = bindings::monitor_departure(rt.monitor.0.cast());
+        let status = bindings::monitor_departure(monitor.0.cast());
         tracelogging::write_event!(
             PROVIDER,
             "MonitorDeparture",
@@ -220,6 +249,21 @@ pub fn unplug(session_id: u64) {
             i32("status", &status)
         );
     }
+    // The monitor is gone from the OS; remove the runtime and finish. The
+    // worker was normally stopped by the departure-driven EvtUnassign;
+    // stop() here covers a departure that never unassigned.
+    if let Some(mut rt) = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&session_id) {
+        if let Some(worker) = rt.worker.take() {
+            worker.stop();
+        }
+        // With the worker joined its ring-mutex pin is released, so this
+        // bounded mark succeeds far more often than the old stop-first
+        // ordering allowed.
+        rt.mark_ring_dead();
+    }
+    // Cursor event handle closes only now, after departure returned, so
+    // the OS never signals a closed event.
+    drop(cursor);
 }
 
 /// TDR duck-out, step 1: depart every live monitor so a failed OS TDR
@@ -258,38 +302,44 @@ pub fn duck_sessions(expected_epoch: u64, sessions: &[u64]) -> usize {
 
 fn duck_selected(expected_epoch: u64, only: Option<&[u64]>) -> usize {
     let shell = super::Shell::get();
-    let drained: Vec<(u64, super::MonitorRt)> = {
-        let mut monitors = shell.monitors.lock().unwrap();
+    let targets: Vec<u64> = {
+        let monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match only {
-            None => monitors.drain().collect(),
+            None => monitors.keys().copied().collect(),
             Some(sessions) => sessions
                 .iter()
-                .filter_map(|sid| monitors.remove_entry(sid))
+                .copied()
+                .filter(|sid| monitors.contains_key(sid))
                 .collect(),
         }
     };
     let mut parked = 0usize;
-    for (session_id, mut rt) in drained {
-        if let Some(worker) = rt.worker.take() {
-            worker.stop();
+    for session_id in targets {
+        // Same TerminateIndirectOnStall rationale as unplug(): rt STAYS
+        // in the map through the departure so the departure-driven
+        // EvtUnassign finds the frame worker and stops it (bounded) at
+        // the contract point where swapchain use must cease — a
+        // pre-stopped worker would leave DWM's frames unconsumed on the
+        // still-assigned swapchain for the whole departure modeset. The
+        // cursor is stopped first (it makes its own IddCx calls) but its
+        // event handle outlives the departure.
+        let taken = {
+            let mut monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            monitors
+                .get_mut(&session_id)
+                .map(|rt| (rt.monitor, rt.cursor.take(), rt.ring.clone()))
+        };
+        let Some((monitor, mut cursor, ring)) = taken else {
+            continue; // unplugged/torn down since we listed it
+        };
+        if let Some(c) = cursor.as_mut() {
+            c.stop();
         }
-        if let Some(cursor) = rt.cursor.as_mut() {
-            cursor.stop();
-        }
-        // Mirror unconditionally (one store, cannot fail), then a single
-        // bounded attempt at the shared section: a detached worker may pin
-        // the ring mutex, and unlike mark_ring_dead there is no urgency to
-        // win — the host's stale-heartbeat detection covers an unmarked
-        // ring, and the TDR poller reads the mirror.
-        rt.ring
-            .live
+        // Mirror unconditionally (one store, cannot fail); the shared
+        // section gets its bounded mark attempt after the worker stops.
+        ring.live
             .publish_state(luminal_driver_proto::ring_state::REBUILDING);
-        if let Ok(ring) = rt.ring.ring.try_lock() {
-            if let Some(s) = &ring.section {
-                s.set_state(luminal_driver_proto::ring_state::REBUILDING);
-            }
-        }
-        let status = unsafe { bindings::monitor_departure(rt.monitor.0.cast()) };
+        let status = unsafe { bindings::monitor_departure(monitor.0.cast()) };
         tracelogging::write_event!(
             PROVIDER,
             "TdrDuckDeparted",
@@ -301,13 +351,37 @@ fn duck_selected(expected_epoch: u64, only: Option<&[u64]>) -> usize {
             // The monitor is still arrived — parking it would leave an
             // occupied connector that a replug (or the host's DESTROY,
             // whose ducked fast-path assumes already-departed) can never
-            // reclaim. Put it back; unplug/teardown will depart it
-            // through the normal path when its session ends.
-            shell.monitors.lock().unwrap().insert(session_id, rt);
+            // reclaim. It never left the map and its worker keeps
+            // draining; hand the stopped cursor back so its event handle
+            // lives as long as the still-arrived monitor. unplug/teardown
+            // departs it through the normal path when its session ends.
+            let mut monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(rt) = monitors.get_mut(&session_id) {
+                rt.cursor = cursor.take();
+            }
             continue;
         }
+        // Departed: remove the runtime and park it. The worker was
+        // normally stopped by the departure-driven EvtUnassign; stop()
+        // covers a departure that never unassigned.
+        let Some(mut rt) = shell
+            .monitors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id)
+        else {
+            continue;
+        };
+        if let Some(worker) = rt.worker.take() {
+            worker.stop();
+        }
+        if let Ok(ring_guard) = rt.ring.ring.try_lock() {
+            if let Some(s) = &ring_guard.section {
+                s.set_state(luminal_driver_proto::ring_state::REBUILDING);
+            }
+        }
         forget_committed(rt.monitor);
-        shell.ducked.lock().unwrap().push(super::DuckedMonitor {
+        shell.ducked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(super::DuckedMonitor {
             session_id,
             display_id: rt.display_id,
             connector_index: rt.connector_index,
@@ -323,7 +397,7 @@ fn duck_selected(expected_epoch: u64, only: Option<&[u64]>) -> usize {
     // D3Final drain. Clean up after ourselves — the epoch bump already
     // made the poller and any queued replug stale, so nothing else will.
     if shell.adapter_epoch() != expected_epoch {
-        let stale: Vec<super::DuckedMonitor> = shell.ducked.lock().unwrap().drain(..).collect();
+        let stale: Vec<super::DuckedMonitor> = shell.ducked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).collect();
         for d in &stale {
             super::mark_ring_dead_arc(&d.ring);
         }
@@ -347,7 +421,7 @@ fn duck_selected(expected_epoch: u64, only: Option<&[u64]>) -> usize {
 pub fn replug_ducked() {
     let shell = super::Shell::get();
     let parked: Vec<super::DuckedMonitor> = {
-        let mut ducked = shell.ducked.lock().unwrap();
+        let mut ducked = shell.ducked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         ducked.drain(..).collect()
     };
     let Some(adapter) = shell.adapter() else {
@@ -401,7 +475,7 @@ pub fn replug_ducked() {
             // gets the same monitor-mode superset; the published target
             // subset carries over too, or the re-arrival would silently
             // undo whatever gating was in force when the duck started.
-            let displaced = shell.monitors.lock().unwrap().insert(
+            let displaced = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
                 d.session_id,
                 super::MonitorRt {
                     monitor: super::OsHandle(monitor.cast()),
@@ -442,7 +516,7 @@ pub fn replug_ducked() {
                 i32("status", &status)
             );
             if status != STATUS_SUCCESS {
-                if let Some(rt) = shell.monitors.lock().unwrap().remove(&d.session_id) {
+                if let Some(rt) = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&d.session_id) {
                     rt.mark_ring_dead();
                     forget_committed(rt.monitor);
                 }
@@ -450,7 +524,7 @@ pub fn replug_ducked() {
             }
 
             let cursor = super::cursor::spawn(d.session_id, super::OsHandle(monitor.cast()));
-            if let Some(rt) = shell.monitors.lock().unwrap().get_mut(&d.session_id) {
+            if let Some(rt) = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&d.session_id) {
                 rt.cursor = cursor;
             }
         }
@@ -806,7 +880,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: &[Mode]) -> PushOutcome
     // for the life of the session. A patch changes what the monitor
     // publishes, so it commits.
     {
-        let mut ducked = shell.ducked.lock().unwrap();
+        let mut ducked = shell.ducked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(d) = ducked.iter_mut().find(|d| d.session_id == session_id) {
             let outcome = modepush::parked_push(&d.monitor_modes, targets);
             if outcome.commits() {
@@ -847,7 +921,7 @@ fn push_targets(shell: &Shell, session_id: u64, targets: &[Mode]) -> PushOutcome
 
     // --- Under the lock: validate, publish, snapshot, build. No IddCx. ---
     let (monitor, previous, superset, target_modes) = {
-        let mut monitors = shell.monitors.lock().unwrap();
+        let mut monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(rt) = monitors.get_mut(&session_id) else {
             return PushOutcome::Failed {
                 stage: stage::NO_MONITOR,
@@ -1010,7 +1084,7 @@ fn restore_targets(
     pushed: &[Mode],
     previous: Vec<Mode>,
 ) -> (bool, bool) {
-    let mut monitors = shell.monitors.lock().unwrap();
+    let mut monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match monitors.get_mut(&session_id) {
         Some(rt) if rt.monitor == monitor && rt.target_modes == pushed => {
             rt.target_modes = previous;
@@ -1088,7 +1162,7 @@ fn session_modes_for_edid(data: &[u8]) -> Option<ModeSnapshot> {
         return None;
     }
     let shell = Shell::get();
-    let monitors = shell.monitors.lock().unwrap();
+    let monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     monitors
         .values()
         .find(|rt| rt.edid[8..16] == data[8..16])
@@ -1100,7 +1174,7 @@ fn session_modes_for_edid(data: &[u8]) -> Option<ModeSnapshot> {
 
 fn modes_for_monitor_object(monitor: ffi::IDDCX_MONITOR) -> Option<ModeSnapshot> {
     let shell = Shell::get();
-    let monitors = shell.monitors.lock().unwrap();
+    let monitors = shell.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     monitors
         .values()
         .find(|rt| rt.monitor == OsHandle(monitor.cast()))
